@@ -5,9 +5,6 @@
 #include "physical/storage/LocalFS.h"
 #include "physical/natives/DirectRandomAccessFile.h"
 #include "physical/natives/DirectUringRandomAccessFile.h"
-#include "physical/FilePath.h"
-#include <filesystem>
-namespace fs = std::filesystem;
 
 std::string LocalFS::SchemePrefix = "file://";
 
@@ -19,7 +16,7 @@ Storage::Scheme LocalFS::getScheme() {
     return file;
 }
 
-std::string LocalFS::ensureSchemePrefix(const std::string &path) const {
+std::string LocalFS::ensureSchemePrefix(std::string path) {
     if(path.rfind(SchemePrefix, 0) != std::string::npos) {
         return path;
     }
@@ -65,6 +62,21 @@ std::vector<std::string> LocalFS::listPaths(const std::string &path) {
         }
     }
     return paths;
+}
+
+std::ifstream LocalFS::open(const std::string &path) {
+    FilePath p(path);
+    if (!p.valid) {
+        throw std::runtime_error("Path '" + path + "' is not a valid local fs path.");
+    }
+    fs::path file(p.realPath);
+    if (fs::is_directory(file)) {
+        throw std::runtime_error("Path '" + p.realPath + "' is a directory, it must be a file.");
+    }
+    if (!fs::exists(file)) {
+        throw std::runtime_error("File '" + p.realPath + "' doesn't exists.");
+    }
+    return std::ifstream(file);
 }
 
 void LocalFS::close() {
