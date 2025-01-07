@@ -182,8 +182,8 @@ std::shared_ptr<VectorizedRowBatch> PixelsRecordReaderImpl::readBatch(bool reuse
 
     std::vector<int> filterColumnIndex;
 
-    if(has_async_task_ > 0) {
-        asyncReadComplete(has_async_task_);
+    if(has_async_task_num_ > 0) {
+        asyncReadComplete(has_async_task_num_);
     }
 
     if(filter != nullptr) {
@@ -328,11 +328,11 @@ void PixelsRecordReaderImpl::prepareRead() {
 
 void PixelsRecordReaderImpl::asyncReadComplete(int requestSize) {
     // std::cerr << "DEBUG2: Wait Async Size: " << requestSize << std::endl;
-    if(ConfigFactory::Instance().boolCheckProperty("localfs.enable.async.io") && has_async_task_ >= requestSize) {
+    if(ConfigFactory::Instance().boolCheckProperty("localfs.enable.async.io") && has_async_task_num_ >= requestSize) {
         if(ConfigFactory::Instance().getProperty("localfs.async.lib") == "iouring") {
             auto localReader = std::static_pointer_cast<PhysicalLocalReader>(physicalReader);
             localReader->readAsyncComplete(requestSize);
-            has_async_task_ -= requestSize;
+            has_async_task_num_ -= requestSize;
         } else if(ConfigFactory::Instance().getProperty("localfs.async.lib") == "aio") {
             throw InvalidArgumentException("PhysicalLocalReader::readAsync: We don't support aio for our async read yet.");
         }
@@ -398,7 +398,7 @@ bool PixelsRecordReaderImpl::read() {
 		auto byteBuffers = scheduler->executeBatch(physicalReader, requestBatch, originalByteBuffers, queryId);
 
         if(ConfigFactory::Instance().boolCheckProperty("localfs.enable.async.io") && originalByteBuffers.size() > 0) {
-            has_async_task_ = diskChunks.size();
+            has_async_task_num_ = diskChunks.size();
 	    }
 
         for(int index = 0; index < diskChunks.size(); index++) {
