@@ -398,7 +398,7 @@ bool PixelsRecordReaderImpl::read() {
 		auto byteBuffers = scheduler->executeBatch(physicalReader, requestBatch, originalByteBuffers, queryId);
 
         if(ConfigFactory::Instance().boolCheckProperty("localfs.enable.async.io") && originalByteBuffers.size() > 0) {
-            has_async_task_num_ = diskChunks.size();
+            has_async_task_num_ += diskChunks.size();
 	    }
 
         for(int index = 0; index < diskChunks.size(); index++) {
