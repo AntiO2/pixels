@@ -336,7 +336,7 @@ public class BasePartitionedChainJoinWorker extends Worker<PartitionedChainJoinI
         }
     }
 
-    private static Joiner buildChainJoiner(
+    protected static Joiner buildChainJoiner(
             long transId, long timestamp, ExecutorService executor, List<BroadcastTableInfo> chainTables,
             List<ChainJoinInfo> chainJoinInfos, TypeDescription lastResultSchema, WorkerMetrics workerMetrics)
     {
@@ -427,10 +427,17 @@ public class BasePartitionedChainJoinWorker extends Worker<PartitionedChainJoinI
                 {
                     readCostTimer.stop();
                     checkArgument(pixelsReader.isPartitioned(), "pixels file is not partitioned");
-                    Set<Integer> rightHashValues = new HashSet<>(pixelsReader.getRowGroupNum());
-                    for (PixelsProto.RowGroupInformation rgInfo : pixelsReader.getRowGroupInfos())
+                    Set<Integer> rightHashValues;
+                    if (rightScheme.equals(Storage.Scheme.httpstream))
                     {
-                        rightHashValues.add(rgInfo.getPartitionInfo().getHashValue());
+                        rightHashValues = new HashSet<>(hashValues);
+                    } else
+                    {
+                        rightHashValues = new HashSet<>(pixelsReader.getRowGroupNum());
+                        for (PixelsProto.RowGroupInformation rgInfo : pixelsReader.getRowGroupInfos())
+                        {
+                            rightHashValues.add(rgInfo.getPartitionInfo().getHashValue());
+                        }
                     }
                     for (int hashValue : hashValues)
                     {
