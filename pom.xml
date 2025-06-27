@@ -127,6 +127,9 @@
         <dep.junit.platform.version>1.6.2</dep.junit.platform.version>
         <dep.mockito.version>4.5.1</dep.mockito.version>
         <dep.junit.jupiter.version>5.8.2</dep.junit.jupiter.version>
+
+        <!-- flat buffers -->
+        <dep.google.flatbuffers.version>2.0.8</dep.google.flatbuffers.version>
     </properties>
 
     <repositories>
@@ -724,6 +727,13 @@
                 <artifactId>junit-platform-runner</artifactId>
                 <version>${dep.junit.platform.version}</version>
                 <scope>test</scope>
+            </dependency>
+
+            <!-- flat buffers -->
+            <dependency>
+                <groupId>com.google.flatbuffers</groupId>
+                <artifactId>flatbuffers-java</artifactId>
+                <version>${dep.google.flatbuffers.version}</version>
             </dependency>
 
             <dependency>
