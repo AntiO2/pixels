@@ -18,6 +18,7 @@
  * <https://www.gnu.org/licenses/>.
  */
 package io.pixelsdb.pixels.index.rocksdb;
+
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 
 public class RocksetTest
@@ -100,12 +101,12 @@ public class RocksetTest
 
         try {
             // 1. create database
-            String bucketName = ConfigFactory.Instance().getProperty("rockset.s3.bucket");
-            String s3Prefix = ConfigFactory.Instance().getProperty("rockset.s3.prefix");
-            String localDbPath = ConfigFactory.Instance().getProperty("rockset.local.data.path");
-            String persistentCachePath = ConfigFactory.Instance().getProperty("rockset.persistent.cache.path");
-            long persistentCacheSizeGB = Long.parseLong(ConfigFactory.Instance().getProperty("rockset.persistent.cache.size.gb"));
-            boolean readOnly = Boolean.parseBoolean(ConfigFactory.Instance().getProperty("rockset.read.only"));
+            String bucketName = ConfigFactory.Instance().getProperty("index.rockset.s3.bucket");
+            String s3Prefix = ConfigFactory.Instance().getProperty("index.rockset.s3.prefix");
+            String localDbPath = ConfigFactory.Instance().getProperty("index.rockset.local.data.path");
+            String persistentCachePath = ConfigFactory.Instance().getProperty("index.rockset.persistent.cache.path");
+            long persistentCacheSizeGB = Long.parseLong(ConfigFactory.Instance().getProperty("index.rockset.persistent.cache.size.gb"));
+            boolean readOnly = Boolean.parseBoolean(ConfigFactory.Instance().getProperty("index.rockset.read.only"));
 
             System.out.println("Creating RocksDB-Cloud instance...");
             dbHandle = test.CreateDBCloud(bucketName, s3Prefix, localDbPath, 

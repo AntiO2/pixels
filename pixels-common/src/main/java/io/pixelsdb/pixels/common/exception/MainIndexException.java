@@ -17,16 +17,26 @@
  * License along with Pixels.  If not, see
  * <https://www.gnu.org/licenses/>.
  */
-package io.pixelsdb.pixels.daemon;
+package io.pixelsdb.pixels.common.exception;
 
-/**
- * @author gengdy
- * @create 2025-01-21
- */
-public class PixelsRetina
-{
-    public static void main(String[] args)
+public class MainIndexException extends IndexException {
+    public MainIndexException()
     {
-        DaemonMain.main(args);
+        super();
+    }
+
+    public MainIndexException(String message)
+    {
+        super(message);
+    }
+
+    public MainIndexException(Throwable cause)
+    {
+        super(cause);
+    }
+
+    public MainIndexException(String message, Throwable cause)
+    {
+        super(message, cause);
     }
 }

@@ -17,6 +17,20 @@
  * License along with Pixels.  If not, see
  * <https://www.gnu.org/licenses/>.
  */
+<<<<<<<< HEAD:pixels-daemon/src/main/java/io/pixelsdb/pixels/daemon/PixelsRetina.java
+package io.pixelsdb.pixels.daemon;
+
+/**
+ * @author gengdy
+ * @create 2025-01-21
+ */
+public class PixelsRetina
+{
+    public static void main(String[] args)
+    {
+        DaemonMain.main(args);
+    }
+========
 package io.pixelsdb.pixels.common.sink;
 
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
@@ -27,4 +41,5 @@ public interface SinkProvider {
     void start(ConfigFactory config);
     void shutdown();
     boolean isRunning();
+>>>>>>>> master:pixels-common/src/main/java/io/pixelsdb/pixels/common/sink/SinkProvider.java
 }
