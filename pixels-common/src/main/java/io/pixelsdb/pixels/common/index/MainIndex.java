@@ -24,7 +24,6 @@ import io.pixelsdb.pixels.index.IndexProto;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.List;
 
 /**
  * The main index of a table is the mapping from row id to data file.
@@ -90,22 +89,6 @@ public interface MainIndex extends Closeable
      * @return true on success
      */
     boolean deleteRowIdRange(RowIdRange rowIdRange);
-
-    /**
-     * Distribute row id for the secondary index. 
-     * If there isn't any row id in cache, get a range of row ids at once and put them into cache.
-     * @param entry the rowLocation of secondary index
-     * @return true on success
-     */
-    boolean getRowId(SecondaryIndex.Entry entry);
-
-    /**
-     * Distribute row ids for the secondary index.
-     * If there isn't enough row ids in cache, get a range of row ids at once and put them into cache.
-     * @param entries the rowLocation of secondary index
-     * @return true on success
-     */
-    boolean getRgOfRowIds(List<SecondaryIndex.Entry> entries);
 
     /**
      * Persist the main index into persistent storage.
