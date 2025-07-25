@@ -20,21 +20,26 @@
 
 package io.pixelsdb.pixels.core.reader;
 
-import io.pixelsdb.pixels.common.physical.*;
+import io.pixelsdb.pixels.common.physical.PhysicalReader;
+import io.pixelsdb.pixels.common.physical.PhysicalReaderUtil;
+import io.pixelsdb.pixels.common.physical.Storage;
 import io.pixelsdb.pixels.core.TypeDescription;
-import io.pixelsdb.pixels.core.vector.ColumnVector;
+import io.pixelsdb.pixels.core.utils.Bitmap;
+import io.pixelsdb.pixels.core.vector.LongColumnVector;
 import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
     private byte[] data;
-    private byte[] activeMemtableData;
+    private final byte[] activeMemtableData;
     private VectorizedRowBatch resultRowBatch = null;
 
     /**
@@ -71,19 +76,23 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
     private boolean checkValid = false;
     private boolean activeMemtableDataEverRead = false;
     private boolean everRead;
-    private boolean endOfBuffer = false;
+    private boolean endOfFile = false;
     private final int typeMode = TypeDescription.Mode.CREATE_INT_VECTOR_FOR_INT;
     private static final Long POLL_INTERVAL_MILLS = 200L;
-
+    private final boolean shouldReadHiddenColumn;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    private static boolean checkBit(long[] bitmap, int k)
+    {
+        return (bitmap[k / 64] & (1L << (k % 64))) != 0;
+    }
 
     PixelsRecordReaderBufferImpl(PixelsReaderOption option,
                                  byte[] activeMemtableData, List<Long> fileIds, // read version
                                  Storage storage,
                                  String schemaName, String tableName, // to locate file with file id
                                  TypeDescription typeDescription
-    )  throws IOException
-    {
+    ) throws IOException {
         this.option = option;
         this.activeMemtableData = activeMemtableData;
         this.fileIds = fileIds;
@@ -92,6 +101,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
         this.tableName = tableName;
         this.typeDescription = typeDescription;
         this.colNum = typeDescription.getChildrenWithHiddenColumn().size();
+        this.shouldReadHiddenColumn = option.hasValidTransTimestamp();
 
         checkBeforeRead();
     }
@@ -104,12 +114,9 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
         List<Integer> optionColsIndices = new ArrayList<>();
         this.includedColumns = new boolean[colNum];
-        for (String col : optionIncludedCols)
-        {
-            for (int j = 0; j < colNum; j++)
-            {
-                if (col.equalsIgnoreCase(typeDescription.getFieldNames().get(j)))
-                {
+        for (String col : optionIncludedCols) {
+            for (int j = 0; j < colNum; j++) {
+                if (col.equalsIgnoreCase(typeDescription.getFieldNames().get(j))) {
                     optionColsIndices.add(j);
                     includedColumns[j] = true;
                     includedColumnNum++;
@@ -119,8 +126,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
         }
 
         // check included columns
-        if (includedColumnNum != optionIncludedCols.length && !option.isTolerantSchemaEvolution())
-        {
+        if (includedColumnNum != optionIncludedCols.length && !option.isTolerantSchemaEvolution()) {
             checkValid = false;
             throw new IOException("includedColumnsNum is " + includedColumnNum +
                     " whereas optionIncludedCols.length is " + optionIncludedCols.length);
@@ -128,18 +134,15 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
         // create result columns storing result column ids in user specified order
         this.resultColumns = new int[optionIncludedCols.length];
-        for (int i = 0; i < optionIncludedCols.length; i++)
-        {
+        for (int i = 0; i < optionIncludedCols.length; i++) {
             this.resultColumns[i] = optionColsIndices.get(i);
         }
         // assign target columns, ordered by original column order in schema
         int targetColumnNum = new HashSet<>(optionColsIndices).size();
         targetColumns = new int[targetColumnNum];
         int targetColIdx = 0;
-        for (int i = 0; i < includedColumns.length; i++)
-        {
-            if (includedColumns[i])
-            {
+        for (int i = 0; i < includedColumns.length; i++) {
+            if (includedColumns[i]) {
                 targetColumns[targetColIdx] = i;
                 targetColIdx++;
             }
@@ -151,28 +154,25 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
     // get Data of the next memtable
     private boolean read() throws IOException {
-        if (!checkValid)
-        {
+        if (!checkValid) {
             return false;
         }
 
-        if(endOfBuffer)
-        {
+        if (endOfFile) {
             return false;
         }
 
-        if(!activeMemtableDataEverRead)
-        {
+        if (!activeMemtableDataEverRead) {
             // We haven't read active memory table data yet
             activeMemtableDataEverRead = true;
-            if(activeMemtableData != null && activeMemtableData.length != 0) {
+            if (activeMemtableData != null && activeMemtableData.length != 0) {
                 data = activeMemtableData;
                 return true;
             }
         }
 
         if (fileIdIndex >= fileIds.size()) {
-            endOfBuffer = true;
+            endOfFile = true;
             return false;
         }
 
@@ -184,24 +184,17 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
     @Override
     public int prepareBatch(int batchSize) throws IOException {
-        if(endOfBuffer) {
-            return 0;
-        }
-        if(data == null) {
-            return 0;
-        }
-        resultRowBatch = VectorizedRowBatch.deserialize(data);
-        return resultRowBatch.size;
+        return batchSize;
     }
 
     /**
      * Create a row batch without any data, only sets the number of rows (size) and OEF.
      * Such a row batch is used for queries such as select count(*).
+     *
      * @param size the number of rows in the row batch.
      * @return the empty row batch.
      */
-    private VectorizedRowBatch createEmptyEOFRowBatch(int size)
-    {
+    private VectorizedRowBatch createEmptyEOFRowBatch(int size) {
         TypeDescription resultSchema = TypeDescription.createSchema(new ArrayList<>());
         VectorizedRowBatch resultRowBatch = resultSchema.createRowBatch(0, this.typeMode);
         resultRowBatch.projectionSize = 0;
@@ -212,24 +205,95 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
     @Override
     public VectorizedRowBatch readBatch() throws IOException {
-        if(!everRead) {
-            long start = System.nanoTime();
-            if (!read())
-            {
-                throw new IOException("failed to read file.");
-            }
-            readTimeNanos += System.nanoTime() - start;
+        long start = System.nanoTime();
+        if (!read()) {
+            return createEmptyEOFRowBatch(0);
         }
-
+        readTimeNanos += System.nanoTime() - start;
         resultRowBatch = VectorizedRowBatch.deserialize(data);
 
-        
+        LongColumnVector hiddenTimestampVector = (LongColumnVector) resultRowBatch.cols[this.colNum - 1];
+        /**
+         * construct the selected rows bitmap, size is curBatchSize
+         * the i-th bit presents the curRowInRG + i row in chunkBuffers is selected or not.
+         */
+        int curBatchSize = resultRowBatch.size;
+        Bitmap selectedRows = new Bitmap(curBatchSize, false);
+        int addedRows = 0;
+        for (int i = 0; i < curBatchSize; i++) {
+            if ((hiddenTimestampVector == null || hiddenTimestampVector.vector[i] <= this.option.getTransTimestamp())) {
+                selectedRows.set(i);
+                addedRows++;
+            }
+        }
+
+        // read vectors with selected rows
+        for (int i = 0; i < resultColumns.length; i++) {
+            if (!columnVectors[i].duplicated) {
+                PixelsProto.ColumnEncoding encoding = rowGroupFooter.getRowGroupEncoding()
+                        .getColumnChunkEncodings(resultColumns[i]);
+                int index = curRGIdx * (includedColumns.length + 1) + resultColumns[i];
+                PixelsProto.ColumnChunkIndex chunkIndex = rowGroupFooter.getRowGroupIndexEntry()
+                        .getColumnChunkIndexEntries(resultColumns[i]);
+                readers[i].readSelected(chunkBuffers[index], encoding, curRowInRG, curBatchSize,
+                        postScript.getPixelStride(), resultRowBatch.size, columnVectors[i], chunkIndex, selectedRows);
+            }
+        }
+
+        // update current row index in the row group
+        curRowInRG += curBatchSize;
+        rowIndex += curBatchSize;
+        resultRowBatch.size += addedRows;
+        // update qualified row number
+        this.qualifiedRowNum += addedRows;
+
+        // update row group index if current row index exceeds max row count in the row group
+        if (curRowInRG >= rgRowCount) {
+            curRGIdx++;
+            //preRGIdx = curRGIdx; // keep in sync with curRGIdx
+            // if not end of file, update row count
+            if (curRGIdx < targetRGNum) {
+                rgRowCount = footer.getRowGroupInfos(targetRGs[curRGIdx]).getNumberOfRows();
+                // refresh resultColumnsEncoded for reading the column vectors in the next row group.
+                PixelsProto.RowGroupEncoding rgEncoding = rowGroupFooters[curRGIdx].getRowGroupEncoding();
+                for (int i = 0; i < includedColumnNum; i++) {
+                    this.resultColumnsEncoded[i] = rgEncoding.getColumnChunkEncodings(targetColumns[i]).getKind() !=
+                            PixelsProto.ColumnEncoding.Kind.NONE && enableEncodedVector;
+                }
+            }
+            // if end of file, set result vectorized row batch endOfFile
+            else {
+                checkValid = false; // Issue #105: to reject continuous read.
+                resultRowBatch.endOfFile = true;
+                this.endOfFile = true;
+                break;
+            }
+            //preRowInRG = curRowInRG = 0; // keep in sync with curRowInRG.
+            curRowInRG = 0;
+        }
+        if (this.enableEncodedVector) {
+            /**
+             * Issue #374:
+             * Dictionary column vector can not contain data from multiple column chunks,
+             * hence we do not pad the row batch with rows from the next row group.
+             */
+            break;
+        }
+
+        for (ColumnVector cv : columnVectors) {
+            if (cv.duplicated) {
+                // copyFrom() is actually a shallow copy
+                // rename copyFrom() to duplicate(), so it is more readable
+                cv.duplicate(columnVectors[cv.originVecId]);
+            }
+        }
+
         return resultRowBatch;
     }
 
     @Override
     public TypeDescription getResultSchema() {
-        // TODO(AntiO2): Schema evolution is currently not supported in Retina, but may be added in the future.
+        // TODO(AntiO2): Schema evolution is currently not supported in Retina.
         return typeDescription;
     }
 
@@ -240,7 +304,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
     @Override
     public boolean isEndOfFile() {
-        return endOfBuffer;
+        return endOfFile;
     }
 
     @Override
@@ -265,12 +329,12 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader {
 
     @Override
     public int getNumReadRequests() {
-        return 0;
+        return fileIdIndex;
     }
 
     @Override
     public long getReadTimeNanos() {
-        return 0;
+        return readTimeNanos;
     }
 
     @Override

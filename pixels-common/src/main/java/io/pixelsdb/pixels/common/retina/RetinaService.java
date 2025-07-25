@@ -119,7 +119,7 @@ public class RetinaService
     public boolean deleteRecord(long fileId, int rgId, int rgRowId, long timestamp) throws RetinaException
     {
         String token = UUID.randomUUID().toString();
-        RetinaProto.DeleteRecordRequest request = RetinaProto.DeleteRecordRequest.newBuilder()
+        io.pixelsdb.pixels.retina.RetinaProto.DeleteRecordRequest request = RetinaProto.DeleteRecordRequest.newBuilder()
                 .setHeader(RetinaProto.RequestHeader.newBuilder().setToken(token).build())
                 .setFileId(fileId)
                 .setRgId(rgId)
