@@ -54,6 +54,7 @@ public class Layout extends Base
     private Map<Long, Path> projectionPaths;
     private String[] projectionPathUris;
     private long tableId;
+    private long schemaVersionId;
 
     public Layout() { }
 
@@ -107,6 +108,7 @@ public class Layout extends Base
             this.projectionPaths.put(path.getId(), path);
         }
         this.tableId = layout.getTableId();
+        this.schemaVersionId = layout.getSchemaVersionId();
     }
 
     public long getVersion()
@@ -306,6 +308,11 @@ public class Layout extends Base
         this.tableId = tableId;
     }
 
+    public long getSchemaVersionId()
+    {
+        return schemaVersionId;
+    }
+
     @Override
     public String toString()
     {
@@ -317,7 +324,8 @@ public class Layout extends Base
                 ", compact='" + compactJson + '\'' +
                 ", splits='" + splitsJson + '\'' +
                 ", projections='" + projectionsJson + '\'' +
-                ", tableId=" + tableId + '}';
+                ", tableId=" + tableId + '\'' +
+                ", schemaVersionId=" + schemaVersionId + '}';
     }
 
     @Override
@@ -328,6 +336,6 @@ public class Layout extends Base
                 .setCreateAt(this.getCreateAt()).setSplits(this.getSplitsJson())
                 .setOrdered(this.getOrderedJson()).setCompact(this.getCompactJson())
                 .setVersion(this.getVersion()).setProjections(this.getProjectionsJson())
-                .setTableId(this.getTableId()).build();
+                .setTableId(this.getTableId()).setSchemaVersionId(this.getSchemaVersionId()).build();
     }
 }

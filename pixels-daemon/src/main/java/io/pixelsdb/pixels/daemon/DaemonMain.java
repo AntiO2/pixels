@@ -3,6 +3,7 @@ package io.pixelsdb.pixels.daemon;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.daemon.cache.CacheCoordinator;
 import io.pixelsdb.pixels.daemon.cache.CacheWorker;
+import io.pixelsdb.pixels.daemon.index.IndexServer;
 import io.pixelsdb.pixels.daemon.retina.RetinaServer;
 import io.pixelsdb.pixels.daemon.exception.NoSuchServerException;
 import io.pixelsdb.pixels.daemon.heartbeat.HeartbeatCoordinator;
@@ -113,6 +114,14 @@ public class DaemonMain
                         CacheCoordinator cacheCoordinator = new CacheCoordinator();
                         container.addServer("cache_coordinator", cacheCoordinator);
                     }
+
+                    if (indexServerEnabled)
+                    {
+                        int indexServerPort = Integer.parseInt(config.getProperty("index.server.port"));
+                        IndexServer indexServer = new IndexServer(indexServerPort);
+                        container.addServer("index", indexServer);
+                        // start index server
+                    }
                 }
                 catch (Throwable e)
                 {
@@ -170,10 +179,6 @@ public class DaemonMain
                 container.addServer("sink", sinkServer);
             }
 
-            if (indexServerEnabled)
-            {
-                // start index server
-            }
 
             // The shutdown hook ensures the servers are shutdown graceful
             // if this main daemon is terminated by SIGTERM(15) signal.
