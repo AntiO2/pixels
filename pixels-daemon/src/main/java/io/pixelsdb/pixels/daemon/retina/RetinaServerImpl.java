@@ -58,7 +58,6 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     private final IndexService indexService;
     private final RetinaResourceManager retinaResourceManager;
     private final ConcurrentHashMap<String, ReentrantLock> tableLocks = new ConcurrentHashMap<>();
-    private final AtomicInteger optCount = new AtomicInteger(0);
     /**
      * Initialize the visibility management for all the records.
      */
@@ -216,8 +215,6 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         String schemaName = request.getSchemaName();
         List<RetinaProto.TableUpdateData> tableUpdateDataList = request.getTableUpdateDataList();
         long timestamp = request.getTimestamp();
-        int processUpdateId = optCount.getAndIncrement();
-        logger.info("Receive Process Request {}", processUpdateId);
         if (!tableUpdateDataList.isEmpty())
         {
             for (RetinaProto.TableUpdateData tableUpdateData : tableUpdateDataList)
@@ -310,7 +307,6 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
 
                 } finally
                 {
-                    logger.info("Complete Process Request {}", processUpdateId);
                     lock.unlock();
                 }
 
