@@ -30,6 +30,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
@@ -41,9 +42,9 @@ import static java.util.Objects.requireNonNull;
 public class SinglePointIndexFactory
 {
     private static final Logger logger = LogManager.getLogger(SinglePointIndexFactory.class);
-    private final Map<TableIndex, SinglePointIndex> singlePointIndexImpls = new HashMap<>();
+    private final Map<TableIndex, SinglePointIndex> singlePointIndexImpls = new ConcurrentHashMap<>();
     private final Set<SinglePointIndex.Scheme> enabledSchemes = new TreeSet<>();
-    private final Map<Long, TableIndex> indexIdToTableIndex = new HashMap<>();
+    private final Map<Long, TableIndex> indexIdToTableIndex = new ConcurrentHashMap<>();
     /**
      * The providers of the enabled single point index schemes.
      */
@@ -128,26 +129,21 @@ public class SinglePointIndexFactory
      * @return the single point index instance
      * @throws SinglePointIndexException
      */
-    public synchronized SinglePointIndex getSinglePointIndex(long tableId, long indexId) throws SinglePointIndexException
+    public SinglePointIndex getSinglePointIndex(long tableId, long indexId) throws SinglePointIndexException
     {
-        TableIndex tableIndex = indexIdToTableIndex.get(indexId);
-        if (tableIndex == null)
-        {
-            try
-            {
+        TableIndex tableIndex = indexIdToTableIndex.computeIfAbsent(indexId, id -> {
+            try {
                 io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex singlePointIndex =
-                        MetadataService.Instance().getSinglePointIndex(indexId);
-                if (singlePointIndex == null)
-                {
-                    throw new SinglePointIndexException("single point index with id " + indexId + " does not exist");
+                        MetadataService.Instance().getSinglePointIndex(id);
+                if (singlePointIndex == null) {
+                    throw new SinglePointIndexException("single point index with id " + id + " does not exist");
                 }
-                tableIndex = new TableIndex(tableId, indexId, singlePointIndex.getIndexScheme(), singlePointIndex.isUnique());
-                indexIdToTableIndex.put(indexId, tableIndex);
-            } catch (MetadataException e)
-            {
-                throw new SinglePointIndexException("failed to query single point index information from metadata", e);
+                return new TableIndex(tableId, id, singlePointIndex.getIndexScheme(), singlePointIndex.isUnique());
+            } catch (MetadataException | SinglePointIndexException e) {
+                throw new RuntimeException(new SinglePointIndexException(
+                        "failed to query single point index information from metadata", e));
             }
-        }
+        });
         // 'synchronized' in Java is reentrant,  it is fine to call the other getSinglePointIndex() from here.
         return getSinglePointIndex(tableIndex);
     }
@@ -164,21 +160,26 @@ public class SinglePointIndexFactory
         checkArgument(this.enabledSchemes.contains(tableIndex.scheme), "single point index scheme '" +
                 tableIndex.scheme.toString() + "' is not enabled.");
 
-        if (!indexIdToTableIndex.containsKey(tableIndex.indexId))
-        {
-            indexIdToTableIndex.put(tableIndex.indexId, tableIndex);
+        // Ensure tableIndex is registered in indexIdToTableIndex
+        indexIdToTableIndex.computeIfAbsent(tableIndex.indexId, id -> tableIndex);
+
+        try {
+            // Create or return existing SinglePointIndex instance
+            return singlePointIndexImpls.computeIfAbsent(tableIndex, key ->
+                {
+                    try
+                    {
+                        return requireNonNull(this.singlePointIndexProviders.get(key.getScheme()))
+                                .createInstance(key.tableId, key.indexId, key.scheme, key.isUnique());
+                    } catch (SinglePointIndexException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                }
+            );
+        } catch (Exception e) {
+            throw new SinglePointIndexException("failed to create single point index instance", e);
         }
-
-        if (singlePointIndexImpls.containsKey(tableIndex))
-        {
-            return singlePointIndexImpls.get(tableIndex);
-        }
-
-        SinglePointIndex singlePointIndex = this.singlePointIndexProviders.get(tableIndex.getScheme())
-                .createInstance(tableIndex.tableId, tableIndex.indexId, tableIndex.scheme, tableIndex.isUnique());
-        singlePointIndexImpls.put(tableIndex, singlePointIndex);
-
-        return singlePointIndex;
     }
 
     /**

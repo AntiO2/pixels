@@ -19,6 +19,7 @@
  */
 package io.pixelsdb.pixels.common.index;
 
+import com.google.common.collect.ImmutableList;
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.exception.MainIndexException;
 import io.pixelsdb.pixels.common.exception.RowIdException;
@@ -30,6 +31,7 @@ import org.apache.logging.log4j.Logger;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.*;
 
 public class LocalIndexService implements IndexService
 {
@@ -40,6 +42,14 @@ public class LocalIndexService implements IndexService
     {
         return defaultInstance;
     }
+
+    private final ExecutorService executor;
+    private LocalIndexService()
+    {
+        int maxThreads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        this.executor = Executors.newFixedThreadPool(maxThreads);
+    }
+
 
     @Override
     public IndexProto.RowIdBatch allocateRowIdBatch(long tableId, int numRowIds)
@@ -298,17 +308,36 @@ public class LocalIndexService implements IndexService
             }
 
             List<IndexProto.RowLocation> locations = new ArrayList<>();
+            List<Future<IndexProto.RowLocation>> futures = new ArrayList<>();
             for (long rowId : rowIds)
             {
-                IndexProto.RowLocation location = mainIndex.getLocation(rowId);
-                if (location == null)
-                {
-                    throw new IndexException("Failed to get row location for rowId=" + rowId
-                            + " (tableId=" + tableId + ", indexId=" + indexId + ")");
-                }
-                locations.add(location);
+                futures.add(executor.submit(() -> {
+                    IndexProto.RowLocation location = mainIndex.getLocation(rowId);
+                    if (location == null)
+                    {
+                        throw new IndexException("Failed to get row location for rowId=" + rowId
+                                + " (tableId=" + tableId + ", indexId=" + indexId + ")");
+                    }
+                    return location;
+                }));
             }
 
+            for (Future<IndexProto.RowLocation> f : futures)
+            {
+                try
+                {
+                    locations.add(f.get());
+                }
+                catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                    throw new IndexException("Interrupted while fetching row locations", e);
+                }
+                catch (ExecutionException e)
+                {
+                    throw new IndexException("Failed to fetch row location", e.getCause());
+                }
+            }
             return locations;
         }
         catch (MainIndexException | SinglePointIndexException e)
@@ -597,6 +626,11 @@ public class LocalIndexService implements IndexService
     {
         try
         {
+            if(executor != null)
+            {
+                executor.shutdown();
+            }
+
             // Close the single-point index
             SinglePointIndexFactory.Instance().closeIndex(tableId, indexId, false);
             // If it's a primary index, also close the main index

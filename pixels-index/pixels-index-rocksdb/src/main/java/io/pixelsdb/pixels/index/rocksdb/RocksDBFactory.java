@@ -57,13 +57,36 @@ public class RocksDBFactory
         }
 
         // 3. Prepare column family descriptors
+
+        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
+                .setCacheIndexAndFilterBlocks(true)
+                .setPinL0FilterAndIndexBlocksInCache(true)
+                .setBlockSize(16 * 1024)
+                .setFilterPolicy(new BloomFilter(10, false)); // enable Bloom filter (10 bits/key)
+
         List<ColumnFamilyDescriptor> descriptors = existingColumnFamilies.stream()
-                .map(name -> new ColumnFamilyDescriptor(name, new ColumnFamilyOptions()))
+                .map(name -> new ColumnFamilyDescriptor(name, new ColumnFamilyOptions()
+                        .setTableFormatConfig(tableConfig)
+                        .setLevelCompactionDynamicLevelBytes(true)
+                        .setTargetFileSizeBase(64L * 1024 * 1024)
+                        .setMaxBytesForLevelBase(512L * 1024 * 1024)
+                        .setMaxBytesForLevelMultiplier(8.0)))
                 .collect(Collectors.toList());
 
         // 4. Open database
         List<ColumnFamilyHandle> handles = new ArrayList<>();
-        DBOptions dbOptions = new DBOptions().setCreateIfMissing(true);
+
+        DBOptions dbOptions = new DBOptions()
+                .setCreateIfMissing(true)
+                .setIncreaseParallelism(Runtime.getRuntime().availableProcessors()) // Use multi-threaded compaction & flush
+                .setMaxBackgroundJobs(8) // Number of background jobs for flush/compaction
+                .setMaxOpenFiles(-1) // Keep all files open (improves performance)
+                .setUseDirectReads(true) // Use direct I/O reads (bypass page cache)
+                .setUseDirectIoForFlushAndCompaction(true) // Direct I/O for compaction
+                .setAllowConcurrentMemtableWrite(true) // Allow concurrent writes into memtable
+                .setEnableWriteThreadAdaptiveYield(true) // Reduce contention on write threads
+                .setCompactionReadaheadSize(2 * 1024 * 1024) // Read ahead for compaction
+                .setKeepLogFileNum(5);
 
         return RocksDB.open(dbOptions, path, descriptors, handles);
     }

@@ -34,7 +34,10 @@ import org.rocksdb.*;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.*;
 
 /**
  * @author hank, Rolland1944
@@ -47,13 +50,12 @@ public class RocksDBIndex implements SinglePointIndex
     private final RocksDB rocksDB;
     private final String rocksDBPath;
     private final WriteOptions writeOptions;
-    private final ReadOptions readOptions;
     private final long tableId;
     private final long indexId;
     private final boolean unique;
     private boolean closed = false;
     private boolean removed = false;
-
+    private final ExecutorService executor;
     public RocksDBIndex(long tableId, long indexId, String rocksDBPath, boolean unique) throws RocksDBException
     {
         this.tableId = tableId;
@@ -63,7 +65,8 @@ public class RocksDBIndex implements SinglePointIndex
         this.rocksDB = RocksDBFactory.getRocksDB(rocksDBPath);
         this.unique = unique;
         this.writeOptions = new WriteOptions();
-        this.readOptions = new ReadOptions();
+        int maxThreads = Math.max(2, Runtime.getRuntime().availableProcessors());
+        this.executor = Executors.newFixedThreadPool(maxThreads);
     }
 
     /**
@@ -81,7 +84,8 @@ public class RocksDBIndex implements SinglePointIndex
         this.rocksDB = rocksDB;  // Use injected mock directly
         this.unique = unique;
         this.writeOptions = new WriteOptions();
-        this.readOptions = new ReadOptions();
+        int maxThreads = Math.max(2, Runtime.getRuntime().availableProcessors());
+        this.executor = Executors.newFixedThreadPool(maxThreads);
     }
 
     @Override
@@ -105,6 +109,7 @@ public class RocksDBIndex implements SinglePointIndex
     @Override
     public long getUniqueRowId(IndexProto.IndexKey key)
     {
+        ReadOptions readOptions = new ReadOptions();
         // Get prefix
         byte[] keyBytes = toByteArray(key);
         long timestamp = key.getTimestamp();
@@ -129,6 +134,7 @@ public class RocksDBIndex implements SinglePointIndex
     @Override
     public List<Long> getRowIds(IndexProto.IndexKey key)
     {
+        ReadOptions readOptions = new ReadOptions();
         ImmutableList.Builder<Long> builder = ImmutableList.builder();
         byte[] keyBytes = toByteArray(key);
         long timestamp = key.getTimestamp();
@@ -459,41 +465,86 @@ public class RocksDBIndex implements SinglePointIndex
     @Override
     public List<Long> deleteEntries(List<IndexProto.IndexKey> keys) throws SinglePointIndexException
     {
-        ImmutableList.Builder<Long> builder = ImmutableList.builder();
+        // create a list of async delete tasks
+        List<Future<List<Long>>> futures = new ArrayList<>();
+
         try(WriteBatch writeBatch = new WriteBatch())
         {
             // Delete single point index
             for(IndexProto.IndexKey key : keys)
             {
-                byte[] keyBytes = toByteArray(key);
-                byte[] newValue = ByteBuffer.allocate(Long.BYTES).putLong(-1L).array(); // -1 means a tombstone
-
-                if(unique)
-                {
-                    long rowId = getUniqueRowId(key);
-                    if(rowId < 0)   // indicates there is a transaction error, delete invalid index entry
+                Future<List<Long>> future = executor.submit(() -> {
+                    List<Long> localResult = new ArrayList<>();
+                    try
                     {
-                        // Return empty array if entry not found
-                        return ImmutableList.of();
+                        byte[] keyBytes = toByteArray(key);
+                        byte[] newValue = ByteBuffer.allocate(Long.BYTES).putLong(-1L).array(); // -1 means a tombstone
+                        if(unique)
+                        {
+                            long rowId = getUniqueRowId(key);
+                            if (rowId < 0)   // indicates there is a transaction error, delete invalid index entry
+                            {
+                                // Return empty array if entry not found
+                                return ImmutableList.of();
+                            }
+                            localResult.add(rowId);
+                            localResult.add(rowId);
+                            synchronized (writeBatch)
+                            {
+                                writeBatch.put(keyBytes, newValue);
+                            }
+                        }
+                        else
+                        {
+                            List<Long> rowIds = getRowIds(key);
+                            if(rowIds.isEmpty())    // indicates there is a transaction error, delete invalid index entry
+                            {
+                                // Return empty array if entry not found
+                                return ImmutableList.of();
+                            }
+                            localResult.addAll(rowIds);
+                            byte[] nonUniqueKey = toNonUniqueKey(key, -1L);
+                            synchronized (writeBatch)
+                            {
+                                writeBatch.put(nonUniqueKey, new byte[0]);
+                            }
+                        }
+                        return localResult;
                     }
-                    builder.add(rowId);
-                    writeBatch.put(keyBytes,newValue);
+                    catch (Exception e)
+                    {
+                        throw new SinglePointIndexException("failed to delete entry", e);
+                    }
+                });
+                futures.add(future);
+            }
+            List<Long> result = new ArrayList<>();
+            for (Future<List<Long>> f : futures)
+            {
+                try
+                {
+                    List<Long> partial = f.get();
+                    if (partial != null && !partial.isEmpty())
+                    {
+                        result.addAll(partial);
+                    } else
+                    {
+                        // indicates there is a transaction error, delete invalid index entry
+                        return partial;
+                    }
                 }
-                else
+                catch (InterruptedException e)
                 {
-                    List<Long> rowIds = getRowIds(key);
-                    if(rowIds.isEmpty())    // indicates there is a transaction error, delete invalid index entry
-                    {
-                        // Return empty array if entry not found
-                        return ImmutableList.of();
-                    }
-                    builder.addAll(rowIds);
-                    byte[] nonUniqueKey = toNonUniqueKey(key, -1L);
-                    writeBatch.put(nonUniqueKey, new byte[0]);
+                    Thread.currentThread().interrupt();
+                    throw new SinglePointIndexException("delete interrupted", e);
+                }
+                catch (ExecutionException e)
+                {
+                    throw new SinglePointIndexException("delete task failed", e.getCause());
                 }
             }
             rocksDB.write(writeOptions, writeBatch);
-            return builder.build();
+            return ImmutableList.copyOf(result);
         }
         catch (RocksDBException e)
         {
@@ -550,6 +601,10 @@ public class RocksDBIndex implements SinglePointIndex
             if (rocksDB != null)
             {
                 rocksDB.close(); // Close RocksDB instance
+            }
+            if (executor != null)
+            {
+                executor.shutdown();
             }
         }
     }
