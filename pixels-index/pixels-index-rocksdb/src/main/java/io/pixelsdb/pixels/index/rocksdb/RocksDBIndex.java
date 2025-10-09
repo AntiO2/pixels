@@ -65,7 +65,7 @@ public class RocksDBIndex implements SinglePointIndex
         this.rocksDB = RocksDBFactory.getRocksDB(rocksDBPath);
         this.unique = unique;
         this.writeOptions = new WriteOptions();
-        int maxThreads = Math.max(2, Runtime.getRuntime().availableProcessors());
+        int maxThreads = 64;
         this.executor = Executors.newFixedThreadPool(maxThreads);
     }
 
@@ -465,59 +465,71 @@ public class RocksDBIndex implements SinglePointIndex
     @Override
     public List<Long> deleteEntries(List<IndexProto.IndexKey> keys) throws SinglePointIndexException
     {
-        // create a list of async delete tasks
+        final int BATCH_SIZE = 16;  // 每个线程处理的 key 数
         List<Future<List<Long>>> futures = new ArrayList<>();
 
-        try(WriteBatch writeBatch = new WriteBatch())
+        try (WriteBatch writeBatch = new WriteBatch())
         {
-            // Delete single point index
-            for(IndexProto.IndexKey key : keys)
+            for (int i = 0; i < keys.size(); i += BATCH_SIZE)
             {
+                int end = Math.min(i + BATCH_SIZE, keys.size());
+                List<IndexProto.IndexKey> batchKeys = keys.subList(i, end);
+
                 Future<List<Long>> future = executor.submit(() -> {
                     List<Long> localResult = new ArrayList<>();
                     try
                     {
-                        byte[] keyBytes = toByteArray(key);
-                        byte[] newValue = ByteBuffer.allocate(Long.BYTES).putLong(-1L).array(); // -1 means a tombstone
-                        if(unique)
+                        for (IndexProto.IndexKey key : batchKeys)
                         {
-                            long rowId = getUniqueRowId(key);
-                            if (rowId < 0)   // indicates there is a transaction error, delete invalid index entry
+                            try
                             {
-                                // Return empty array if entry not found
-                                return ImmutableList.of();
+                                byte[] keyBytes = toByteArray(key);
+                                byte[] newValue = ByteBuffer.allocate(Long.BYTES).putLong(-1L).array(); // -1 tombstone
+
+                                if (unique)
+                                {
+                                    long rowId = getUniqueRowId(key);
+                                    if (rowId < 0)
+                                    {
+                                        continue; // 跳过无效记录
+                                    }
+                                    localResult.add(rowId);
+                                    synchronized (writeBatch)
+                                    {
+                                        writeBatch.put(keyBytes, newValue);
+                                    }
+                                }
+                                else
+                                {
+                                    List<Long> rowIds = getRowIds(key);
+                                    if (rowIds.isEmpty())
+                                    {
+                                        continue; // 跳过无效记录
+                                    }
+                                    localResult.addAll(rowIds);
+                                    byte[] nonUniqueKey = toNonUniqueKey(key, -1L);
+                                    synchronized (writeBatch)
+                                    {
+                                        writeBatch.put(nonUniqueKey, new byte[0]);
+                                    }
+                                }
                             }
-                            localResult.add(rowId);
-                            localResult.add(rowId);
-                            synchronized (writeBatch)
+                            catch (Exception inner)
                             {
-                                writeBatch.put(keyBytes, newValue);
-                            }
-                        }
-                        else
-                        {
-                            List<Long> rowIds = getRowIds(key);
-                            if(rowIds.isEmpty())    // indicates there is a transaction error, delete invalid index entry
-                            {
-                                // Return empty array if entry not found
-                                return ImmutableList.of();
-                            }
-                            localResult.addAll(rowIds);
-                            byte[] nonUniqueKey = toNonUniqueKey(key, -1L);
-                            synchronized (writeBatch)
-                            {
-                                writeBatch.put(nonUniqueKey, new byte[0]);
+                                LOGGER.warn("failed to delete single key: {}", key, inner);
                             }
                         }
                         return localResult;
                     }
                     catch (Exception e)
                     {
-                        throw new SinglePointIndexException("failed to delete entry", e);
+                        throw new SinglePointIndexException("batch delete failed", e);
                     }
                 });
+
                 futures.add(future);
             }
+
             List<Long> result = new ArrayList<>();
             for (Future<List<Long>> f : futures)
             {
@@ -527,10 +539,6 @@ public class RocksDBIndex implements SinglePointIndex
                     if (partial != null && !partial.isEmpty())
                     {
                         result.addAll(partial);
-                    } else
-                    {
-                        // indicates there is a transaction error, delete invalid index entry
-                        return partial;
                     }
                 }
                 catch (InterruptedException e)
@@ -543,6 +551,7 @@ public class RocksDBIndex implements SinglePointIndex
                     throw new SinglePointIndexException("delete task failed", e.getCause());
                 }
             }
+
             rocksDB.write(writeOptions, writeBatch);
             return ImmutableList.copyOf(result);
         }
@@ -552,6 +561,7 @@ public class RocksDBIndex implements SinglePointIndex
             throw new SinglePointIndexException("failed to delete entries", e);
         }
     }
+
 
     @Override
     public List<Long> purgeEntries(List<IndexProto.IndexKey> indexKeys) throws SinglePointIndexException

@@ -46,7 +46,7 @@ public class LocalIndexService implements IndexService
     private final ExecutorService executor;
     private LocalIndexService()
     {
-        int maxThreads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        int maxThreads = 64;
         this.executor = Executors.newFixedThreadPool(maxThreads);
     }
 
