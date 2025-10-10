@@ -45,6 +45,7 @@ import java.util.List;
 public class RocksDBIndex implements SinglePointIndex
 {
     public static final Logger LOGGER = LogManager.getLogger(RocksDBIndex.class);
+    private static final Logger retinaLogger = LogManager.getLogger("retina");
 
     private final RocksDB rocksDB;
     private final String rocksDBPath;
@@ -219,6 +220,16 @@ public class RocksDBIndex implements SinglePointIndex
                 writeBatch.put(keyBytes, valueBytes);
                 // Put main index
                 mainIndex.putEntry(entry.getRowId(), entry.getRowLocation());
+                retinaLogger.info("P\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        tableId,
+                        indexId,
+                        entry.getIndexKey().getKey().asReadOnlyByteBuffer().getInt(),
+                        entry.getIndexKey().getTimestamp(),
+                        entry.getRowId(),
+                        entry.getRowLocation().getFileId(),
+                        entry.getRowLocation().getRgId(),
+                        entry.getRowLocation().getRgRowOffset()
+                );
             }
             rocksDB.write(writeOptions, writeBatch);
             return true;
@@ -463,7 +474,11 @@ public class RocksDBIndex implements SinglePointIndex
             {
                 byte[] keyBytes = toKeyBytes(key);
                 byte[] newValue = ByteBuffer.allocate(Long.BYTES).putLong(-1L).array(); // -1 means a tombstone
-
+                retinaLogger.info("D\t{}\t{}\t{}\t{}",
+                        tableId,
+                        indexId,
+                        key.getKey().asReadOnlyByteBuffer().getInt(),
+                        key.getTimestamp());
                 if(unique)
                 {
                     long rowId = getUniqueRowId(key);

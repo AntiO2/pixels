@@ -54,7 +54,6 @@ import static java.util.Objects.requireNonNull;
 public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServiceImplBase
 {
     private static final Logger logger = LogManager.getLogger(RetinaServerImpl.class);
-    private static final Logger retinaLogger = LogManager.getLogger("retina");
 
     private final MetadataService metadataService;
     private final IndexService indexService;
@@ -253,11 +252,6 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                             this.retinaResourceManager.deleteRecord(rowLocation, timestamp);
                         }
 
-                        for (IndexProto.IndexKey primaryIndexKey : primaryIndexKeys)
-                        {
-                            retinaLogger.info("D\t{}\t{}\t{}\t{}", tableId, primaryIndexId, primaryIndexKey.getKey().asReadOnlyByteBuffer().getInt(), timestamp);
-                        }
-
                         for (int i = 1; i < indexNum; i++)
                         {
                             List<IndexProto.IndexKey> indexKeys = indexKeysList.get(i);
@@ -295,16 +289,6 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                             rowIdList.add(primaryIndexEntryBuilder.getRowId());
                             IndexProto.PrimaryIndexEntry primaryIndexEntry = primaryIndexEntryBuilder.build();
                             primaryIndexEntries.add(primaryIndexEntry);
-
-                            retinaLogger.info("P\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", primaryIndexEntry.getIndexKey().getTableId(),
-                                    primaryIndexId,
-                                    primaryIndexEntry.getIndexKey().getKey().asReadOnlyByteBuffer().getInt(),
-                                    timestamp,
-                                    primaryIndexEntry.getRowId(),
-                                    primaryIndexEntry.getRowLocation().getFileId(),
-                                    primaryIndexEntry.getRowLocation().getRgId(),
-                                    primaryIndexEntry.getRowLocation().getRgRowOffset()
-                                    );
                         }
                         long tableId = primaryIndexEntries.get(0).getIndexKey().getTableId();
                         indexService.putPrimaryIndexEntries(tableId, primaryIndexId, primaryIndexEntries);
