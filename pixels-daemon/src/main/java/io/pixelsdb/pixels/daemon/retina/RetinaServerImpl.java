@@ -221,8 +221,8 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             {
                 String tableName = tableUpdateData.getTableName();
                 long timestamp = tableUpdateData.getTimestamp();
-                ReentrantLock lock = tableLocks.computeIfAbsent(tableName, k -> new ReentrantLock());
-                lock.lock();
+                // ReentrantLock lock = tableLocks.computeIfAbsent(tableName, k -> new ReentrantLock());
+                // lock.lock();
                 try
                 {
                     boolean init = true;
@@ -308,7 +308,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
 
                 } finally
                 {
-                    lock.unlock();
+                   // lock.unlock();
                 }
 
             }
