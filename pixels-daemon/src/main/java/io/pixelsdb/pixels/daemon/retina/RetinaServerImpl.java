@@ -57,7 +57,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     private final MetadataService metadataService;
     private final IndexService indexService;
     private final RetinaResourceManager retinaResourceManager;
-    private final ConcurrentHashMap<String, ReentrantLock> tableLocks = new ConcurrentHashMap<>();
+    // private final ConcurrentHashMap<String, ReentrantLock> tableLocks = new ConcurrentHashMap<>();
 
     /**
      * Initialize the visibility management for all the records.
@@ -221,8 +221,9 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             {
                 String tableName = tableUpdateData.getTableName();
                 long timestamp = tableUpdateData.getTimestamp();
-                // ReentrantLock lock = tableLocks.computeIfAbsent(tableName, k -> new ReentrantLock());
-                // lock.lock();
+//                String key = tableName + tableUpdateData.getBucket();
+//                ReentrantLock lock = tableLocks.computeIfAbsent(key, k -> new ReentrantLock());
+//                lock.lock();
                 try
                 {
                     boolean init = true;
@@ -308,9 +309,8 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
 
                 } finally
                 {
-                   // lock.unlock();
+                    // lock.unlock();
                 }
-
             }
         }
     }
