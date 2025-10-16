@@ -184,10 +184,23 @@ public class LocalIndexService implements IndexService
 
             // Batch insert into single point index
             boolean success = singlePointIndex.putPrimaryEntries(entries);
+
             if (!success)
             {
                 throw new IndexException("failed to put primary entries into single point index, tableId="
                         + tableId + ", indexId=" + indexId);
+            }
+
+            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
+
+            // Insert into main index
+            for(IndexProto.PrimaryIndexEntry entry : entries)
+            {
+                boolean mainSuccess = mainIndex.putEntry(entry.getRowId(), entry.getRowLocation());
+                if (!mainSuccess)
+                {
+                    throw new MainIndexException("failed to put entry into main index for rowId=" + entry.getRowId());
+                }
             }
 
             return true;
@@ -368,16 +381,12 @@ public class LocalIndexService implements IndexService
 
             // Update the entry in the single point index and get the previous row ID
             long prevRowId = singlePointIndex.updatePrimaryEntry(key, indexEntry.getRowId());
-
+            IndexProto.RowLocation prevLocation;
             if (prevRowId > 0)
             {
                 // Retrieve the previous RowLocation from the main index
-                IndexProto.RowLocation prevLocation = mainIndex.getLocation(prevRowId);
-                if (prevLocation != null)
-                {
-                    return prevLocation;
-                }
-                else
+                prevLocation = mainIndex.getLocation(prevRowId);
+                if (prevLocation == null)
                 {
                     throw new IndexException(
                             "Failed to get previous row location for rowId=" + prevRowId);
@@ -387,6 +396,12 @@ public class LocalIndexService implements IndexService
             {
                 return null; // entry not found
             }
+            boolean mainSuccess = mainIndex.putEntry(indexEntry.getRowId(), indexEntry.getRowLocation());
+            if (!mainSuccess)
+            {
+                throw new MainIndexException("failed to put entry into main index for rowId=" + indexEntry.getRowId());
+            }
+            return prevLocation;
         }
         catch (MainIndexException e)
         {
@@ -417,19 +432,29 @@ public class LocalIndexService implements IndexService
             }
 
             List<IndexProto.RowLocation> prevRowLocations = new ArrayList<>(prevRowIds.size());
-            for (long rowId : prevRowIds)
+            for (long prevRowId : prevRowIds)
             {
                 // Retrieve previous RowLocation from the main index
-                IndexProto.RowLocation location = mainIndex.getLocation(rowId);
+                IndexProto.RowLocation location = mainIndex.getLocation(prevRowId);
                 if (location != null)
                 {
                     prevRowLocations.add(location);
                 }
                 else
                 {
-                    throw new IndexException("Failed to get previous row location for rowId=" + rowId);
+                    throw new IndexException("Failed to get previous row location for prevRowId=" + prevRowId);
                 }
             }
+
+            for(IndexProto.PrimaryIndexEntry entry: indexEntries)
+            {
+                boolean mainSuccess = mainIndex.putEntry(entry.getRowId(), entry.getRowLocation());
+                if (!mainSuccess)
+                {
+                    throw new MainIndexException("failed to put entry into main index for rowId=" + entry.getRowId());
+                }
+            }
+
             return prevRowLocations;
         }
         catch (MainIndexException e)

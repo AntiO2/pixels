@@ -140,14 +140,13 @@ public class MemoryIndex implements SinglePointIndex
     }
 
     @Override
-    public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries) throws MainIndexException, SinglePointIndexException
+    public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries) throws SinglePointIndexException
     {
         checkClosed();
         if (!unique)
         {
             throw new SinglePointIndexException("putPrimaryEntries can only be called on unique indexes");
         }
-        MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
         for (IndexProto.PrimaryIndexEntry entry : entries)
         {
             CompositeKey baseKey = extractBaseKey(entry.getIndexKey());
@@ -155,7 +154,6 @@ public class MemoryIndex implements SinglePointIndex
             ConcurrentSkipListMap<Long, Long> versions =
                     this.uniqueIndex.computeIfAbsent(baseKey, k -> new ConcurrentSkipListMap<>());
             versions.put(timestamp, entry.getRowId());
-            mainIndex.putEntry(entry.getRowId(), entry.getRowLocation());
         }
         return true;
     }

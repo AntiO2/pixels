@@ -216,6 +216,16 @@ public class IndexServiceImpl extends IndexServiceGrpc.IndexServiceImplBase
             {
                 builder.setErrorCode(ErrorCode.INDEX_PUT_SINGLE_POINT_INDEX_FAIL);
             }
+
+            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
+            for(IndexProto.PrimaryIndexEntry entry: entries)
+            {
+                success = mainIndex.putEntry(entry.getRowId(), entry.getRowLocation());
+                if(!success)
+                {
+                    throw new MainIndexException("failed to put entry into main index for rowId=" + entry.getRowId());
+                }
+            }
         }
         catch (MainIndexException e)
         {
@@ -475,11 +485,11 @@ public class IndexServiceImpl extends IndexServiceGrpc.IndexServiceImplBase
             long indexId = request.getIndexId();
             MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
             SinglePointIndex singlePointIndex = SinglePointIndexFactory.Instance().getSinglePointIndex(tableId, indexId);
-            List<Long> rowIds = singlePointIndex.updatePrimaryEntries(entries);
-            if (rowIds != null && !rowIds.isEmpty())
+            List<Long> prevRowIds = singlePointIndex.updatePrimaryEntries(entries);
+            if (prevRowIds != null && !prevRowIds.isEmpty())
             {
                 builder.setErrorCode(ErrorCode.SUCCESS);
-                for (long rowId : rowIds)
+                for (long rowId : prevRowIds)
                 {
                     IndexProto.RowLocation location = mainIndex.getLocation(rowId);
                     if(location == null)
@@ -494,6 +504,16 @@ public class IndexServiceImpl extends IndexServiceGrpc.IndexServiceImplBase
             {
                 builder.setErrorCode(ErrorCode.INDEX_ENTRY_NOT_FOUND);
             }
+
+            for(IndexProto.PrimaryIndexEntry entry: entries)
+            {
+                boolean mainSuccess = mainIndex.putEntry(entry.getRowId(), entry.getRowLocation());
+                if (!mainSuccess)
+                {
+                    throw new MainIndexException("failed to put entry into main index for rowId=" + entry.getRowId());
+                }
+            }
+
         }
         catch (MainIndexException e)
         {

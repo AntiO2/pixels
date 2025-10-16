@@ -20,10 +20,7 @@
 package io.pixelsdb.pixels.index.rockset;
 
 import com.google.common.collect.ImmutableList;
-import io.pixelsdb.pixels.common.exception.MainIndexException;
 import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
-import io.pixelsdb.pixels.common.index.MainIndex;
-import io.pixelsdb.pixels.common.index.MainIndexFactory;
 import io.pixelsdb.pixels.common.index.SinglePointIndex;
 import io.pixelsdb.pixels.index.IndexProto;
 import org.apache.logging.log4j.LogManager;
@@ -32,7 +29,6 @@ import org.apache.logging.log4j.Logger;
 import javax.annotation.Nonnull;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.List;
 
 public class RocksetIndex implements SinglePointIndex
@@ -285,13 +281,12 @@ public class RocksetIndex implements SinglePointIndex
 
     @Override
     public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries)
-            throws SinglePointIndexException, MainIndexException
+            throws SinglePointIndexException
     {
         long wb = 0;
         try
         {
             wb = WriteBatchCreate();
-            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
             for (IndexProto.PrimaryIndexEntry entry : entries)
             {
                 IndexProto.IndexKey key = entry.getIndexKey();
@@ -299,7 +294,6 @@ public class RocksetIndex implements SinglePointIndex
                 byte[] fullKey = concat(toByteArray(key), writeLongBE(key.getTimestamp()));
                 byte[] val = writeLongBE(rowId);
                 WriteBatchPut(wb, fullKey, val);
-                mainIndex.putEntry(rowId, entry.getRowLocation());
             }
             DBWrite(this.dbHandle, wb);
             return true;
