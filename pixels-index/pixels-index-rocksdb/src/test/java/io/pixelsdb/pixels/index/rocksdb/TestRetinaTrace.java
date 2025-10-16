@@ -67,13 +67,14 @@ public class TestRetinaTrace
     private static final int THREAD_COUNT = 16;
 
     // Trace load path: only put operations
-    private static final String loadPath = "/home/gengdy/data/index/index.load.trace";
+    private static final String loadPath = "/tmp/index.load.trace";
 
     // Trace update path: both put and delete operations
-    private static final String updatePath = "/home/gengdy/data/index/index.update.trace";
+    private static final String updatePath = "/tmp/index.update.trace";
 
     private static final IndexService indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local);
 
+    private static int indexIdOffset = 207;
     /**
      * Load the initial data into the index
      */
@@ -123,7 +124,7 @@ public class TestRetinaTrace
                 throw new RuntimeException("Invalid PUT operation: " + String.join("\t", parts));
             }
             this.tableId = Long.parseLong(parts[1]);
-            this.indexId = Long.parseLong(parts[2]);
+            this.indexId = Long.parseLong(parts[2]) + indexIdOffset;
             int keyInt = Integer.parseInt(parts[3]);
             this.key = ByteString.copyFrom(ByteBuffer.allocate(Integer.BYTES)
                     .putInt(keyInt).array());
@@ -178,7 +179,7 @@ public class TestRetinaTrace
                 throw new RuntimeException("Invalid DEL operation: " + String.join("\t", parts));
             }
             this.tableId = Long.parseLong(parts[1]);
-            this.indexId = Long.parseLong(parts[2]);
+            this.indexId = Long.parseLong(parts[2]) + indexIdOffset;
             int keyInt = Integer.parseInt(parts[3]);
             this.key = ByteString.copyFrom(ByteBuffer.allocate(Integer.BYTES)
                     .putInt(keyInt).array());
