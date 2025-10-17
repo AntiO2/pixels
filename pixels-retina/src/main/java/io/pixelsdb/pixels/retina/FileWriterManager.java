@@ -165,6 +165,8 @@ public class FileWriterManager
                      *
                      */
                     ByteBuffer data = minioManager.read(this.tableId, blockId);
+                    String md5 = Md5Util.md5(data);
+                    logger.info("Read Table {} Entry {} Md5 {}", tableId, blockId, md5);
                     this.writer.addRowBatch(VectorizedRowBatch.deserialize(data));
                 }
                 this.writer.close();

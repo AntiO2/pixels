@@ -36,6 +36,7 @@ import io.pixelsdb.pixels.common.index.RowIdAllocator;
 import io.pixelsdb.pixels.common.metadata.domain.Path;
 import io.pixelsdb.pixels.common.physical.*;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
+import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
 import io.pixelsdb.pixels.index.IndexProto;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -272,7 +273,10 @@ public class PixelsWriterBuffer
             {
                 // put into minio
                 long id = flushMemTable.getId();
-                this.minioManager.write(this.tableId, id, flushMemTable.serialize());
+                byte[] memTableSerializedData = flushMemTable.serialize();
+                String md5 = Md5Util.md5(memTableSerializedData);
+                logger.info("Write Table {} Entry {} Md5 {}", tableId, id, md5);
+                this.minioManager.write(this.tableId, id, memTableSerializedData);
 
                 ObjectEntry objectEntry = new ObjectEntry(id, flushMemTable.getFileId(),
                         flushMemTable.getStartIndex(), flushMemTable.getLength());
