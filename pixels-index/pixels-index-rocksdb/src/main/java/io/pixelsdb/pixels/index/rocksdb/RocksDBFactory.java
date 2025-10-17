@@ -36,37 +36,66 @@ public class RocksDBFactory
 
     private RocksDBFactory() { }
 
-    private static RocksDB createRocksDB(String path) throws RocksDBException
-    {
+    private static RocksDB createRocksDB(String path) throws RocksDBException {
         // 1. Get existing column families (returns empty list for new database)
         List<byte[]> existingColumnFamilies;
-        try
-        {
+        try {
             existingColumnFamilies = RocksDB.listColumnFamilies(new Options(), path);
-        } catch (RocksDBException e)
-        {
+        } catch (RocksDBException e) {
             // For new database, return list containing only default column family
             existingColumnFamilies = Collections.singletonList(RocksDB.DEFAULT_COLUMN_FAMILY);
         }
 
         // 2. Ensure default column family is included
-        if (!existingColumnFamilies.contains(RocksDB.DEFAULT_COLUMN_FAMILY))
-        {
+        if (!existingColumnFamilies.contains(RocksDB.DEFAULT_COLUMN_FAMILY)) {
             existingColumnFamilies = new ArrayList<>(existingColumnFamilies);
             existingColumnFamilies.add(RocksDB.DEFAULT_COLUMN_FAMILY);
         }
 
+        // --- 🔧 全局 RocksDB 优化参数 ---
+        final long blockCacheSize = 512L * 1024 * 1024; // 512MB block cache
+        final long writeBufferSize = 128L * 1024 * 1024; // 128MB write buffer
+
+        // Block-based table 配置
+        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
+                .setBlockSize(32 * 1024) // 32KB Block，适合大 key
+                .setBlockCacheSize(blockCacheSize)
+                .setCacheIndexAndFilterBlocks(true)
+                .setCacheIndexAndFilterBlocksWithHighPriority(true)
+                .setPinL0FilterAndIndexBlocksInCache(true)
+                .setFilterPolicy(new BloomFilter(10, false)); // 10 bits/key 布隆过滤器
+
+        // Column family options
+        ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
+                .setTableFormatConfig(tableConfig)
+                .setCompressionType(CompressionType.ZSTD_COMPRESSION) // 比 Snappy 更快
+                .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
+                .optimizeLevelStyleCompaction(writeBufferSize);
+
         // 3. Prepare column family descriptors
         List<ColumnFamilyDescriptor> descriptors = existingColumnFamilies.stream()
-                .map(name -> new ColumnFamilyDescriptor(name, new ColumnFamilyOptions()))
+                .map(name -> new ColumnFamilyDescriptor(name, cfOptions))
                 .collect(Collectors.toList());
 
-        // 4. Open database
+        // 4. RocksDB 实例选项
+        DBOptions dbOptions = new DBOptions()
+                .setCreateIfMissing(true)
+                .setCreateMissingColumnFamilies(true)
+                .setMaxOpenFiles(-1) // 防止文件句柄限制
+                .setIncreaseParallelism(Runtime.getRuntime().availableProcessors())
+                .setMaxBackgroundJobs(4)
+                .setUseDirectReads(true) // 避免双层 page cache
+                .setUseDirectIoForFlushAndCompaction(true)
+                .setAllowConcurrentMemtableWrite(true)
+                .setEnableWriteThreadAdaptiveYield(true);
+
+        // 5. Open database
         List<ColumnFamilyHandle> handles = new ArrayList<>();
-        DBOptions dbOptions = new DBOptions().setCreateIfMissing(true);
 
         return RocksDB.open(dbOptions, path, descriptors, handles);
     }
+
+
 
     public static synchronized RocksDB getRocksDB(String rocksDBPath) throws RocksDBException
     {

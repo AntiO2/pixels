@@ -57,8 +57,11 @@ public class RocksDBIndex implements SinglePointIndex
         this.rocksDBPath = rocksDBPath;
         this.rocksDB = RocksDBFactory.getRocksDB(rocksDBPath);
         this.unique = unique;
-        this.writeOptions = new WriteOptions();
-        this.readOptions = new ReadOptions();
+        this.writeOptions = new WriteOptions()
+                .setDisableWAL(true);
+        this.readOptions = new ReadOptions()
+            .setFillCache(true)
+            .setReadaheadSize(4 * 1024 * 1024);
     }
 
     /**
