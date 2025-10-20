@@ -140,15 +140,13 @@ public class MemoryIndex implements SinglePointIndex
     }
 
     @Override
-    public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries) throws MainIndexException, SinglePointIndexException
+    public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries) throws SinglePointIndexException
     {
         checkClosed();
         if (!unique)
         {
             throw new SinglePointIndexException("putPrimaryEntries can only be called on unique indexes");
         }
-        MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
-        mainIndex.putEntries(entries);
         for (IndexProto.PrimaryIndexEntry entry : entries)
         {
             CompositeKey baseKey = extractBaseKey(entry.getIndexKey());
@@ -364,7 +362,12 @@ public class MemoryIndex implements SinglePointIndex
         ImmutableList.Builder<Long> builder = ImmutableList.builder();
         for (IndexProto.IndexKey key : keys)
         {
-            builder.addAll(deleteEntry(key));
+            List<Long> prevRowIds = deleteEntry(key);
+            if (prevRowIds.isEmpty())
+            {
+                return ImmutableList.of();
+            }
+            builder.addAll(prevRowIds);
         }
         return builder.build();
     }

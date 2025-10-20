@@ -20,10 +20,7 @@
 package io.pixelsdb.pixels.index.rockset;
 
 import com.google.common.collect.ImmutableList;
-import io.pixelsdb.pixels.common.exception.MainIndexException;
 import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
-import io.pixelsdb.pixels.common.index.MainIndex;
-import io.pixelsdb.pixels.common.index.MainIndexFactory;
 import io.pixelsdb.pixels.common.index.SinglePointIndex;
 import io.pixelsdb.pixels.index.IndexProto;
 import org.apache.logging.log4j.LogManager;
@@ -284,14 +281,12 @@ public class RocksetIndex implements SinglePointIndex
 
     @Override
     public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries)
-            throws SinglePointIndexException, MainIndexException
+            throws SinglePointIndexException
     {
         long wb = 0;
         try
         {
             wb = WriteBatchCreate();
-            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
-            mainIndex.putEntries(entries);
             for (IndexProto.PrimaryIndexEntry entry : entries)
             {
                 IndexProto.IndexKey key = entry.getIndexKey();
@@ -368,7 +363,6 @@ public class RocksetIndex implements SinglePointIndex
             byte[] fullKey = concat(toByteArray(key), writeLongBE(key.getTimestamp()));
             byte[] val = writeLongBE(rowId);
             DBput(this.dbHandle, fullKey, val);
-
             return prev;
         }
         catch (Exception e)
@@ -413,16 +407,21 @@ public class RocksetIndex implements SinglePointIndex
         try
         {
             wb = WriteBatchCreate();
-            ImmutableList.Builder<Long> prev = ImmutableList.builder();
+            ImmutableList.Builder<Long> prevRowIds = ImmutableList.builder();
             for (IndexProto.PrimaryIndexEntry entry : entries)
             {
                 IndexProto.IndexKey key = entry.getIndexKey();
-                prev.add(getUniqueRowId(key));
+                long prevRowId = getUniqueRowId(key);
+                if (prevRowId < 0)
+                {
+                    return ImmutableList.of();
+                }
+                prevRowIds.add(prevRowId);
                 byte[] fullKey = concat(toByteArray(key), writeLongBE(key.getTimestamp()));
                 WriteBatchPut(wb, fullKey, writeLongBE(entry.getRowId()));
             }
             DBWrite(this.dbHandle, wb);
-            return prev.build();
+            return prevRowIds.build();
         }
         catch (Exception e)
         {
@@ -446,27 +445,36 @@ public class RocksetIndex implements SinglePointIndex
         try
         {
             wb = WriteBatchCreate();
-            ImmutableList.Builder<Long> prev = ImmutableList.builder();
+            ImmutableList.Builder<Long> prevRowIds = ImmutableList.builder();
             for (IndexProto.SecondaryIndexEntry entry : entries)
             {
                 IndexProto.IndexKey key = entry.getIndexKey();
                 long rowId = entry.getRowId();
                 if (unique)
                 {
-                    prev.add(getUniqueRowId(key));
+                    long prevRowId = getUniqueRowId(key);
+                    if (prevRowId < 0)
+                    {
+                        return ImmutableList.of();
+                    }
+                    prevRowIds.add(prevRowId);
                     byte[] fullKey = concat(toByteArray(key), writeLongBE(key.getTimestamp()));
                     WriteBatchPut(wb, fullKey, writeLongBE(rowId));
                 }
                 else
                 {
                     List<Long> rowIds = getRowIds(key);
-                    prev.addAll(rowIds);
+                    if (rowIds.isEmpty())
+                    {
+                        return ImmutableList.of();
+                    }
+                    prevRowIds.addAll(rowIds);
                     byte[] nonUniqueKey = toNonUniqueKey(key, rowId);
                     WriteBatchPut(wb, nonUniqueKey, new byte[0]);
                 }
             }
             DBWrite(this.dbHandle, wb);
-            return prev.build();
+            return prevRowIds.build();
         }
         catch (Exception e)
         {
@@ -513,7 +521,10 @@ public class RocksetIndex implements SinglePointIndex
             if (unique)
             {
                 long rowId = getUniqueRowId(key);
-                if (rowId < 0) return ImmutableList.of();
+                if (rowId < 0)
+                {
+                    return ImmutableList.of();
+                }
                 prev.add(rowId);
                 byte[] fullKey = concat(toByteArray(key), writeLongBE(key.getTimestamp()));
                 WriteBatchPut(wb, fullKey, writeLongBE(-1L));
@@ -521,7 +532,10 @@ public class RocksetIndex implements SinglePointIndex
             else
             {
                 List<Long> rowIds = getRowIds(key);
-                if (rowIds.isEmpty()) return ImmutableList.of();
+                if (rowIds.isEmpty())
+                {
+                    return ImmutableList.of();
+                }
                 prev.addAll(rowIds);
                 // mark tombstone entry for this (key, -1L)
                 byte[] nonUniqueKeyTomb = toNonUniqueKey(key, -1L);
@@ -558,7 +572,10 @@ public class RocksetIndex implements SinglePointIndex
                 if (unique)
                 {
                     long rowId = getUniqueRowId(key);
-                    if (rowId < 0) return ImmutableList.of();
+                    if (rowId < 0)
+                    {
+                        return ImmutableList.of();
+                    }
                     prev.add(rowId);
                     byte[] fullKey = concat(toByteArray(key), writeLongBE(key.getTimestamp()));
                     WriteBatchPut(wb, fullKey, writeLongBE(-1L));
@@ -566,7 +583,10 @@ public class RocksetIndex implements SinglePointIndex
                 else
                 {
                     List<Long> rowIds = getRowIds(key);
-                    if (rowIds.isEmpty()) return ImmutableList.of();
+                    if (rowIds.isEmpty())
+                    {
+                        return ImmutableList.of();
+                    }
                     prev.addAll(rowIds);
                     byte[] nonUniqueKeyTomb = toNonUniqueKey(key, -1L);
                     WriteBatchPut(wb, nonUniqueKeyTomb, new byte[0]);
