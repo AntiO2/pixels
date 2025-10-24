@@ -23,6 +23,8 @@ import org.junit.Test;
 import org.rocksdb.*;
 import org.rocksdb.util.SizeUnit;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -342,5 +344,35 @@ public class TestRocksDB
                 System.err.println(e);
             }
         }
+    }
+
+    @Test
+    public void testUdt() throws RocksDBException
+    {
+        RocksDB rocksDB = RocksDBFactory.getRocksDB();
+
+        ByteBuffer keyBuffer = ByteBuffer.allocate(4 + 8).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer valueBuffer = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(123); // test;
+        long ts1 = 0L;
+        int key1 = 0;
+        keyBuffer.putInt(key1).putLong(ts1);
+        rocksDB.put(keyBuffer.array(), valueBuffer.array());
+
+
+        ReadOptions readOptions = new ReadOptions();
+        readOptions.setTimestamp(longToSlice(ts1));
+
+        ByteBuffer keyBufferWithoutTs = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
+        keyBufferWithoutTs.putInt(key1);
+        byte[] bytes = rocksDB.get(readOptions, keyBufferWithoutTs.array());
+
+        rocksDB.close();
+    }
+
+    private static Slice longToSlice(long value) {
+        ByteBuffer buf = ByteBuffer.allocate(Long.BYTES)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putLong(value);
+        return new Slice(buf.array());
     }
 }
