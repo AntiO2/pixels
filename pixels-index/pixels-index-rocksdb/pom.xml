@@ -26,6 +26,7 @@
         <dependency>
             <groupId>org.rocksdb</groupId>
             <artifactId>rocksdbjni</artifactId>
+            <version>10.8.0</version>
         </dependency>
 
         <dependency>

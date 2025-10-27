@@ -72,8 +72,7 @@ public class RocksDBFactory
                     cfOptions.setWriteBufferSize(writeBufferSize);
                     cfOptions.setMemtablePrefixBloomSizeRatio(0.1);
                     cfOptions.setTableFormatConfig(tableConfig);
-
-                    cfOptions.setComparator(BuiltinComparator.BYTEWISE_COMPARATOR);
+                    cfOptions.setComparator(BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64TS);
                     return new ColumnFamilyDescriptor(name, cfOptions);
                 })
                 .collect(Collectors.toList());
