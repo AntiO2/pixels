@@ -503,27 +503,27 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
         targetRGNum = targetRGIdx;
 
         // query visibility bitmap of target row groups
-        if (this.option.hasValidTransTimestamp() && retinaService.isEnabled())
-        {
-            try
-            {
-                MetadataService metadataService = MetadataService.Instance();
-                long fileId = metadataService.getFileId(physicalReader.getPathUri());
-                rgVisibilityBitmaps = retinaService.queryVisibility(fileId, targetRGs, option.getTransTimestamp());
-            } catch (IOException e)
-            {
-                logger.error("Failed to get path uri");
-                throw new IOException("Failed to get path uri");
-            } catch (MetadataException e)
-            {
-                logger.error("Failed to get file id for file " + physicalReader.getPathUri(), e);
-                throw new IOException("Failed to get file id for file " + physicalReader.getPathUri(), e);
-            } catch (RetinaException e)
-            {
-                logger.error("Failed to query visibility bitmap for file " + physicalReader.getPathUri(), e);
-                throw new IOException("Failed to query visibility bitmap for file " + physicalReader.getPathUri(), e);
-            }
-        }
+//        if (this.option.hasValidTransTimestamp() && retinaService.isEnabled())
+//        {
+//            try
+//            {
+//                MetadataService metadataService = MetadataService.Instance();
+//                long fileId = metadataService.getFileId(physicalReader.getPathUri());
+//                rgVisibilityBitmaps = retinaService.queryVisibility(fileId, targetRGs, option.getTransTimestamp());
+//            } catch (IOException e)
+//            {
+//                logger.error("Failed to get path uri");
+//                throw new IOException("Failed to get path uri");
+//            } catch (MetadataException e)
+//            {
+//                logger.error("Failed to get file id for file " + physicalReader.getPathUri(), e);
+//                throw new IOException("Failed to get file id for file " + physicalReader.getPathUri(), e);
+//            } catch (RetinaException e)
+//            {
+//                logger.error("Failed to query visibility bitmap for file " + physicalReader.getPathUri(), e);
+//                throw new IOException("Failed to query visibility bitmap for file " + physicalReader.getPathUri(), e);
+//            }
+//        }
 
         if (targetRGNum == 0)
         {
@@ -1131,11 +1131,15 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
                  */
                 Bitmap selectedRows = new Bitmap(curBatchSize, false);
                 int addedRows = 0;
-                for (int i = 0; i < curBatchSize; i++)
-                {
-                    if ((hiddenTimestampVector == null || hiddenTimestampVector.vector[i] <= this.transTimestamp)
-                        && (rgVisibilityBitmaps == null || !checkBit(rgVisibilityBitmaps[curRGIdx], curRowInRG + i)))
-                    {
+                // 获取 dice 阈值
+                double dice = this.option.getDeleteDice();
+                for (int i = 0; i < curBatchSize; i++) {
+                    // 掷骰子决定是否删除
+                    if (dice > 0.0 && java.util.concurrent.ThreadLocalRandom.current().nextDouble() < dice) {
+                        // 命中删除比例
+                        resultRowBatch.deletedSize++;
+                    } else {
+                        // 正常读取
                         selectedRows.set(i);
                         addedRows++;
                     }

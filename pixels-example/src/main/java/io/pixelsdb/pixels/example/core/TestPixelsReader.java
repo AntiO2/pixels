@@ -35,14 +35,11 @@ import java.util.List;
 /**
  * @author hank
  */
-public class TestPixelsReader
-{
-    public static void main(String[] args)
-    {
-        // Note you may need to restart intellij to let it pick up the updated environment variable value
-        // example path: s3://bucket-name/test-file.pxl
-        String currentPath = System.getenv("PIXELS_S3_TEST_BUCKET_PATH") + "test.pxl";
-        System.out.println(currentPath);
+public class TestPixelsReader {
+    public static void main(String[] args) {
+        String currentPath = "s3://home-zinuo/hybench/sf1200_v3/loantrans/v-0-ordered/realtime-pixels-retina_20260124112621_29_69356.pxl";
+        int totalIterations = 100;
+        double deleteDice = 0.9;
         try {
             Storage storage = StorageFactory.Instance().getStorage("s3");
             PixelsReader reader = PixelsReaderImpl.newBuilder()
@@ -51,43 +48,58 @@ public class TestPixelsReader
                     .setPixelsFooterCache(new PixelsFooterCache())
                     .build();
 
-            TypeDescription schema = reader.getFileSchema();
-            List<String> fieldNames = schema.getFieldNames();
-            System.out.println("fieldNames: " + fieldNames);
-            String[] cols = new String[fieldNames.size()];
-            for (int i = 0; i < fieldNames.size(); i++) {
-                cols[i] = fieldNames.get(i);
+            PixelsReaderOption option = new PixelsReaderOption();
+            option.includeCols(reader.getFileSchema().getFieldNames().toArray(new String[0]));
+            option.setDeleteDice(deleteDice);
+            option.transTimestamp(Long.MAX_VALUE);
+
+            long globalValidRows = 0;
+            long globalDeletedRows = 0;
+
+            // --- 开始计时 ---
+            long startTime = System.currentTimeMillis();
+
+            for (int iter = 1; iter <= totalIterations; iter++) {
+                // 如果迭代次数很多，可以关掉打印以减少 IO 对耗时的影响
+                // System.out.println("Iteration " + iter + " starting...");
+
+                PixelsRecordReader recordReader = reader.read(option);
+                VectorizedRowBatch rowBatch;
+                while (true) {
+                    rowBatch = recordReader.readBatch(10000);
+                    globalValidRows += rowBatch.size;
+                    globalDeletedRows += rowBatch.deletedSize;
+                    if (rowBatch.endOfFile) break;
+                }
             }
 
-            PixelsReaderOption option = new PixelsReaderOption();
-            option.skipCorruptRecords(true);
-            option.tolerantSchemaEvolution(true);
-            option.includeCols(cols);
-            PixelsRecordReader recordReader = reader.read(option);
-            System.out.println("recordReader.getCompletedRows():" + recordReader.getCompletedRows());
-            System.out.println("reader.getRowGroupInfo(0).getNumberOfRows():" + reader.getRowGroupInfo(0).getNumberOfRows());
-            int batchSize = 10000;
-            VectorizedRowBatch rowBatch;
-            int len = 0;
-            int numRows = 0;
-            int numBatches = 0;
-            while (true) {
-                rowBatch = recordReader.readBatch(batchSize);
-                System.out.println("rowBatch: " + rowBatch);
-                numBatches++;
-                String result = rowBatch.toString();
-                len += result.length();
-                System.out.println("loop:" + numBatches + ", rowBatchSize:" + rowBatch.size);
-                if (rowBatch.endOfFile) {
-                    numRows += rowBatch.size;
-                    break;
-                }
-                numRows += rowBatch.size;
-            }
-            System.out.println("numBatches:" + numBatches + ", numRows:" + numRows);
+            // --- 结束计时 ---
+            long endTime = System.currentTimeMillis();
+            long totalTimeMs = endTime - startTime;
+
+            // --- 数据计算 ---
+            long totalRows = globalValidRows + globalDeletedRows;
+            double deleteRate = totalRows == 0 ? 0 : (double) globalDeletedRows / totalRows * 100;
+            double avgIterTime = (double) totalTimeMs / totalIterations;
+            // 吞吐量：每秒处理的总行数 (Total Rows / Second)
+            double throughput = totalTimeMs == 0 ? 0 : (double) totalRows / (totalTimeMs / 1000.0);
+
+            // 1. 标准控制台打印 (用于直观查看)
+            System.out.println("================== Result Statistics ==================");
+            System.out.println(String.format("Time Taken: %d ms", totalTimeMs));
+            System.out.println(String.format("Throughput: %.2f rows/s", throughput));
+
+            // 2. CSV 格式输出 (最后一行为 CSV 内容)
+            System.out.println("\nCSV Output (Header + Data):");
+            System.out.println("Iterations,TotalRows,ValidRows,DeletedRows,DeleteRate(%),TotalTime(ms),AvgIterTime(ms),Throughput(rows/s)");
+
+            String csvResult = String.format("%d,%d,%d,%d,%.2f,%d,%.2f,%.2f",
+                    totalIterations, totalRows, globalValidRows, globalDeletedRows,
+                    deleteRate, totalTimeMs, avgIterTime, throughput);
+            System.out.println(csvResult);
+
             reader.close();
         } catch (IOException e) {
-            System.out.println("Err path: " + currentPath.toString());
             e.printStackTrace();
         }
     }

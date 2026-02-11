@@ -39,6 +39,18 @@ public class PixelsReaderOption
     private int rgStart = 0;
     private int rgLen = -1;     // -1 means reading to the end of the file
 
+    private double deleteDice = 0.0;
+
+    public double getDeleteDice() {
+        return deleteDice;
+    }
+
+    public void setDeleteDice(double deleteDice) {
+        if (deleteDice < 0.0 || deleteDice > 1.0) {
+            throw new IllegalArgumentException("Delete dice must be between 0.0 and 1.0");
+        }
+        this.deleteDice = deleteDice;
+    }
     public PixelsReaderOption() { }
 
     public PixelsReaderOption includeCols(String[] columnNames)

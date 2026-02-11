@@ -45,7 +45,7 @@ public class VectorizedRowBatch implements AutoCloseable
     public int size;              // number of rows that qualify, i.e., haven't been filtered out.
     public int projectionSize;
     public int maxSize;           // capacity, i.e., the maximum number of rows can be stored in this row batch.
-
+    public int deletedSize;
     private long memoryUsage = 0L;
 
     // If this is true, then there is no data in the batch -- we have hit the end of input.
