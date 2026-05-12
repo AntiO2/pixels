@@ -21,14 +21,27 @@ package io.pixelsdb.pixels.common.index.service;
 
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.exception.MainIndexException;
+import io.pixelsdb.pixels.common.exception.MetadataException;
+import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.exception.RowIdException;
 import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
+import io.pixelsdb.pixels.common.exception.VectorIndexException;
 import io.pixelsdb.pixels.common.index.*;
+import io.pixelsdb.pixels.common.metadata.MetadataService;
+import io.pixelsdb.pixels.common.metadata.domain.File;
+import io.pixelsdb.pixels.common.metadata.domain.Layout;
+import io.pixelsdb.pixels.common.metadata.domain.Path;
+import io.pixelsdb.pixels.common.metadata.domain.Schema;
+import io.pixelsdb.pixels.common.metadata.domain.Table;
+import io.pixelsdb.pixels.common.retina.RetinaService;
+import io.pixelsdb.pixels.common.utils.RetinaUtils;
 import io.pixelsdb.pixels.index.IndexProto;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class LocalIndexService implements IndexService
 {
@@ -632,5 +645,163 @@ public class LocalIndexService implements IndexService
         {
             throw new IndexException("Failed to remove index for tableId=" + tableId + ", indexId=" + indexId, e);
         }
+    }
+
+    @Override
+    public boolean upsertVectorIndexEntry(IndexProto.VectorIndexEntry entry, VectorIndexOption indexOption) throws IndexException
+    {
+        try
+        {
+            VectorIndex vectorIndex = VectorIndexFactory.Instance().getVectorIndex(entry.getTableId(), entry.getIndexId(), indexOption);
+            return vectorIndex.upsert(entry.getRowId(), entry.getValuesList().stream().mapToDouble(Double::doubleValue).toArray(),
+                    entry.getTimestamp());
+        }
+        catch (VectorIndexException e)
+        {
+            throw new IndexException("Failed to upsert vector index entry for indexId=" + entry.getIndexId(), e);
+        }
+    }
+
+    @Override
+    public boolean upsertVectorIndexEntries(long tableId, long indexId, List<IndexProto.VectorIndexEntry> entries,
+                                            VectorIndexOption indexOption) throws IndexException
+    {
+        try
+        {
+            VectorIndex vectorIndex = VectorIndexFactory.Instance().getVectorIndex(tableId, indexId, indexOption);
+            return vectorIndex.upsert(entries);
+        }
+        catch (VectorIndexException e)
+        {
+            throw new IndexException("Failed to upsert vector index entries for indexId=" + indexId, e);
+        }
+    }
+
+    @Override
+    public List<VectorSearchResult> searchVectorIndex(long tableId, long indexId, double[] queryVector, int topK,
+                                                      long timestamp, VectorIndexOption indexOption) throws IndexException
+    {
+        try
+        {
+            VectorIndex vectorIndex = VectorIndexFactory.Instance().getVectorIndex(tableId, indexId, indexOption);
+            int oversampleFactor = Integer.parseInt(ConfigFactory.Instance().getProperty("index.hnsw.oversample.factor"));
+            List<VectorSearchResult> candidates = vectorIndex.search(queryVector, Math.max(topK, topK * oversampleFactor), indexOption);
+            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
+            MetadataService metadataService = MetadataService.Instance();
+            Map<Long, Path> pathMap = getPathMap(metadataService, tableId);
+            List<VectorSearchResult> visible = new ArrayList<>(topK);
+            for (VectorSearchResult candidate : candidates)
+            {
+                IndexProto.RowLocation rowLocation = mainIndex.getLocation(candidate.getRowId());
+                if (rowLocation == null)
+                {
+                    continue;
+                }
+                File file = metadataService.getFileById(rowLocation.getFileId());
+                Path path = pathMap.get(file.getPathId());
+                RetinaService retinaService = (path == null) ? RetinaService.Instance() :
+                        RetinaUtils.getRetinaServiceFromPath(File.getFilePath(path, file));
+                RetinaService.VisibilityResult visibilityResult = retinaService.queryVisibility(rowLocation.getFileId(),
+                        new int[]{rowLocation.getRgId()}, timestamp,
+                        indexOption.getTransId() == null ? -1L : indexOption.getTransId());
+                if (visibilityResult.isOffloaded())
+                {
+                    continue;
+                }
+                long[][] bitmaps = visibilityResult.getBitmaps();
+                if (bitmaps.length == 0 || !isDeleted(bitmaps[0], rowLocation.getRgRowOffset()))
+                {
+                    visible.add(candidate);
+                    if (visible.size() >= topK)
+                    {
+                        break;
+                    }
+                }
+            }
+            return visible;
+        }
+        catch (VectorIndexException | MainIndexException | MetadataException | RetinaException e)
+        {
+            throw new IndexException("Failed to search vector index for tableId=" + tableId + ", indexId=" + indexId, e);
+        }
+    }
+
+    @Override
+    public boolean openVectorIndex(long tableId, long indexId, VectorIndexOption indexOption) throws IndexException
+    {
+        try
+        {
+            return VectorIndexFactory.Instance().getVectorIndex(tableId, indexId, indexOption) != null;
+        }
+        catch (VectorIndexException e)
+        {
+            throw new IndexException("Failed to open vector index for tableId=" + tableId + ", indexId=" + indexId, e);
+        }
+    }
+
+    @Override
+    public boolean closeVectorIndex(long tableId, long indexId, VectorIndexOption option) throws IndexException
+    {
+        try
+        {
+            VectorIndexFactory.Instance().closeIndex(tableId, indexId, false, option);
+            return true;
+        }
+        catch (VectorIndexException e)
+        {
+            throw new IndexException("Failed to close vector index for tableId=" + tableId + ", indexId=" + indexId, e);
+        }
+    }
+
+    @Override
+    public boolean removeVectorIndex(long tableId, long indexId, VectorIndexOption option) throws IndexException
+    {
+        try
+        {
+            VectorIndexFactory.Instance().closeIndex(tableId, indexId, true, option);
+            return true;
+        }
+        catch (VectorIndexException e)
+        {
+            throw new IndexException("Failed to remove vector index for tableId=" + tableId + ", indexId=" + indexId, e);
+        }
+    }
+
+    private static boolean isDeleted(long[] bitmap, int rowOffset)
+    {
+        if (bitmap == null || bitmap.length == 0)
+        {
+            return false;
+        }
+        int wordIndex = rowOffset / 64;
+        if (wordIndex >= bitmap.length)
+        {
+            return false;
+        }
+        return (bitmap[wordIndex] & (1L << (rowOffset % 64))) != 0;
+    }
+
+    private static Map<Long, Path> getPathMap(MetadataService metadataService, long tableId) throws MetadataException
+    {
+        Table table = metadataService.getTableById(tableId);
+        Schema schema = metadataService.getSchemaById(table.getSchemaId());
+        List<Layout> layouts = metadataService.getLayouts(schema.getName(), table.getName());
+        Map<Long, Path> pathMap = new HashMap<>();
+        for (Layout layout : layouts)
+        {
+            for (Path path : layout.getOrderedPaths())
+            {
+                pathMap.put(path.getId(), path);
+            }
+            for (Path path : layout.getCompactPaths())
+            {
+                pathMap.put(path.getId(), path);
+            }
+            for (Path path : layout.getProjectionPaths().values())
+            {
+                pathMap.put(path.getId(), path);
+            }
+        }
+        return pathMap;
     }
 }

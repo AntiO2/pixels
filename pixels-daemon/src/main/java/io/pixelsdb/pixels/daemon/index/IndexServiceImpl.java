@@ -21,12 +21,14 @@ package io.pixelsdb.pixels.daemon.index;
 
 import io.grpc.stub.StreamObserver;
 import io.pixelsdb.pixels.common.error.ErrorCode;
+import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.exception.MainIndexException;
 import io.pixelsdb.pixels.common.exception.RowIdException;
 import io.pixelsdb.pixels.common.exception.SinglePointIndexException;
 import io.pixelsdb.pixels.common.index.*;
 import io.pixelsdb.pixels.index.IndexProto;
 import io.pixelsdb.pixels.index.IndexServiceGrpc;
+import io.pixelsdb.pixels.common.index.service.LocalIndexService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -792,6 +794,125 @@ public class IndexServiceImpl extends IndexServiceGrpc.IndexServiceImplBase
         catch (SinglePointIndexException e)
         {
             builder.setErrorCode(ErrorCode.INDEX_REMOVE_SINGLE_POINT_INDEX_FAIL);
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void upsertVectorIndexEntry(IndexProto.UpsertVectorIndexEntryRequest request,
+                                       StreamObserver<IndexProto.UpsertVectorIndexEntryResponse> responseObserver)
+    {
+        IndexProto.UpsertVectorIndexEntryResponse.Builder builder = IndexProto.UpsertVectorIndexEntryResponse.newBuilder();
+        try
+        {
+            LocalIndexService.Instance().upsertVectorIndexEntry(request.getIndexEntry(),
+                    new VectorIndexOption(request.getIndexOption()));
+            builder.setErrorCode(ErrorCode.SUCCESS);
+        }
+        catch (IndexException e)
+        {
+            builder.setErrorCode(ErrorCode.INDEX_UPSERT_VECTOR_INDEX_FAIL);
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void upsertVectorIndexEntries(IndexProto.UpsertVectorIndexEntriesRequest request,
+                                         StreamObserver<IndexProto.UpsertVectorIndexEntriesResponse> responseObserver)
+    {
+        IndexProto.UpsertVectorIndexEntriesResponse.Builder builder = IndexProto.UpsertVectorIndexEntriesResponse.newBuilder();
+        try
+        {
+            LocalIndexService.Instance().upsertVectorIndexEntries(request.getTableId(), request.getIndexId(),
+                    request.getIndexEntriesList(), new VectorIndexOption(request.getIndexOption()));
+            builder.setErrorCode(ErrorCode.SUCCESS);
+        }
+        catch (IndexException e)
+        {
+            builder.setErrorCode(ErrorCode.INDEX_UPSERT_VECTOR_INDEX_FAIL);
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void searchVectorIndex(IndexProto.SearchVectorIndexRequest request,
+                                  StreamObserver<IndexProto.SearchVectorIndexResponse> responseObserver)
+    {
+        IndexProto.SearchVectorIndexResponse.Builder builder = IndexProto.SearchVectorIndexResponse.newBuilder();
+        try
+        {
+            List<VectorSearchResult> hits = LocalIndexService.Instance().searchVectorIndex(request.getTableId(),
+                    request.getIndexId(), request.getQueryVectorList().stream().mapToDouble(Double::doubleValue).toArray(),
+                    request.getTopK(), request.getTimestamp(), new VectorIndexOption(request.getIndexOption()));
+            builder.setErrorCode(ErrorCode.SUCCESS);
+            for (VectorSearchResult hit : hits)
+            {
+                builder.addHits(IndexProto.VectorSearchHit.newBuilder().setRowId(hit.getRowId()).setScore(hit.getScore()).build());
+            }
+        }
+        catch (IndexException e)
+        {
+            builder.setErrorCode(ErrorCode.INDEX_SEARCH_VECTOR_INDEX_FAIL);
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void openVectorIndex(IndexProto.OpenVectorIndexRequest request,
+                                StreamObserver<IndexProto.OpenVectorIndexResponse> responseObserver)
+    {
+        IndexProto.OpenVectorIndexResponse.Builder builder = IndexProto.OpenVectorIndexResponse.newBuilder();
+        try
+        {
+            LocalIndexService.Instance().openVectorIndex(request.getTableId(), request.getIndexId(),
+                    new VectorIndexOption(request.getIndexOption()));
+            builder.setErrorCode(ErrorCode.SUCCESS);
+        }
+        catch (IndexException e)
+        {
+            builder.setErrorCode(ErrorCode.INDEX_OPEN_VECTOR_INDEX_FAIL);
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void closeVectorIndex(IndexProto.CloseVectorIndexRequest request,
+                                 StreamObserver<IndexProto.CloseVectorIndexResponse> responseObserver)
+    {
+        IndexProto.CloseVectorIndexResponse.Builder builder = IndexProto.CloseVectorIndexResponse.newBuilder();
+        try
+        {
+            LocalIndexService.Instance().closeVectorIndex(request.getTableId(), request.getIndexId(),
+                    new VectorIndexOption(request.getIndexOption()));
+            builder.setErrorCode(ErrorCode.SUCCESS);
+        }
+        catch (IndexException e)
+        {
+            builder.setErrorCode(ErrorCode.INDEX_CLOSE_VECTOR_INDEX_FAIL);
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void removeVectorIndex(IndexProto.RemoveVectorIndexRequest request,
+                                  StreamObserver<IndexProto.RemoveVectorIndexResponse> responseObserver)
+    {
+        IndexProto.RemoveVectorIndexResponse.Builder builder = IndexProto.RemoveVectorIndexResponse.newBuilder();
+        try
+        {
+            LocalIndexService.Instance().removeVectorIndex(request.getTableId(), request.getIndexId(),
+                    new VectorIndexOption(request.getIndexOption()));
+            builder.setErrorCode(ErrorCode.SUCCESS);
+        }
+        catch (IndexException e)
+        {
+            builder.setErrorCode(ErrorCode.INDEX_REMOVE_VECTOR_INDEX_FAIL);
         }
         responseObserver.onNext(builder.build());
         responseObserver.onCompleted();

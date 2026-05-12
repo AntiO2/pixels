@@ -85,6 +85,10 @@ public class ErrorCode
     public static final int METADATA_ADD_RETINA_BUFFER_FAILED = (ERROR_BASE_METADATA + 53);
     public static final int METADATA_GET_FILE_BY_ID_FAILED = (ERROR_BASE_METADATA + 54);
     public static final int METADATA_ATOMIC_SWAP_FILES_FAILED = (ERROR_BASE_METADATA + 55);
+    public static final int METADATA_ADD_VECTOR_INDEX_FAILED = (ERROR_BASE_METADATA + 56);
+    public static final int METADATA_VECTOR_INDEX_NOT_FOUND = (ERROR_BASE_METADATA + 57);
+    public static final int METADATA_UPDATE_VECTOR_INDEX_FAILED = (ERROR_BASE_METADATA + 58);
+    public static final int METADATA_DELETE_VECTOR_INDEX_FAILED = (ERROR_BASE_METADATA + 59);
     // end error code for metadata rpc
 
     // begin error code for shared memory message queue
@@ -157,6 +161,11 @@ public class ErrorCode
     public static final int INDEX_UPDATE_SINGLE_POINT_INDEX_FAIL = ERROR_INDEX_SERVER + 17;
     public static final int INDEX_PURGE_MAIN_INDEX_FAIL = ERROR_INDEX_SERVER + 18;
     public static final int INDEX_PURGE_SINGLE_POINT_FAIL = ERROR_INDEX_SERVER + 19;
+    public static final int INDEX_UPSERT_VECTOR_INDEX_FAIL = ERROR_INDEX_SERVER + 20;
+    public static final int INDEX_SEARCH_VECTOR_INDEX_FAIL = ERROR_INDEX_SERVER + 21;
+    public static final int INDEX_OPEN_VECTOR_INDEX_FAIL = ERROR_INDEX_SERVER + 22;
+    public static final int INDEX_CLOSE_VECTOR_INDEX_FAIL = ERROR_INDEX_SERVER + 23;
+    public static final int INDEX_REMOVE_VECTOR_INDEX_FAIL = ERROR_INDEX_SERVER + 24;
 
     // error code for node service
     private static final int ERROR_NODE_SERVER = ERROR_BASE + 700;

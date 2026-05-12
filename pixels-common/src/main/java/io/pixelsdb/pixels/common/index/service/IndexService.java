@@ -21,6 +21,8 @@ package io.pixelsdb.pixels.common.index.service;
 
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.index.IndexOption;
+import io.pixelsdb.pixels.common.index.VectorIndexOption;
+import io.pixelsdb.pixels.common.index.VectorSearchResult;
 import io.pixelsdb.pixels.index.IndexProto;
 import java.util.List;
 
@@ -215,5 +217,20 @@ public interface IndexService
      * @return true on success
      */
     boolean removeIndex(long tableId, long indexId, boolean isPrimary, IndexOption option) throws IndexException;
-}
 
+    boolean upsertVectorIndexEntry(IndexProto.VectorIndexEntry entry, VectorIndexOption indexOption) throws IndexException;
+
+    boolean upsertVectorIndexEntries(long tableId, long indexId,
+                                     List<IndexProto.VectorIndexEntry> entries,
+                                     VectorIndexOption indexOption) throws IndexException;
+
+    List<VectorSearchResult> searchVectorIndex(long tableId, long indexId, double[] queryVector,
+                                               int topK, long timestamp,
+                                               VectorIndexOption indexOption) throws IndexException;
+
+    boolean openVectorIndex(long tableId, long indexId, VectorIndexOption indexOption) throws IndexException;
+
+    boolean closeVectorIndex(long tableId, long indexId, VectorIndexOption option) throws IndexException;
+
+    boolean removeVectorIndex(long tableId, long indexId, VectorIndexOption option) throws IndexException;
+}

@@ -57,6 +57,12 @@ service IndexService {
   rpc OpenIndex (OpenIndexRequest) returns (OpenIndexResponse);
   rpc CloseIndex (CloseIndexRequest) returns (CloseIndexResponse);
   rpc RemoveIndex (RemoveIndexRequest) returns (RemoveIndexResponse);
+  rpc UpsertVectorIndexEntry (UpsertVectorIndexEntryRequest) returns (UpsertVectorIndexEntryResponse);
+  rpc UpsertVectorIndexEntries (UpsertVectorIndexEntriesRequest) returns (UpsertVectorIndexEntriesResponse);
+  rpc SearchVectorIndex (SearchVectorIndexRequest) returns (SearchVectorIndexResponse);
+  rpc OpenVectorIndex (OpenVectorIndexRequest) returns (OpenVectorIndexResponse);
+  rpc CloseVectorIndex (CloseVectorIndexRequest) returns (CloseVectorIndexResponse);
+  rpc RemoveVectorIndex (RemoveVectorIndexRequest) returns (RemoveVectorIndexResponse);
 }
 
 message IndexKey {
@@ -92,6 +98,21 @@ message SecondaryIndexEntry {
 
 message IndexOption {
   uint32 virtualNodeId = 1;
+  optional uint32 efSearch = 2;
+  optional int64 transId = 3;
+}
+
+message VectorIndexEntry {
+  uint64 tableId = 1;
+  uint64 indexId = 2;
+  uint64 rowId = 3;
+  repeated double values = 4;
+  uint64 timestamp = 5;
+}
+
+message VectorSearchHit {
+  uint64 rowId = 1;
+  double score = 2;
 }
 
 message AllocateRowIdBatchRequest {
@@ -305,5 +326,69 @@ message RemoveIndexRequest {
 }
 
 message RemoveIndexResponse {
+  int32 errorCode = 1;
+}
+
+message UpsertVectorIndexEntryRequest {
+  VectorIndexEntry indexEntry = 1;
+  IndexOption indexOption = 2;
+}
+
+message UpsertVectorIndexEntryResponse {
+  int32 errorCode = 1;
+}
+
+message UpsertVectorIndexEntriesRequest {
+  uint64 tableId = 1;
+  uint64 indexId = 2;
+  repeated VectorIndexEntry indexEntries = 3;
+  IndexOption indexOption = 4;
+}
+
+message UpsertVectorIndexEntriesResponse {
+  int32 errorCode = 1;
+}
+
+message SearchVectorIndexRequest {
+  uint64 tableId = 1;
+  uint64 indexId = 2;
+  repeated double queryVector = 3;
+  uint32 topK = 4;
+  uint64 timestamp = 5;
+  IndexOption indexOption = 6;
+}
+
+message SearchVectorIndexResponse {
+  int32 errorCode = 1;
+  repeated VectorSearchHit hits = 2;
+}
+
+message OpenVectorIndexRequest {
+  uint64 tableId = 1;
+  uint64 indexId = 2;
+  IndexOption indexOption = 3;
+}
+
+message OpenVectorIndexResponse {
+  int32 errorCode = 1;
+}
+
+message CloseVectorIndexRequest {
+  uint64 tableId = 1;
+  uint64 indexId = 2;
+  IndexOption indexOption = 3;
+}
+
+message CloseVectorIndexResponse {
+  int32 errorCode = 1;
+}
+
+message RemoveVectorIndexRequest {
+  uint64 tableId = 1;
+  uint64 indexId = 2;
+  IndexOption indexOption = 3;
+}
+
+message RemoveVectorIndexResponse {
   int32 errorCode = 1;
 }

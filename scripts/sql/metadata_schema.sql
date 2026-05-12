@@ -366,6 +366,36 @@ CREATE TABLE IF NOT EXISTS `pixels_metadata`.`SINGLE_POINT_INDICES` (
     COLLATE = utf8mb4_bin;
 
 
+-- -----------------------------------------------------
+-- Table `pixels_metadata`.`VECTOR_INDICES`
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS `pixels_metadata`.`VECTOR_INDICES` (
+    `VI_ID` BIGINT NOT NULL AUTO_INCREMENT,
+    `VI_VECTOR_COLUMN_ID` BIGINT NOT NULL COMMENT 'The id of the vector column.',
+    `VI_METRIC` VARCHAR(32) NOT NULL COMMENT 'The vector distance metric.',
+    `VI_DIMENSION` INT NOT NULL COMMENT 'The dimension of vectors in this index.',
+    `VI_INDEX_SCHEME` VARCHAR(32) NOT NULL COMMENT 'The vector index scheme, e.g., hnsw.',
+    `VI_PARAMS_JSON` LONGTEXT NOT NULL COMMENT 'The vector index parameters in json format.',
+    `TBLS_TBL_ID` BIGINT NOT NULL,
+    `SCHEMA_VERSIONS_SV_ID` BIGINT NOT NULL,
+    PRIMARY KEY (`VI_ID`),
+    INDEX `fk_VECTOR_INDICES_TBLS_idx` (`TBLS_TBL_ID` ASC),
+    INDEX `fk_VECTOR_INDICES_SCHEMA_VERSIONS_idx` (`SCHEMA_VERSIONS_SV_ID` ASC),
+    CONSTRAINT `fk_VECTOR_INDICES_TBLS`
+        FOREIGN KEY (`TBLS_TBL_ID`)
+            REFERENCES `pixels_metadata`.`TBLS` (`TBL_ID`)
+            ON DELETE CASCADE
+            ON UPDATE CASCADE,
+    CONSTRAINT `fk_VECTOR_INDICES_SCHEMA_VERSIONS`
+        FOREIGN KEY (`SCHEMA_VERSIONS_SV_ID`)
+            REFERENCES `pixels_metadata`.`SCHEMA_VERSIONS` (`SV_ID`)
+            ON DELETE CASCADE
+            ON UPDATE CASCADE)
+    ENGINE = InnoDB
+    DEFAULT CHARACTER SET = utf8mb4
+    COLLATE = utf8mb4_bin;
+
+
 SET SQL_MODE=@OLD_SQL_MODE;
 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;
 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;

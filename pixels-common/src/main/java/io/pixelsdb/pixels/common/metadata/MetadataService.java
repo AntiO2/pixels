@@ -1227,6 +1227,146 @@ public class MetadataService
         return true;
     }
 
+    public boolean createVectorIndex(VectorIndex vectorIndex) throws MetadataException
+    {
+        String token = UUID.randomUUID().toString();
+        MetadataProto.CreateVectorIndexRequest request = MetadataProto.CreateVectorIndexRequest.newBuilder()
+                .setHeader(MetadataProto.RequestHeader.newBuilder().setToken(token).build())
+                .setVectorIndex(vectorIndex.toProto()).build();
+        try
+        {
+            MetadataProto.CreateVectorIndexResponse response = this.stub.createVectorIndex(request);
+            if (response.getHeader().getErrorCode() != 0)
+            {
+                throw new MetadataException("error code=" + response.getHeader().getErrorCode()
+                        + ", error message=" + response.getHeader().getErrorMsg());
+            }
+            if (!response.getHeader().getToken().equals(token))
+            {
+                throw new MetadataException("response token does not match.");
+            }
+        }
+        catch (Exception e)
+        {
+            throw new MetadataException("failed to create vector index", e);
+        }
+        return true;
+    }
+
+    public VectorIndex getVectorIndex(long indexId) throws MetadataException
+    {
+        String token = UUID.randomUUID().toString();
+        MetadataProto.GetVectorIndexRequest request = MetadataProto.GetVectorIndexRequest.newBuilder()
+                .setHeader(MetadataProto.RequestHeader.newBuilder().setToken(token).build())
+                .setIndexId(indexId).build();
+        try
+        {
+            MetadataProto.GetVectorIndexResponse response = this.stub.getVectorIndex(request);
+            if (response.getHeader().getErrorCode() != 0)
+            {
+                if (response.getHeader().getErrorCode() == METADATA_VECTOR_INDEX_NOT_FOUND)
+                {
+                    return null;
+                }
+                throw new MetadataException("error code=" + response.getHeader().getErrorCode()
+                        + ", error message=" + response.getHeader().getErrorMsg());
+            }
+            if (!response.getHeader().getToken().equals(token))
+            {
+                throw new MetadataException("response token does not match.");
+            }
+            return new VectorIndex(response.getVectorIndex());
+        }
+        catch (Exception e)
+        {
+            throw new MetadataException("failed to get vector index", e);
+        }
+    }
+
+    public List<VectorIndex> getVectorIndices(long tableId) throws MetadataException
+    {
+        String token = UUID.randomUUID().toString();
+        MetadataProto.GetVectorIndicesRequest request = MetadataProto.GetVectorIndicesRequest.newBuilder()
+                .setHeader(MetadataProto.RequestHeader.newBuilder().setToken(token).build())
+                .setTableId(tableId).build();
+        try
+        {
+            MetadataProto.GetVectorIndicesResponse response = this.stub.getVectorIndices(request);
+            if (response.getHeader().getErrorCode() != 0)
+            {
+                if (response.getHeader().getErrorCode() == METADATA_VECTOR_INDEX_NOT_FOUND)
+                {
+                    return null;
+                }
+                throw new MetadataException("error code=" + response.getHeader().getErrorCode()
+                        + ", error message=" + response.getHeader().getErrorMsg());
+            }
+            if (!response.getHeader().getToken().equals(token))
+            {
+                throw new MetadataException("response token does not match.");
+            }
+            ImmutableList.Builder<VectorIndex> builder = ImmutableList.builder();
+            response.getVectorIndicesList().forEach(proto -> builder.add(new VectorIndex(proto)));
+            return builder.build();
+        }
+        catch (Exception e)
+        {
+            throw new MetadataException("failed to get vector indices", e);
+        }
+    }
+
+    public boolean updateVectorIndex(VectorIndex vectorIndex) throws MetadataException
+    {
+        String token = UUID.randomUUID().toString();
+        MetadataProto.UpdateVectorIndexRequest request = MetadataProto.UpdateVectorIndexRequest.newBuilder()
+                .setHeader(MetadataProto.RequestHeader.newBuilder().setToken(token).build())
+                .setVectorIndex(vectorIndex.toProto()).build();
+        try
+        {
+            MetadataProto.UpdateVectorIndexResponse response = this.stub.updateVectorIndex(request);
+            if (response.getHeader().getErrorCode() != 0)
+            {
+                throw new MetadataException("error code=" + response.getHeader().getErrorCode()
+                        + ", error message=" + response.getHeader().getErrorMsg());
+            }
+            if (!response.getHeader().getToken().equals(token))
+            {
+                throw new MetadataException("response token does not match.");
+            }
+        }
+        catch (Exception e)
+        {
+            throw new MetadataException("failed to update vector index", e);
+        }
+        return true;
+    }
+
+    public boolean dropVectorIndex(long indexId) throws MetadataException
+    {
+        String token = UUID.randomUUID().toString();
+        MetadataProto.DropVectorIndexRequest request = MetadataProto.DropVectorIndexRequest.newBuilder()
+                .setHeader(MetadataProto.RequestHeader.newBuilder().setToken(token).build())
+                .setIndexId(indexId).build();
+        try
+        {
+            MetadataProto.DropVectorIndexResponse response = this.stub.dropVectorIndex(request);
+            if (response.getHeader().getErrorCode() != 0)
+            {
+                throw new MetadataException("error code=" + response.getHeader().getErrorCode()
+                        + ", error message=" + response.getHeader().getErrorMsg());
+            }
+            if (!response.getHeader().getToken().equals(token))
+            {
+                throw new MetadataException("response token does not match.");
+            }
+        }
+        catch (Exception e)
+        {
+            throw new MetadataException("failed to drop vector index", e);
+        }
+        return true;
+    }
+
     public boolean addPath(Path path) throws MetadataException
     {
         String token = UUID.randomUUID().toString();

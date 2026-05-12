@@ -67,6 +67,7 @@
         <module>pixels-index/pixels-index-rockset</module>
         <module>pixels-index/pixels-index-memory</module>
         <module>pixels-index/pixels-index-mapdb</module>
+        <module>pixels-index/pixels-index-hnsw</module>
         <module>pixels-index/pixels-index-main-sqlite</module>
     </modules>
 
@@ -144,6 +145,7 @@
         <dep.slf4j.version>1.7.36</dep.slf4j.version>
 
         <dep.rocksdb.version>10.2.1</dep.rocksdb.version>
+        <dep.hnswlib.version>1.2.1</dep.hnswlib.version>
 
         <!-- testing -->
         <dep.junit4.version>4.13.2</dep.junit4.version>

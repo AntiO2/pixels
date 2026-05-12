@@ -60,6 +60,7 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
     private final RangeDao rangeDao = DaoFactory.Instance().getRangeDao();
     private final RangeIndexDao rangeIndexDao = DaoFactory.Instance().getRangeIndexDao();
     private final SinglePointIndexDao singlePointIndexDao = DaoFactory.Instance().getSinglePointIndexDao();
+    private final VectorIndexDao vectorIndexDao = DaoFactory.Instance().getVectorIndexDao();
     private final ViewDao viewDao = DaoFactory.Instance().getViewDao();
     private final PathDao pathDao = DaoFactory.Instance().getPathDao();
     private final FileDao fileDao = DaoFactory.Instance().getFileDao();
@@ -1041,6 +1042,112 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
         MetadataProto.DropSinglePointIndexResponse response = MetadataProto.DropSinglePointIndexResponse.newBuilder()
                 .setHeader(headerBuilder.build()).build();
         responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void createVectorIndex(MetadataProto.CreateVectorIndexRequest request,
+                                  StreamObserver<MetadataProto.CreateVectorIndexResponse> responseObserver)
+    {
+        MetadataProto.ResponseHeader.Builder headerBuilder = MetadataProto.ResponseHeader.newBuilder()
+                .setToken(request.getHeader().getToken());
+        if (vectorIndexDao.insert(request.getVectorIndex()) > 0)
+        {
+            headerBuilder.setErrorCode(0).setErrorMsg("");
+        }
+        else
+        {
+            headerBuilder.setErrorCode(METADATA_ADD_VECTOR_INDEX_FAILED).setErrorMsg("add vector index failed");
+        }
+        responseObserver.onNext(MetadataProto.CreateVectorIndexResponse.newBuilder()
+                .setHeader(headerBuilder.build()).build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void getVectorIndex(MetadataProto.GetVectorIndexRequest request,
+                               StreamObserver<MetadataProto.GetVectorIndexResponse> responseObserver)
+    {
+        MetadataProto.ResponseHeader.Builder headerBuilder = MetadataProto.ResponseHeader.newBuilder()
+                .setToken(request.getHeader().getToken());
+        MetadataProto.VectorIndex vectorIndex = vectorIndexDao.getById(request.getIndexId());
+        MetadataProto.GetVectorIndexResponse response;
+        if (vectorIndex != null)
+        {
+            headerBuilder.setErrorCode(0).setErrorMsg("");
+            response = MetadataProto.GetVectorIndexResponse.newBuilder()
+                    .setHeader(headerBuilder.build()).setVectorIndex(vectorIndex).build();
+        }
+        else
+        {
+            headerBuilder.setErrorCode(METADATA_VECTOR_INDEX_NOT_FOUND)
+                    .setErrorMsg("vector index with index id '" + request.getIndexId() + "' is not found");
+            response = MetadataProto.GetVectorIndexResponse.newBuilder().setHeader(headerBuilder.build()).build();
+        }
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void getVectorIndices(MetadataProto.GetVectorIndicesRequest request,
+                                 StreamObserver<MetadataProto.GetVectorIndicesResponse> responseObserver)
+    {
+        MetadataProto.ResponseHeader.Builder headerBuilder = MetadataProto.ResponseHeader.newBuilder()
+                .setToken(request.getHeader().getToken());
+        List<MetadataProto.VectorIndex> vectorIndices = vectorIndexDao.getAllByTableId(request.getTableId());
+        MetadataProto.GetVectorIndicesResponse response;
+        if (vectorIndices != null && !vectorIndices.isEmpty())
+        {
+            headerBuilder.setErrorCode(0).setErrorMsg("");
+            response = MetadataProto.GetVectorIndicesResponse.newBuilder()
+                    .setHeader(headerBuilder.build()).addAllVectorIndices(vectorIndices).build();
+        }
+        else
+        {
+            headerBuilder.setErrorCode(METADATA_VECTOR_INDEX_NOT_FOUND)
+                    .setErrorMsg("vector indices with table id '" + request.getTableId() + "' are not found");
+            response = MetadataProto.GetVectorIndicesResponse.newBuilder().setHeader(headerBuilder.build()).build();
+        }
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void updateVectorIndex(MetadataProto.UpdateVectorIndexRequest request,
+                                  StreamObserver<MetadataProto.UpdateVectorIndexResponse> responseObserver)
+    {
+        MetadataProto.ResponseHeader.Builder headerBuilder = MetadataProto.ResponseHeader.newBuilder()
+                .setToken(request.getHeader().getToken());
+        if (vectorIndexDao.update(request.getVectorIndex()))
+        {
+            headerBuilder.setErrorCode(0).setErrorMsg("");
+        }
+        else
+        {
+            headerBuilder.setErrorCode(METADATA_UPDATE_VECTOR_INDEX_FAILED)
+                    .setErrorMsg("make sure the vector index exists");
+        }
+        responseObserver.onNext(MetadataProto.UpdateVectorIndexResponse.newBuilder()
+                .setHeader(headerBuilder.build()).build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void dropVectorIndex(MetadataProto.DropVectorIndexRequest request,
+                                StreamObserver<MetadataProto.DropVectorIndexResponse> responseObserver)
+    {
+        MetadataProto.ResponseHeader.Builder headerBuilder = MetadataProto.ResponseHeader.newBuilder()
+                .setToken(request.getHeader().getToken());
+        if (vectorIndexDao.deleteById(request.getIndexId()))
+        {
+            headerBuilder.setErrorCode(0).setErrorMsg("");
+        }
+        else
+        {
+            headerBuilder.setErrorCode(METADATA_DELETE_VECTOR_INDEX_FAILED).setErrorMsg("delete vector index failed");
+        }
+        responseObserver.onNext(MetadataProto.DropVectorIndexResponse.newBuilder()
+                .setHeader(headerBuilder.build()).build());
         responseObserver.onCompleted();
     }
 

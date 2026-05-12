@@ -31,6 +31,7 @@ public class DaoFactory
     private final RangeDao rangeDao;
     private final RangeIndexDao rangeIndexDao;
     private final SinglePointIndexDao singlePointIndexDao;
+    private final VectorIndexDao vectorIndexDao;
 
     private DaoFactory ()
     {
@@ -47,6 +48,7 @@ public class DaoFactory
         this.rangeDao = new RdbRangeDao();
         this.rangeIndexDao = new RdbRangeIndexDao();
         this.singlePointIndexDao = new RdbSinglePointIndexDao();
+        this.vectorIndexDao = new RdbVectorIndexDao();
     }
 
     public ColumnDao getColumnDao ()
@@ -112,5 +114,10 @@ public class DaoFactory
     public SinglePointIndexDao getSinglePointIndexDao()
     {
         return singlePointIndexDao;
+    }
+
+    public VectorIndexDao getVectorIndexDao()
+    {
+        return vectorIndexDao;
     }
 }

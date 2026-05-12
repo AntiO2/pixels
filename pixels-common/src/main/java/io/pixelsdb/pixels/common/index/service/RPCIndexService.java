@@ -25,6 +25,8 @@ import io.grpc.ManagedChannelBuilder;
 import io.pixelsdb.pixels.common.error.ErrorCode;
 import io.pixelsdb.pixels.common.exception.IndexException;
 import io.pixelsdb.pixels.common.index.IndexOption;
+import io.pixelsdb.pixels.common.index.VectorIndexOption;
+import io.pixelsdb.pixels.common.index.VectorSearchResult;
 import io.pixelsdb.pixels.common.server.HostAddress;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.common.utils.ShutdownHookManager;
@@ -34,6 +36,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -564,6 +567,99 @@ public class RPCIndexService implements IndexService
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new IndexException("Failed to remove index, error code=" + response.getErrorCode());
+        }
+        return true;
+    }
+
+    @Override
+    public boolean upsertVectorIndexEntry(IndexProto.VectorIndexEntry entry, VectorIndexOption indexOption) throws IndexException
+    {
+        IndexProto.UpsertVectorIndexEntryRequest request = IndexProto.UpsertVectorIndexEntryRequest.newBuilder()
+                .setIndexEntry(entry)
+                .setIndexOption(indexOption.toProto())
+                .build();
+        IndexProto.UpsertVectorIndexEntryResponse response = stub.upsertVectorIndexEntry(request);
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new IndexException("Failed to upsert vector index entry, error code=" + response.getErrorCode());
+        }
+        return true;
+    }
+
+    @Override
+    public boolean upsertVectorIndexEntries(long tableId, long indexId, List<IndexProto.VectorIndexEntry> entries,
+                                            VectorIndexOption indexOption) throws IndexException
+    {
+        IndexProto.UpsertVectorIndexEntriesRequest request = IndexProto.UpsertVectorIndexEntriesRequest.newBuilder()
+                .setTableId(tableId).setIndexId(indexId).addAllIndexEntries(entries)
+                .setIndexOption(indexOption.toProto()).build();
+        IndexProto.UpsertVectorIndexEntriesResponse response = stub.upsertVectorIndexEntries(request);
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new IndexException("Failed to upsert vector index entries, error code=" + response.getErrorCode());
+        }
+        return true;
+    }
+
+    @Override
+    public List<VectorSearchResult> searchVectorIndex(long tableId, long indexId, double[] queryVector, int topK,
+                                                      long timestamp, VectorIndexOption indexOption) throws IndexException
+    {
+        IndexProto.SearchVectorIndexRequest.Builder requestBuilder = IndexProto.SearchVectorIndexRequest.newBuilder()
+                .setTableId(tableId).setIndexId(indexId).setTopK(topK).setTimestamp(timestamp)
+                .setIndexOption(indexOption.toProto());
+        for (double value : queryVector)
+        {
+            requestBuilder.addQueryVector(value);
+        }
+        IndexProto.SearchVectorIndexResponse response = stub.searchVectorIndex(requestBuilder.build());
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new IndexException("Failed to search vector index, error code=" + response.getErrorCode());
+        }
+        List<VectorSearchResult> results = new ArrayList<>(response.getHitsCount());
+        for (IndexProto.VectorSearchHit hit : response.getHitsList())
+        {
+            results.add(new VectorSearchResult(hit.getRowId(), hit.getScore()));
+        }
+        return results;
+    }
+
+    @Override
+    public boolean openVectorIndex(long tableId, long indexId, VectorIndexOption indexOption) throws IndexException
+    {
+        IndexProto.OpenVectorIndexRequest request = IndexProto.OpenVectorIndexRequest.newBuilder()
+                .setTableId(tableId).setIndexId(indexId).setIndexOption(indexOption.toProto()).build();
+        IndexProto.OpenVectorIndexResponse response = stub.openVectorIndex(request);
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new IndexException("Failed to open vector index, error code=" + response.getErrorCode());
+        }
+        return true;
+    }
+
+    @Override
+    public boolean closeVectorIndex(long tableId, long indexId, VectorIndexOption indexOption) throws IndexException
+    {
+        IndexProto.CloseVectorIndexRequest request = IndexProto.CloseVectorIndexRequest.newBuilder()
+                .setTableId(tableId).setIndexId(indexId).setIndexOption(indexOption.toProto()).build();
+        IndexProto.CloseVectorIndexResponse response = stub.closeVectorIndex(request);
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new IndexException("Failed to close vector index, error code=" + response.getErrorCode());
+        }
+        return true;
+    }
+
+    @Override
+    public boolean removeVectorIndex(long tableId, long indexId, VectorIndexOption indexOption) throws IndexException
+    {
+        IndexProto.RemoveVectorIndexRequest request = IndexProto.RemoveVectorIndexRequest.newBuilder()
+                .setTableId(tableId).setIndexId(indexId).setIndexOption(indexOption.toProto()).build();
+        IndexProto.RemoveVectorIndexResponse response = stub.removeVectorIndex(request);
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new IndexException("Failed to remove vector index, error code=" + response.getErrorCode());
         }
         return true;
     }

@@ -60,6 +60,11 @@ service MetadataService {
     rpc GetSinglePointIndices (GetSinglePointIndicesRequest) returns (GetSinglePointIndicesResponse);
     rpc UpdateSinglePointIndex (UpdateSinglePointIndexRequest) returns (UpdateSinglePointIndexResponse);
     rpc DropSinglePointIndex (DropSinglePointIndexRequest) returns (DropSinglePointIndexResponse);
+    rpc CreateVectorIndex (CreateVectorIndexRequest) returns (CreateVectorIndexResponse);
+    rpc GetVectorIndex (GetVectorIndexRequest) returns (GetVectorIndexResponse);
+    rpc GetVectorIndices (GetVectorIndicesRequest) returns (GetVectorIndicesResponse);
+    rpc UpdateVectorIndex (UpdateVectorIndexRequest) returns (UpdateVectorIndexResponse);
+    rpc DropVectorIndex (DropVectorIndexRequest) returns (DropVectorIndexResponse);
     rpc AddPath (AddPathRequest) returns (AddPathResponse);
     rpc GetPaths (GetPathsRequest) returns (GetPathsResponse);
     rpc UpdatePath (UpdatePathRequest) returns (UpdatePathResponse);
@@ -157,6 +162,17 @@ message SinglePointIndex {
     string indexScheme = 5;
     uint64 tableId = 6;
     uint64 schemaVersionId = 7;
+}
+
+message VectorIndex {
+    uint64 id = 1;
+    uint64 vectorColumnId = 2;
+    string metric = 3;
+    uint32 dimension = 4;
+    string indexScheme = 5;
+    string paramsJson = 6;
+    uint64 tableId = 7;
+    uint64 schemaVersionId = 8;
 }
 
 message Path {
@@ -583,6 +599,54 @@ message DropSinglePointIndexRequest {
 message DropSinglePointIndexResponse {
     ResponseHeader header = 1;
 };
+
+// vector index
+message CreateVectorIndexRequest {
+    RequestHeader header = 1;
+    VectorIndex vectorIndex = 2;
+}
+
+message CreateVectorIndexResponse {
+    ResponseHeader header = 1;
+}
+
+message GetVectorIndexRequest {
+    RequestHeader header = 1;
+    uint64 indexId = 2;
+}
+
+message GetVectorIndexResponse {
+    ResponseHeader header = 1;
+    VectorIndex vectorIndex = 2;
+}
+
+message GetVectorIndicesRequest {
+    RequestHeader header = 1;
+    uint64 tableId = 2;
+}
+
+message GetVectorIndicesResponse {
+    ResponseHeader header = 1;
+    repeated VectorIndex vectorIndices = 2;
+}
+
+message UpdateVectorIndexRequest {
+    RequestHeader header = 1;
+    VectorIndex vectorIndex = 2;
+}
+
+message UpdateVectorIndexResponse {
+    ResponseHeader header = 1;
+}
+
+message DropVectorIndexRequest {
+    RequestHeader header = 1;
+    uint64 indexId = 2;
+}
+
+message DropVectorIndexResponse {
+    ResponseHeader header = 1;
+}
 
 // peer
 message CreatePeerRequest {

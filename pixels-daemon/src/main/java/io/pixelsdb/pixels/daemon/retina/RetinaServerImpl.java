@@ -25,8 +25,10 @@ import com.google.protobuf.ByteString;
 import com.sun.management.OperatingSystemMXBean;
 import io.grpc.stub.StreamObserver;
 import io.pixelsdb.pixels.common.exception.IndexException;
+import io.pixelsdb.pixels.common.exception.MetadataException;
 import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.index.IndexOption;
+import io.pixelsdb.pixels.common.index.VectorIndexOption;
 import io.pixelsdb.pixels.common.index.service.IndexService;
 import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
@@ -477,6 +479,10 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             String tableName = tableUpdateData.getTableName();
             long primaryIndexId = tableUpdateData.getPrimaryIndexId();
             long timestamp = tableUpdateData.getTimestamp();
+            long tableId = getTableId(primaryIndexId);
+            List<io.pixelsdb.pixels.common.metadata.domain.VectorIndex> vectorIndices = getVectorIndices(tableId);
+            Map<Long, Integer> columnIdToOrdinal = vectorIndices == null || vectorIndices.isEmpty() ?
+                    Collections.emptyMap() : getColumnOrdinalMap(schemaName, tableName);
 
             // =================================================================
             // 1. Process Delete Data
@@ -492,10 +498,10 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                     // 1b. Transpose the index keys
                     List<List<IndexProto.IndexKey>> keysList = transposeIndexKeys(subList, RetinaProto.DeleteData::getIndexKeysList);
                     List<IndexProto.IndexKey> primaryKeys = keysList.get(0);
-                    long tableId = primaryKeys.get(0).getTableId();
+                    long bucketTableId = primaryKeys.get(0).getTableId();
 
                     // 1c. Delete primary index entries
-                    List<IndexProto.RowLocation> rowLocations = indexService.deletePrimaryIndexEntries(tableId, primaryIndexId, primaryKeys, option);
+                    List<IndexProto.RowLocation> rowLocations = indexService.deletePrimaryIndexEntries(bucketTableId, primaryIndexId, primaryKeys, option);
 
                     // 1d. Delete records
                     for (IndexProto.RowLocation loc : rowLocations)
@@ -506,7 +512,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                     // 1e. Delete secondary index entries
                     for (int i = 1; i < keysList.size(); ++i)
                     {
-                        indexService.deleteSecondaryIndexEntries(tableId, keysList.get(i).get(0).getIndexId(), keysList.get(i), option);
+                        indexService.deleteSecondaryIndexEntries(bucketTableId, keysList.get(i).get(0).getIndexId(), keysList.get(i), option);
                     }
                 });
             }
@@ -537,11 +543,18 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                     }
 
                     // 2d. Put primary index entries
-                    long tableId = primaryEntries.get(0).getIndexKey().getTableId();
-                    indexService.putPrimaryIndexEntries(tableId, primaryIndexId, primaryEntries, option);
+                    long bucketTableId = primaryEntries.get(0).getIndexKey().getTableId();
+                    indexService.putPrimaryIndexEntries(bucketTableId, primaryIndexId, primaryEntries, option);
 
                     // 2e. Put secondary index entries
                     processSecondaryIndexes(subList, RetinaProto.InsertData::getIndexKeysList, rowIds, option, false);
+
+                    if (vectorIndices != null && !vectorIndices.isEmpty())
+                    {
+                        upsertVectorIndexes(bucketTableId, vectorIndices, columnIdToOrdinal, rowIds, timestamp,
+                                subList.stream().map(RetinaProto.InsertData::getColValuesList).collect(Collectors.toList()),
+                                option);
+                    }
                 });
             }
             // =================================================================
@@ -570,14 +583,14 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                     }
 
                     // 3d. Update primary index entries with fine-grained locking
-                    long tableId = primaryEntries.get(0).getIndexKey().getTableId();
+                    long bucketTableId = primaryEntries.get(0).getIndexKey().getTableId();
                     String lockKey = "v_" + virtualNodeId + "_b_" + bucketId + "_i_" + primaryIndexId;
                     Lock lock = updateLocks.get(lockKey);
 
                     lock.lock();
                     try
                     {
-                        List<IndexProto.RowLocation> prevLocs = indexService.updatePrimaryIndexEntries(tableId, primaryIndexId, primaryEntries, option);
+                        List<IndexProto.RowLocation> prevLocs = indexService.updatePrimaryIndexEntries(bucketTableId, primaryIndexId, primaryEntries, option);
                         // 3e. Delete previous records
                         for (IndexProto.RowLocation loc : prevLocs)
                         {
@@ -591,9 +604,115 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
 
                     // 3f. Update secondary index entries
                     processSecondaryIndexes(subList, RetinaProto.UpdateData::getIndexKeysList, rowIds, option, true);
+
+                    if (vectorIndices != null && !vectorIndices.isEmpty())
+                    {
+                        upsertVectorIndexes(bucketTableId, vectorIndices, columnIdToOrdinal, rowIds, timestamp,
+                                subList.stream().map(RetinaProto.UpdateData::getColValuesList).collect(Collectors.toList()),
+                                option);
+                    }
                 });
             }
         }
+    }
+
+    private long getTableId(long primaryIndexId) throws RetinaException
+    {
+        try
+        {
+            io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex index = metadataService.getSinglePointIndex(primaryIndexId);
+            if (index == null)
+            {
+                throw new RetinaException("Primary index " + primaryIndexId + " not found in metadata");
+            }
+            return index.getTableId();
+        }
+        catch (MetadataException e)
+        {
+            throw new RetinaException("Failed to get primary index metadata", e);
+        }
+    }
+
+    private Map<Long, Integer> getColumnOrdinalMap(String schemaName, String tableName) throws RetinaException
+    {
+        try
+        {
+            List<Column> columns = metadataService.getColumns(schemaName, tableName, false);
+            Map<Long, Integer> ordinals = new HashMap<>();
+            for (int i = 0; i < columns.size(); i++)
+            {
+                ordinals.put(columns.get(i).getId(), i);
+            }
+            return ordinals;
+        }
+        catch (MetadataException e)
+        {
+            throw new RetinaException("Failed to get table columns for vector index maintenance", e);
+        }
+    }
+
+    private List<io.pixelsdb.pixels.common.metadata.domain.VectorIndex> getVectorIndices(long tableId) throws RetinaException
+    {
+        try
+        {
+            return metadataService.getVectorIndices(tableId);
+        }
+        catch (MetadataException e)
+        {
+            throw new RetinaException("Failed to get vector indices for table " + tableId, e);
+        }
+    }
+
+    private void upsertVectorIndexes(long tableId,
+                                     List<io.pixelsdb.pixels.common.metadata.domain.VectorIndex> vectorIndices,
+                                     Map<Long, Integer> columnIdToOrdinal,
+                                     List<Long> rowIds,
+                                     long timestamp,
+                                     List<List<ByteString>> rowValues,
+                                     IndexOption option) throws IndexException
+    {
+        VectorIndexOption vectorIndexOption = new VectorIndexOption();
+        vectorIndexOption.setVNodeId(option.getVNodeId());
+        for (io.pixelsdb.pixels.common.metadata.domain.VectorIndex vectorIndex : vectorIndices)
+        {
+            Integer ordinal = columnIdToOrdinal.get(vectorIndex.getVectorColumnId());
+            if (ordinal == null)
+            {
+                continue;
+            }
+            List<IndexProto.VectorIndexEntry> entries = new ArrayList<>(rowIds.size());
+            for (int i = 0; i < rowIds.size(); i++)
+            {
+                double[] values = decodeVector(rowValues.get(i).get(ordinal).toByteArray(), vectorIndex.getDimension());
+                IndexProto.VectorIndexEntry.Builder builder = IndexProto.VectorIndexEntry.newBuilder()
+                        .setTableId(tableId)
+                        .setIndexId(vectorIndex.getId())
+                        .setRowId(rowIds.get(i))
+                        .setTimestamp(timestamp);
+                for (double value : values)
+                {
+                    builder.addValues(value);
+                }
+                entries.add(builder.build());
+            }
+            indexService.upsertVectorIndexEntries(tableId, vectorIndex.getId(), entries, vectorIndexOption);
+        }
+    }
+
+    private static double[] decodeVector(byte[] bytes, int dimension) throws IndexException
+    {
+        if (bytes.length != dimension * Double.BYTES)
+        {
+            throw new IndexException("Invalid vector byte length " + bytes.length + ", expected " +
+                    (dimension * Double.BYTES));
+        }
+        double[] vector = new double[dimension];
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+        for (int i = 0; i < dimension; i++)
+        {
+            vector[i] = buffer.getDouble();
+        }
+        return vector;
     }
 
     /**
