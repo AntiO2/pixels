@@ -23,7 +23,31 @@
  * @create 2023-03-06
  */
 #include "PixelsReaderBuilder.h"
-#include "utils/Endianness.h"
+#include "format/PixelsFormatReader.h"
+
+namespace
+{
+
+void throwFormatError(
+        const pixels::proto::FileTail &fileTail,
+        const pixels::format::FormatError &error)
+{
+    if (error.code == pixels::format::ErrorCode::UNSUPPORTED_VERSION
+        && fileTail.has_postscript())
+    {
+        throw PixelsFileVersionInvalidException(
+                fileTail.postscript().version());
+    }
+    if (error.code == pixels::format::ErrorCode::INVALID_MAGIC
+        && fileTail.has_postscript())
+    {
+        throw PixelsFileMagicInvalidException(
+                fileTail.postscript().magic());
+    }
+    throw InvalidArgumentException(error.message);
+}
+
+} // namespace
 
 PixelsReaderBuilder::PixelsReaderBuilder()
 {
@@ -58,6 +82,20 @@ std::shared_ptr<PixelsReader> PixelsReaderBuilder::build()
     // get PhysicalReader
     std::shared_ptr<PhysicalReader> fsReader =
             PhysicalReaderUtil::newPhysicalReader (builderStorage, builderPath);
+    if (fsReader == nullptr)
+    {
+        throw PixelsReaderException (
+                "Failed to create PixelsReader due to error of creating PhysicalReader");
+    }
+
+    const long fileLen = fsReader->getFileLength ();
+    if (fileLen < 0)
+    {
+        throw InvalidArgumentException (
+                "PixelsReaderBuilder::build: negative file length");
+    }
+    const auto portableFileLen = static_cast<std::uint64_t> (fileLen);
+
     // try to get file tail from cache
     std::string fileName = fsReader->getName ();
     std::shared_ptr<pixels::proto::FileTail> fileTail;
@@ -66,30 +104,45 @@ std::shared_ptr<PixelsReader> PixelsReaderBuilder::build()
         fileTail = builderPixelsFooterCache->getFileTail (fileName);
     } else
     {
-        if (fsReader.get () == nullptr)
+        if (portableFileLen
+            < pixels::format::PixelsFormatReader::TAIL_POINTER_SIZE)
         {
-            throw PixelsReaderException (
-                    "Failed to create PixelsReader due to error of creating PhysicalReader");
-        }
-        // get FileTail
-        long fileLen = fsReader->getFileLength ();
-        fsReader->seek (fileLen - (long) sizeof (long));
-        // get FileTailOffset
-
-        long fileTailOffset = fsReader->readLong ();
-        if (Endianness::isLittleEndian ())
-        {
-            fileTailOffset = (long) __builtin_bswap64 (fileTailOffset);
+            throw InvalidArgumentException (
+                    "PixelsReaderBuilder::build: file is shorter than the tail pointer");
         }
 
-        int fileTailLength = (int) (fileLen - fileTailOffset - sizeof (long));
-        fsReader->seek (fileTailOffset);
-        std::shared_ptr<ByteBuffer> fileTailBuffer = fsReader->readFully (fileTailLength);
+        fsReader->seek (
+                fileLen
+                - static_cast<long> (
+                        pixels::format::PixelsFormatReader::TAIL_POINTER_SIZE));
+        std::shared_ptr<ByteBuffer> tailPointerBuffer = fsReader->readFully (
+                static_cast<int> (
+                        pixels::format::PixelsFormatReader::TAIL_POINTER_SIZE));
+
+        pixels::format::FileRange fileTailRange;
+        pixels::format::FormatError formatError;
+        if (!pixels::format::PixelsFormatReader::parseTailPointer (
+                    portableFileLen,
+                    pixels::format::ByteSpan (
+                            tailPointerBuffer->getPointer (),
+                            tailPointerBuffer->size ()),
+                    fileTailRange, formatError))
+        {
+            throw InvalidArgumentException (formatError.message);
+        }
+
+        fsReader->seek (static_cast<long> (fileTailRange.offset));
+        std::shared_ptr<ByteBuffer> fileTailBuffer = fsReader->readFully (
+                static_cast<int> (fileTailRange.length));
         fileTail = std::make_shared<pixels::proto::FileTail> ();
-        if (!fileTail->ParseFromArray (fileTailBuffer->getPointer (),
-                                       fileTailLength))
+        if (!pixels::format::PixelsFormatReader::parseFileTail (
+                    portableFileLen, fileTailRange,
+                    pixels::format::ByteSpan (
+                            fileTailBuffer->getPointer (),
+                            fileTailBuffer->size ()),
+                    *fileTail, formatError))
         {
-            throw InvalidArgumentException ("PixelsReaderBuilder::build: paring FileTail error!");
+            throwFormatError (*fileTail, formatError);
         }
         if (builderPixelsFooterCache != nullptr)
         {
@@ -97,17 +150,11 @@ std::shared_ptr<PixelsReader> PixelsReaderBuilder::build()
         }
     }
 
-    // check file MAGIC and file version
-    pixels::proto::PostScript postScript = fileTail->postscript ();
-    uint32_t fileVersion = postScript.version ();
-    const std::string &fileMagic = postScript.magic ();
-    if (PixelsVersion::currentVersion () != fileVersion)
+    pixels::format::FormatError formatError;
+    if (!pixels::format::PixelsFormatReader::validateFileTail (
+                portableFileLen, *fileTail, formatError))
     {
-        throw PixelsFileVersionInvalidException (fileVersion);
-    }
-    if (fileMagic != Constants::MAGIC)
-    {
-        throw PixelsFileMagicInvalidException (fileMagic);
+        throwFormatError (*fileTail, formatError);
     }
 
     auto fileColTypes = std::vector<std::shared_ptr<pixels::proto::Type >>{};
@@ -122,5 +169,4 @@ std::shared_ptr<PixelsReader> PixelsReaderBuilder::build()
     return std::make_shared<PixelsReaderImpl> (builderSchema, fsReader, fileTail,
                                                builderPixelsFooterCache);
 }
-
 

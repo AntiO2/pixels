@@ -23,6 +23,7 @@
  * @create 2023-03-07
  */
 #include "reader/PixelsRecordReaderImpl.h"
+#include "format/PixelsFormatReader.h"
 #include "physical/io/PhysicalLocalReader.h"
 #include "profiler/CountProfiler.h"
 std::mutex PixelsRecordReaderImpl::mutex_;
@@ -363,17 +364,40 @@ void PixelsRecordReaderImpl::prepareRead()
     Scheduler *scheduler = SchedulerFactory::Instance()->getScheduler();
     auto bbs = scheduler->executeBatch(physicalReader, requestBatch, queryId);
     // TODO: the return value should be unique_ptr?
+    const long physicalFileLength = physicalReader->getFileLength();
+    if (physicalFileLength < 0)
+    {
+        throw InvalidArgumentException(
+                "PixelsRecordReaderImpl::prepareRead: negative file length");
+    }
 
     for (int i = 0; i < bbs.size(); i++)
     {
-        if (!rowGroupFooterCacheHit.at(i))
+        const int targetIndex = fis.at(i);
+        if (!rowGroupFooterCacheHit.at(targetIndex))
         {
             auto parsed = std::make_shared<pixels::proto::RowGroupFooter>();
-            parsed->ParseFromArray(bbs[i]->getPointer(), (int) bbs[i]->size());
-            rowGroupFooters.at(fis[i]) = parsed;
+            const int rowGroupId = targetRGs.at(targetIndex);
+            const pixels::proto::RowGroupInformation &rowGroupInformation =
+                    footer.rowgroupinfos(rowGroupId);
+            pixels::format::FormatError formatError;
+            if (!pixels::format::PixelsFormatReader::parseRowGroupFooter(
+                        static_cast<std::uint64_t>(physicalFileLength),
+                        pixels::format::FileRange{
+                                rowGroupInformation.footeroffset(),
+                                rowGroupInformation.footerlength()},
+                        pixels::format::ByteSpan(
+                                bbs[i]->getPointer(), bbs[i]->size()),
+                        *parsed, formatError))
+            {
+                throw InvalidArgumentException(
+                        "PixelsRecordReaderImpl::prepareRead: "
+                        + formatError.message);
+            }
+            rowGroupFooters.at(targetIndex) = parsed;
             if (footerCache != nullptr)
             {
-                footerCache->putRGFooter(rgCacheIds[fis[i]], parsed);
+                footerCache->putRGFooter(rgCacheIds[targetIndex], parsed);
             }
         }
     }

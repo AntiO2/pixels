@@ -28,6 +28,7 @@
 LongColumnVector::LongColumnVector(uint64_t len, bool encoding, bool isLong)
         : ColumnVector (len, encoding)
 {
+    (void) isLong;
     posix_memalign (reinterpret_cast<void **>(&longVector), 32,
                     len * sizeof (int64_t));
 
@@ -39,7 +40,7 @@ void LongColumnVector::close()
     if (!closed)
     {
         ColumnVector::close ();
-        if (encoding && longVector != nullptr)
+        if (longVector != nullptr)
         {
             free (longVector);
         }
@@ -131,7 +132,7 @@ void LongColumnVector::ensureSize(uint64_t size, bool preserveData)
         {
             std::copy (oldVector, oldVector + length, longVector);
         }
-        delete[] oldVector;
+        free (oldVector);
         memoryUsage += (long) sizeof (long) * (size - length);
         resize (size);
     }
