@@ -31,7 +31,7 @@ namespace
 {
 
 const std::string EXPECTED_METADATA =
-        "{\"abi\":3,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
+        "{\"abi\":4,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
         "\"pixelStride\":10000,\"schemaCount\":4,\"rowGroupCount\":1,"
         "\"firstColumn\":{\"name\":\"id\",\"kind\":4},"
         "\"postscript\":{\"contentLength\":\"352\",\"compression\":0,"
@@ -72,10 +72,13 @@ const std::string EXPECTED_METADATA =
         "\"sum\":\"66057\"}}]]}";
 
 const std::string EXPECTED_CAPABILITIES =
-        "{\"abi\":3,\"page\":\"generic-v1\","
+        "{\"abi\":4,\"page\":\"generic-v1\","
         "\"rowGroup\":\"layout-v1\",\"rows\":\"rows-v1\","
-        "\"filter\":\"filter-v1\",\"maxRows\":500,"
-        "\"defaultRows\":100,\"types\":["
+        "\"filter\":\"filter-v1\",\"scan\":\"scan-v2\","
+        "\"maxRows\":500,\"defaultRows\":100,"
+        "\"defaultScanRows\":20,\"maxScanRows\":500,"
+        "\"maxProjectionColumns\":128,\"maxExpressionNodes\":64,"
+        "\"maxOrderKeys\":8,\"maxOrderedWindowRows\":4096,\"types\":["
         "{\"kind\":0,\"name\":\"BOOLEAN\"},"
         "{\"kind\":1,\"name\":\"BYTE\"},"
         "{\"kind\":2,\"name\":\"SHORT\"},"
@@ -318,6 +321,129 @@ void appendLittleUint32(
         bytes.push_back(static_cast<std::uint8_t>(
                 value >> (byte * 8U)));
     }
+}
+
+void writeLittleUint16(
+        std::vector<std::uint8_t> &bytes, std::size_t offset,
+        std::uint16_t value)
+{
+    bytes[offset] = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8U);
+}
+
+void writeLittleUint32(
+        std::vector<std::uint8_t> &bytes, std::size_t offset,
+        std::uint32_t value)
+{
+    for (std::uint32_t byte = 0; byte < 4; ++byte)
+    {
+        bytes[offset + byte] = static_cast<std::uint8_t>(
+                value >> (byte * 8U));
+    }
+}
+
+void writeLittleUint64(
+        std::vector<std::uint8_t> &bytes, std::size_t offset,
+        std::uint64_t value)
+{
+    for (std::uint32_t byte = 0; byte < 8; ++byte)
+    {
+        bytes[offset + byte] = static_cast<std::uint8_t>(
+                value >> (byte * 8U));
+    }
+}
+
+struct TestScanNode
+{
+    std::uint8_t kind = 0;
+    std::uint8_t operation = 0;
+    std::uint16_t children = 0;
+    std::uint32_t column = 0;
+    std::string literal;
+};
+
+struct TestScanOrder
+{
+    std::uint32_t column = 0;
+    std::uint8_t direction = 0;
+    std::uint8_t nulls = 1;
+};
+
+std::vector<std::uint8_t> makeScanPlan(
+        bool projectionAll,
+        const std::vector<std::uint32_t> &projection,
+        const std::vector<TestScanNode> &nodes,
+        const std::vector<TestScanOrder> &order,
+        std::uint64_t offset, std::uint32_t limit,
+        const std::string &cursor = std::string())
+{
+    std::string literals;
+    for (const TestScanNode &node : nodes)
+    {
+        literals += node.literal;
+    }
+    const std::size_t total =
+            48 + projection.size() * 4 + nodes.size() * 20
+            + order.size() * 8 + literals.size() + cursor.size();
+    std::vector<std::uint8_t> packet(total, 0);
+    packet[0] = 'P';
+    packet[1] = 'X';
+    packet[2] = 'S';
+    packet[3] = 'V';
+    writeLittleUint16(packet, 4, 1);
+    writeLittleUint16(packet, 6, 48);
+    writeLittleUint32(packet, 8, static_cast<std::uint32_t>(total));
+    writeLittleUint32(packet, 12, projectionAll ? 1 : 0);
+    writeLittleUint16(
+            packet, 16,
+            static_cast<std::uint16_t>(projection.size()));
+    writeLittleUint16(
+            packet, 18, static_cast<std::uint16_t>(nodes.size()));
+    writeLittleUint16(
+            packet, 20, static_cast<std::uint16_t>(order.size()));
+    writeLittleUint32(
+            packet, 24, static_cast<std::uint32_t>(literals.size()));
+    writeLittleUint16(
+            packet, 28, static_cast<std::uint16_t>(cursor.size()));
+    writeLittleUint64(packet, 32, offset);
+    writeLittleUint32(packet, 40, limit);
+    std::size_t position = 48;
+    for (std::uint32_t column : projection)
+    {
+        writeLittleUint32(packet, position, column);
+        position += 4;
+    }
+    std::uint32_t literalOffset = 0;
+    for (const TestScanNode &node : nodes)
+    {
+        packet[position] = node.kind;
+        packet[position + 1] = node.operation;
+        writeLittleUint16(packet, position + 2, node.children);
+        writeLittleUint32(packet, position + 4, node.column);
+        writeLittleUint32(
+                packet, position + 8,
+                node.kind == 1 ? literalOffset : 0);
+        writeLittleUint32(
+                packet, position + 12,
+                static_cast<std::uint32_t>(node.literal.size()));
+        if (node.kind == 1)
+        {
+            literalOffset += static_cast<std::uint32_t>(
+                    node.literal.size());
+        }
+        position += 20;
+    }
+    for (const TestScanOrder &key : order)
+    {
+        writeLittleUint32(packet, position, key.column);
+        packet[position + 4] = key.direction;
+        packet[position + 5] = key.nulls;
+        position += 8;
+    }
+    std::copy(literals.begin(), literals.end(), packet.begin() + position);
+    position += literals.size();
+    std::copy(cursor.begin(), cursor.end(), packet.begin() + position);
+    return packet;
 }
 
 void appendUint32(
@@ -1766,7 +1892,10 @@ std::string driveOperation(
                 "composite operation did not converge");
     }
     require(status == PIXELS_INSPECTOR_RESULT_READY,
-            "composite operation did not produce a result");
+            "composite operation did not produce a result (status "
+            + std::to_string(status) + "): "
+            + (status >= PIXELS_INSPECTOR_INVALID_ARGUMENT
+               ? readError(session) : std::string()));
     return readResult(session);
 }
 
@@ -2927,6 +3056,193 @@ void testWholeFileFilter()
                     "\"fourth line\"]}")
                    != std::string::npos,
                 "whole-file filter lost cross-row-group ordering");
+    }
+}
+
+void testScanV2()
+{
+    const std::vector<std::uint8_t> file = readFixture();
+    const std::vector<TestScanNode> all = {TestScanNode{}};
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::vector<std::uint8_t> packet =
+                makeScanPlan(true, {}, all, {}, 0, 0);
+        const std::string result = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), packet.data(),
+                        static_cast<std::uint32_t>(packet.size())));
+        require(result.find(
+                    "{\"operation\":\"scan-v2\",\"columns\":["
+                    "{\"id\":0,\"name\":\"id\",\"kind\":4}")
+                == 0
+                && result.find("\"limit\":20,\"returned\":10")
+                   != std::string::npos
+                && result.find(
+                    "\"ordered\":false,\"completion\":\"complete\"")
+                   != std::string::npos,
+                "default scan-v2 plan differs");
+        std::uint8_t progress[PIXELS_INSPECTOR_SCAN_PROGRESS_V1_BYTES] = {};
+        require(pixels_inspector_copy_scan_progress(
+                        session.handle(), progress, sizeof(progress))
+                == PIXELS_INSPECTOR_OK
+                && progress[0] == 1 && progress[4] == 3,
+                "scan-v2 terminal progress snapshot differs");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::vector<std::uint8_t> packet =
+                makeScanPlan(false, {0}, all, {}, 2, 3);
+        const std::string result = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), packet.data(),
+                        static_cast<std::uint32_t>(packet.size())));
+        require(result.find("\"localRow\":\"2\"")
+                != std::string::npos
+                && result.find("\"localRow\":\"4\"")
+                   != std::string::npos,
+                "natural scan offset/limit is not stable");
+        const std::string marker = "\"cursor\":\"";
+        const std::size_t cursorStart =
+                result.find(marker) + marker.size();
+        const std::size_t cursorEnd =
+                result.find('"', cursorStart);
+        require(cursorStart >= marker.size()
+                && cursorEnd != std::string::npos
+                && cursorEnd - cursorStart == 54,
+                "natural scan cursor is not opaque PXC2");
+        const std::string cursor =
+                result.substr(cursorStart, cursorEnd - cursorStart);
+
+        const std::vector<std::uint8_t> continuation =
+                makeScanPlan(false, {0}, all, {}, 0, 2, cursor);
+        const std::string next = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), continuation.data(),
+                        static_cast<std::uint32_t>(
+                                continuation.size())));
+        require(next.find("\"localRow\":\"5\"")
+                != std::string::npos
+                && next.find("\"localRow\":\"6\"")
+                   != std::string::npos,
+                "natural scan continuation has a gap or duplicate");
+        const std::vector<std::uint8_t> changedPlan =
+                makeScanPlan(false, {1}, all, {}, 0, 2, cursor);
+        require(pixels_inspector_begin_scan(
+                        session.handle(), changedPlan.data(),
+                        static_cast<std::uint32_t>(
+                                changedPlan.size()))
+                == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+                "PXC2 cursor was accepted for a changed plan");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::vector<TestScanNode> expression = {
+                {1, PIXELS_INSPECTOR_FILTER_GE, 0, 0, "8"},
+                {1, PIXELS_INSPECTOR_FILTER_LT, 0, 0, "9"},
+                {2, 0, 2, 0, ""}};
+        const std::vector<std::uint8_t> packet =
+                makeScanPlan(false, {0}, expression, {}, 0, 20);
+        const std::string result = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), packet.data(),
+                        static_cast<std::uint32_t>(packet.size())));
+        require(result.find("\"returned\":1")
+                != std::string::npos
+                && result.find("\"values\":[\"8\"]")
+                   != std::string::npos,
+                "scan-v2 composite AND differs from 3VL semantics");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::vector<TestScanNode> expression = {
+                {1, PIXELS_INSPECTOR_FILTER_EQ, 0, 0, "20"}};
+        const std::vector<std::uint8_t> packet =
+                makeScanPlan(false, {0}, expression, {}, 0, 20);
+        const std::string result = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), packet.data(),
+                        static_cast<std::uint32_t>(packet.size())));
+        require(result.find("\"prunedRowGroups\":1")
+                != std::string::npos
+                && result.find("\"prunedRows\":\"10\"")
+                   != std::string::npos,
+                "scan-v2 did not conservatively prune impossible stats");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::vector<TestScanNode> expression = {
+                {1, PIXELS_INSPECTOR_FILTER_CONTAINS, 0, 1, ""}};
+        const std::vector<std::uint8_t> packet =
+                makeScanPlan(false, {0, 1}, expression, {}, 0, 20);
+        const std::string result = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), packet.data(),
+                        static_cast<std::uint32_t>(packet.size())));
+        require(result.find("\"returned\":10")
+                != std::string::npos,
+                "empty-string scan predicate was rejected or misread");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::vector<TestScanOrder> order = {{0, 1, 1}};
+        const std::vector<std::uint8_t> packet =
+                makeScanPlan(false, {0}, all, order, 0, 3);
+        const std::string result = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), packet.data(),
+                        static_cast<std::uint32_t>(packet.size())));
+        require(result.find(
+                    "\"values\":[\"9\"]},{\"rowGroup\":0,"
+                    "\"localRow\":\"8\"")
+                != std::string::npos
+                && result.find("\"localRow\":\"7\"")
+                   != std::string::npos
+                && result.find("\"ordered\":true")
+                   != std::string::npos,
+                "ordered scan Top-K result differs");
+        const std::string marker = "\"cursor\":\"";
+        const std::size_t cursorStart =
+                result.find(marker) + marker.size();
+        const std::size_t cursorEnd =
+                result.find('"', cursorStart);
+        require(cursorStart >= marker.size()
+                && cursorEnd != std::string::npos
+                && cursorEnd - cursorStart == 54,
+                "ordered scan did not emit an opaque PXC2 cursor");
+        const std::string cursor =
+                result.substr(cursorStart, cursorEnd - cursorStart);
+        const std::vector<std::uint8_t> continuation =
+                makeScanPlan(false, {0}, all, order, 0, 3, cursor);
+        const std::string next = driveOperation(
+                session, file, pixels_inspector_begin_scan(
+                        session.handle(), continuation.data(),
+                        static_cast<std::uint32_t>(
+                                continuation.size())));
+        require(next.find("\"values\":[\"6\"]")
+                != std::string::npos
+                && next.find("\"values\":[\"5\"]")
+                   != std::string::npos
+                && next.find("\"values\":[\"4\"]")
+                   != std::string::npos,
+                "ordered PXC2 continuation has a gap or duplicate");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        std::vector<std::uint8_t> malformed =
+                makeScanPlan(true, {}, all, {}, 0, 20);
+        malformed[44] = 1;
+        require(pixels_inspector_begin_scan(
+                        session.handle(), malformed.data(),
+                        static_cast<std::uint32_t>(malformed.size()))
+                == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+                "nonzero scan reserved field was accepted");
     }
 }
 
@@ -4136,7 +4452,7 @@ void writeBytes(
 void writeConformanceCorpus(const std::filesystem::path &directory)
 {
     std::filesystem::create_directories(directory);
-    std::string manifest = "{\"abi\":3,\"cases\":[";
+    std::string manifest = "{\"abi\":4,\"cases\":[";
     bool first = true;
     const auto addCase =
             [&](const std::string &name, const std::string &fileName,
@@ -4559,6 +4875,7 @@ int main(int argc, char **argv)
         testTpchLineitemFixture();
         testRowProjection();
         testWholeFileFilter();
+        testScanV2();
         testCompatibilityMetadata();
         testDecimalAndTimestampBoundaries();
         testSupportedEncodingMatrix();

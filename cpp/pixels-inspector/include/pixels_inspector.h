@@ -14,12 +14,14 @@ extern "C"
 {
 #endif
 
-#define PIXELS_INSPECTOR_ABI_VERSION 3U
+#define PIXELS_INSPECTOR_ABI_VERSION 4U
 #define PIXELS_INSPECTOR_MAX_OPERATION_ROWS 500U
 #define PIXELS_INSPECTOR_DEFAULT_FILTER_ROWS 100U
 #define PIXELS_INSPECTOR_MAX_PROJECTION_COLUMNS 128U
 #define PIXELS_INSPECTOR_MAX_FILTER_LITERAL_BYTES 4096U
 #define PIXELS_INSPECTOR_MAX_FILTER_CURSOR_BYTES 64U
+#define PIXELS_INSPECTOR_MAX_SCAN_PLAN_BYTES 131072U
+#define PIXELS_INSPECTOR_SCAN_PROGRESS_V1_BYTES 64U
 
 typedef uint32_t pixels_inspector_handle;
 
@@ -94,6 +96,14 @@ pixels_inspector_status pixels_inspector_begin_filter(
         const uint8_t *literal, uint32_t literal_size,
         const uint32_t *columns, uint32_t column_count,
         const uint8_t *cursor, uint32_t cursor_size, uint32_t limit);
+
+pixels_inspector_status pixels_inspector_begin_scan(
+        pixels_inspector_handle handle,
+        const uint8_t *plan, uint32_t plan_size);
+
+pixels_inspector_status pixels_inspector_copy_scan_progress(
+        pixels_inspector_handle handle,
+        uint8_t *destination, uint32_t destination_size);
 
 pixels_inspector_status pixels_inspector_next_range(
         pixels_inspector_handle handle, uint64_t *offset, uint64_t *length);

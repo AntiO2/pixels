@@ -12,6 +12,9 @@
 #include "InspectionSession.h"
 
 #include "pixels_inspector.h"
+#include "ScanComparator.h"
+#include "ScanCursor.h"
+#include "ScanExpression.h"
 #include "format/PixelsFormatReader.h"
 #include "format/PlainLongDecoder.h"
 #include "format/PlainScalarDecoder.h"
@@ -25,6 +28,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -1083,6 +1087,284 @@ void InspectionSession::resetOperation()
     filterResultRowGroups_.clear();
     filterResultLocalRows_.clear();
     filterResultRows_.clear();
+    scanRequest_ = ScanRuntime{};
+}
+
+bool InspectionSession::beginScan(const format::ByteSpan &packet)
+{
+    if (state_ != State::METADATA_READY && state_ != State::PAGE_READY)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_STATE,
+                "scan requires ready metadata");
+    }
+    ScanPlan plan;
+    format::FormatError planError;
+    if (!parseScanPlan(packet, plan, planError))
+    {
+        return transitionFailure(planError.code, planError.message);
+    }
+    resetOperation();
+    operation_ = Operation::SCAN;
+    scanRequest_.plan = std::move(plan);
+    error_.clear();
+    result_.clear();
+    if (!validateScanPlan())
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    scanRequest_.progress.phase = 1;
+    scanRequest_.progress.rowGroupsTotal =
+            static_cast<std::uint32_t>(
+                    fileTail_.footer().rowgroupinfos_size());
+    for (int group = 0;
+         group < fileTail_.footer().rowgroupinfos_size(); ++group)
+    {
+        const proto::RowGroupInformation &information =
+                fileTail_.footer().rowgroupinfos(group);
+        if (!information.has_numberofrows()
+            || !format::checkedAdd(
+                    scanRequest_.progress.rowsTotal,
+                    information.numberofrows(),
+                    scanRequest_.progress.rowsTotal))
+        {
+            return transitionFailure(
+                    format::ErrorCode::MALFORMED_PROTOBUF,
+                    "scan row totals are malformed");
+        }
+    }
+    scanRequest_.planFingerprint =
+            scanPlanFingerprint(scanRequest_.plan);
+    scanRequest_.sourceSignature = scanSourceSignature(
+            fileSize_, fileTail_.SerializeAsString());
+    if (!scanRequest_.plan.cursor.empty())
+    {
+        ScanCursor cursor;
+        format::FormatError cursorError;
+        if (!decodeScanCursor(
+                    scanRequest_.plan.cursor, cursor, cursorError)
+            || cursor.ordered
+               != !scanRequest_.plan.order.empty()
+            || cursor.planFingerprint
+               != scanRequest_.planFingerprint
+            || cursor.sourceSignature
+               != scanRequest_.sourceSignature)
+        {
+            return transitionFailure(
+                    format::ErrorCode::INVALID_ARGUMENT,
+                    "scan cursor does not match the plan or source");
+        }
+        const std::uint64_t anchor = cursor.anchorAbsoluteRow;
+        std::uint64_t base = 0;
+        bool found = false;
+        for (int group = 0;
+             group < fileTail_.footer().rowgroupinfos_size(); ++group)
+        {
+            const std::uint64_t rows =
+                    fileTail_.footer().rowgroupinfos(group).numberofrows();
+            if (anchor >= base && anchor - base < rows)
+            {
+                scanRequest_.rowGroup =
+                        static_cast<std::uint32_t>(group);
+                scanRequest_.rowOffset = anchor - base
+                        + (cursor.ordered ? 0U : 1U);
+                scanRequest_.anchor.rowGroup =
+                        static_cast<std::uint32_t>(group);
+                scanRequest_.anchor.localRow = anchor - base;
+                scanRequest_.anchor.absoluteRow = anchor;
+                found = true;
+                break;
+            }
+            base += rows;
+        }
+        if (!found)
+        {
+            return transitionFailure(
+                    format::ErrorCode::INVALID_ARGUMENT,
+                    "natural scan cursor is outside the file");
+        }
+        scanRequest_.hasCursor = true;
+        scanRequest_.locatingOrderedAnchor = cursor.ordered;
+    }
+    return continueScan();
+}
+
+bool InspectionSession::validateScanPlan()
+{
+    ScanPlan &plan = scanRequest_.plan;
+    if (plan.projectionAll)
+    {
+        for (int column = 0;
+             column < fileTail_.footer().types_size(); ++column)
+        {
+            if (isRootColumn(static_cast<std::uint32_t>(column)))
+            {
+                plan.projection.push_back(
+                        static_cast<std::uint32_t>(column));
+            }
+        }
+    }
+    operationColumns_ = plan.projection;
+    if (!validateProjection(operationColumns_))
+    {
+        return false;
+    }
+    std::set<std::uint32_t> inputs;
+    for (const ScanExpressionNode &node : plan.expression)
+    {
+        if (node.kind != ScanNodeKind::PREDICATE)
+        {
+            continue;
+        }
+        if (!isRootColumn(node.column))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "scan predicate must select a root column");
+        }
+        const proto::Type &type =
+                fileTail_.footer().types(static_cast<int>(node.column));
+        const bool stringLike =
+                type.kind() == proto::Type_Kind_STRING
+                || type.kind() == proto::Type_Kind_VARCHAR
+                || type.kind() == proto::Type_Kind_CHAR;
+        const bool comparable =
+                stringLike
+                || type.kind() == proto::Type_Kind_BOOLEAN
+                || type.kind() == proto::Type_Kind_BYTE
+                || type.kind() == proto::Type_Kind_SHORT
+                || type.kind() == proto::Type_Kind_INT
+                || type.kind() == proto::Type_Kind_LONG
+                || type.kind() == proto::Type_Kind_FLOAT
+                || type.kind() == proto::Type_Kind_DOUBLE
+                || type.kind() == proto::Type_Kind_TIMESTAMP
+                || type.kind() == proto::Type_Kind_DECIMAL
+                || type.kind() == proto::Type_Kind_DATE
+                || type.kind() == proto::Type_Kind_TIME;
+        if (!comparable)
+        {
+            return format::fail(
+                    error_, format::ErrorCode::UNSUPPORTED_TYPE,
+                    "scan predicate column type is not filterable");
+        }
+        const bool nullOperator =
+                node.filterOperator == PIXELS_INSPECTOR_FILTER_IS_NULL
+                || node.filterOperator
+                   == PIXELS_INSPECTOR_FILTER_IS_NOT_NULL;
+        if (node.filterOperator == PIXELS_INSPECTOR_FILTER_CONTAINS
+            && !stringLike)
+        {
+            return format::fail(
+                    error_, format::ErrorCode::INVALID_ARGUMENT,
+                    "scan contains requires a string-like column");
+        }
+        if (type.kind() == proto::Type_Kind_BOOLEAN
+            && !nullOperator
+            && node.filterOperator != PIXELS_INSPECTOR_FILTER_EQ
+            && node.filterOperator != PIXELS_INSPECTOR_FILTER_NE)
+        {
+            return format::fail(
+                    error_, format::ErrorCode::INVALID_ARGUMENT,
+                    "scan BOOLEAN predicate operator is invalid");
+        }
+        if (!nullOperator && !stringLike
+            && node.filterOperator != PIXELS_INSPECTOR_FILTER_CONTAINS)
+        {
+            const std::string zero =
+                    type.kind() == proto::Type_Kind_BOOLEAN ? "false"
+                    : type.kind() == proto::Type_Kind_FLOAT
+                      || type.kind() == proto::Type_Kind_DOUBLE
+                    ? "0" : "\"0\"";
+            int comparison = 0;
+            if (!compareTypedLiteral(
+                        type, zero, node.literal, comparison))
+            {
+                return format::fail(
+                        error_, format::ErrorCode::INVALID_ARGUMENT,
+                        "scan predicate literal is not canonical");
+            }
+        }
+        inputs.insert(node.column);
+    }
+    for (const ScanOrderKey &key : plan.order)
+    {
+        if (!isRootColumn(key.column))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "scan order key must select a root column");
+        }
+        const proto::Type &type =
+                fileTail_.footer().types(static_cast<int>(key.column));
+        if (type.kind() == proto::Type_Kind_BINARY
+            || type.kind() == proto::Type_Kind_VARBINARY
+            || type.kind() == proto::Type_Kind_ARRAY
+            || type.kind() == proto::Type_Kind_MAP
+            || type.kind() == proto::Type_Kind_STRUCT
+            || type.kind() == proto::Type_Kind_VECTOR)
+        {
+            return format::fail(
+                    error_, format::ErrorCode::UNSUPPORTED_TYPE,
+                    "scan order key type is not comparable");
+        }
+        inputs.insert(key.column);
+    }
+    scanRequest_.inputColumns.assign(inputs.begin(), inputs.end());
+    return true;
+}
+
+namespace
+{
+void writeProgress32(std::uint8_t *destination, std::size_t offset,
+                     std::uint32_t value)
+{
+    for (std::size_t byte = 0; byte < 4; ++byte)
+    {
+        destination[offset + byte] =
+                static_cast<std::uint8_t>(value >> (byte * 8U));
+    }
+}
+
+void writeProgress64(std::uint8_t *destination, std::size_t offset,
+                     std::uint64_t value)
+{
+    for (std::size_t byte = 0; byte < 8; ++byte)
+    {
+        destination[offset + byte] =
+                static_cast<std::uint8_t>(value >> (byte * 8U));
+    }
+}
+} // namespace
+
+bool InspectionSession::copyScanProgress(
+        std::uint8_t *destination, std::uint32_t size) const
+{
+    if (operation_ != Operation::SCAN
+        && scanRequest_.progress.phase != 3)
+    {
+        return false;
+    }
+    if (destination == nullptr
+        || size < PIXELS_INSPECTOR_SCAN_PROGRESS_V1_BYTES)
+    {
+        return false;
+    }
+    std::memset(destination, 0, PIXELS_INSPECTOR_SCAN_PROGRESS_V1_BYTES);
+    const ScanProgress &progress = scanRequest_.progress;
+    writeProgress32(destination, 0, 1);
+    writeProgress32(destination, 4, progress.phase);
+    writeProgress32(destination, 8, progress.rowGroupsTotal);
+    writeProgress32(destination, 12, progress.rowGroupsConsidered);
+    writeProgress32(destination, 16, progress.scannedRowGroups);
+    writeProgress32(destination, 20, progress.prunedRowGroups);
+    writeProgress32(destination, 24, progress.currentRowGroup);
+    writeProgress32(destination, 28, progress.retained);
+    writeProgress64(destination, 32, progress.rowsTotal);
+    writeProgress64(destination, 40, progress.scannedRows);
+    writeProgress64(destination, 48, progress.prunedRows);
+    writeProgress64(destination, 56, progress.matchedRows);
+    return true;
 }
 
 bool InspectionSession::beginRows(
@@ -3631,6 +3913,10 @@ bool InspectionSession::consumeOperationChild(
     const std::vector<std::string> values =
             operationChild_->pageValues_;
     operationChild_.reset();
+    if (operation_ == Operation::SCAN)
+    {
+        return consumeScanChild(values);
+    }
     if (operation_ == Operation::ROWS)
     {
         operationColumnValues_.push_back(values);
@@ -3685,6 +3971,307 @@ bool InspectionSession::consumeOperationChild(
     operationColumnValues_[operationColumnIndex_] = values;
     ++operationColumnIndex_;
     return continueFilter();
+}
+
+bool InspectionSession::scanValueTruth(
+        const ScanExpressionNode &node, const std::string &value,
+        std::uint8_t &truth)
+{
+    truth = static_cast<std::uint8_t>(ScanTruth::FALSE_VALUE);
+    if (value == "null")
+    {
+        if (node.filterOperator == PIXELS_INSPECTOR_FILTER_IS_NULL)
+        {
+            truth = static_cast<std::uint8_t>(ScanTruth::TRUE_VALUE);
+        }
+        else if (node.filterOperator
+                 != PIXELS_INSPECTOR_FILTER_IS_NOT_NULL)
+        {
+            truth = static_cast<std::uint8_t>(ScanTruth::UNKNOWN);
+        }
+        return true;
+    }
+    if (node.filterOperator == PIXELS_INSPECTOR_FILTER_IS_NULL)
+    {
+        return true;
+    }
+    if (node.filterOperator == PIXELS_INSPECTOR_FILTER_IS_NOT_NULL)
+    {
+        truth = static_cast<std::uint8_t>(ScanTruth::TRUE_VALUE);
+        return true;
+    }
+    if (node.filterOperator == PIXELS_INSPECTOR_FILTER_CONTAINS)
+    {
+        std::string text;
+        if (!parseJsonString(value, text))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "decoded scan string is invalid JSON");
+        }
+        truth = static_cast<std::uint8_t>(
+                text.find(node.literal) == std::string::npos
+                ? ScanTruth::FALSE_VALUE : ScanTruth::TRUE_VALUE);
+        return true;
+    }
+    const proto::Type &type =
+            fileTail_.footer().types(static_cast<int>(node.column));
+    if ((type.kind() == proto::Type_Kind_FLOAT
+         || type.kind() == proto::Type_Kind_DOUBLE)
+        && !value.empty() && value.front() == '"')
+    {
+        std::string special;
+        if (!parseJsonString(value, special))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "decoded scan floating value is invalid");
+        }
+        if (special == "NaN")
+        {
+            truth = static_cast<std::uint8_t>(
+                    node.filterOperator == PIXELS_INSPECTOR_FILTER_NE
+                    ? ScanTruth::TRUE_VALUE : ScanTruth::FALSE_VALUE);
+            return true;
+        }
+        const int comparison = special == "-Infinity" ? -1 : 1;
+        truth = static_cast<std::uint8_t>(
+                applyComparison(node.filterOperator, comparison)
+                ? ScanTruth::TRUE_VALUE : ScanTruth::FALSE_VALUE);
+        return true;
+    }
+    int comparison = 0;
+    if (!compareTypedLiteral(type, value, node.literal, comparison))
+    {
+        return format::fail(
+                error_, format::ErrorCode::INVALID_ARGUMENT,
+                "scan predicate comparison failed");
+    }
+    truth = static_cast<std::uint8_t>(
+            applyComparison(node.filterOperator, comparison)
+            ? ScanTruth::TRUE_VALUE : ScanTruth::FALSE_VALUE);
+    return true;
+}
+
+bool InspectionSession::evaluateScanRow(
+        std::uint32_t row, bool &matches)
+{
+    std::size_t predicate = 0;
+    ScanTruth result = ScanTruth::UNKNOWN;
+    const bool evaluated = evaluateScanExpression(
+            scanRequest_.plan,
+            [this, row, &predicate](
+                    std::size_t, ScanTruth &truth) -> bool
+            {
+                std::size_t seen = 0;
+                const ScanExpressionNode *node = nullptr;
+                for (const ScanExpressionNode &candidate :
+                     scanRequest_.plan.expression)
+                {
+                    if (candidate.kind != ScanNodeKind::PREDICATE)
+                    {
+                        continue;
+                    }
+                    if (seen++ == predicate)
+                    {
+                        node = &candidate;
+                        break;
+                    }
+                }
+                ++predicate;
+                if (node == nullptr)
+                {
+                    return false;
+                }
+                const auto column = std::find(
+                        scanRequest_.inputColumns.begin(),
+                        scanRequest_.inputColumns.end(), node->column);
+                if (column == scanRequest_.inputColumns.end())
+                {
+                    return false;
+                }
+                const std::size_t index = static_cast<std::size_t>(
+                        column - scanRequest_.inputColumns.begin());
+                if (index >= scanRequest_.inputValues.size()
+                    || row >= scanRequest_.inputValues[index].size())
+                {
+                    return false;
+                }
+                std::uint8_t raw = 0;
+                if (!scanValueTruth(
+                            *node, scanRequest_.inputValues[index][row],
+                            raw))
+                {
+                    return false;
+                }
+                truth = static_cast<ScanTruth>(raw);
+                return true;
+            },
+            result);
+    if (!evaluated)
+    {
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "scan expression evaluation failed");
+    }
+    matches = result == ScanTruth::TRUE_VALUE;
+    return true;
+}
+
+bool InspectionSession::scanRowGroupCanBePruned(
+        std::uint32_t rowGroup, bool &pruned)
+{
+    constexpr std::uint8_t FALSE_OR_UNKNOWN =
+            (1U << static_cast<std::uint8_t>(
+                    ScanTruth::FALSE_VALUE))
+            | (1U << static_cast<std::uint8_t>(
+                    ScanTruth::UNKNOWN));
+    constexpr std::uint8_t ALL_TRUTHS =
+            FALSE_OR_UNKNOWN
+            | (1U << static_cast<std::uint8_t>(
+                    ScanTruth::TRUE_VALUE));
+    const FilterRequest saved = filterRequest_;
+    std::size_t predicate = 0;
+    std::uint8_t possible = ALL_TRUTHS;
+    const bool evaluated = evaluateScanTruthSet(
+            scanRequest_.plan,
+            [this, rowGroup, &predicate](
+                    std::size_t, std::uint8_t &truthSet)
+            {
+                std::size_t seen = 0;
+                const ScanExpressionNode *node = nullptr;
+                for (const ScanExpressionNode &candidate :
+                     scanRequest_.plan.expression)
+                {
+                    if (candidate.kind != ScanNodeKind::PREDICATE)
+                    {
+                        continue;
+                    }
+                    if (seen++ == predicate)
+                    {
+                        node = &candidate;
+                        break;
+                    }
+                }
+                ++predicate;
+                if (node == nullptr)
+                {
+                    return false;
+                }
+                filterRequest_.predicateColumn = node->column;
+                filterRequest_.filterOperator = node->filterOperator;
+                filterRequest_.literal = node->literal;
+                bool leafPruned = false;
+                if (!rowGroupCanBePruned(rowGroup, leafPruned))
+                {
+                    return false;
+                }
+                truthSet = leafPruned
+                           ? FALSE_OR_UNKNOWN : ALL_TRUTHS;
+                return true;
+            },
+            possible);
+    filterRequest_ = saved;
+    if (!evaluated)
+    {
+        return false;
+    }
+    pruned = (possible
+              & (1U << static_cast<std::uint8_t>(
+                      ScanTruth::TRUE_VALUE))) == 0;
+    return true;
+}
+
+bool InspectionSession::compareScanCandidates(
+        const ScanCandidate &left, const ScanCandidate &right,
+        int &comparison)
+{
+    return compareOrderedCandidates(
+            scanRequest_.plan, left, right,
+            [this](
+                    std::size_t index,
+                    const std::string &leftValue,
+                    const std::string &rightValue,
+                    int &valueComparison)
+            {
+                const ScanOrderKey &key =
+                        scanRequest_.plan.order[index];
+                const proto::Type &type =
+                        fileTail_.footer().types(
+                                static_cast<int>(key.column));
+                if ((type.kind() == proto::Type_Kind_FLOAT
+                     || type.kind() == proto::Type_Kind_DOUBLE)
+                    && (leftValue.front() == '"'
+                        || rightValue.front() == '"'))
+                {
+                    auto rank = [](const std::string &value)
+                    {
+                        return value == "\"-Infinity\"" ? 0
+                               : value == "\"Infinity\"" ? 2
+                               : value == "\"NaN\"" ? 3 : 1;
+                    };
+                    const int leftRank = rank(leftValue);
+                    const int rightRank = rank(rightValue);
+                    valueComparison =
+                            leftRank < rightRank ? -1
+                            : leftRank > rightRank ? 1 : 0;
+                    return true;
+                }
+                std::string rightLiteral = rightValue;
+                if (type.kind() == proto::Type_Kind_STRING
+                    || type.kind() == proto::Type_Kind_VARCHAR
+                    || type.kind() == proto::Type_Kind_CHAR
+                    || (type.kind() != proto::Type_Kind_BOOLEAN
+                        && type.kind() != proto::Type_Kind_FLOAT
+                        && type.kind() != proto::Type_Kind_DOUBLE))
+                {
+                    if (!parseJsonString(rightValue, rightLiteral))
+                    {
+                        return format::fail(
+                                error_,
+                                format::ErrorCode::MALFORMED_PROTOBUF,
+                                "scan order value is invalid JSON");
+                    }
+                }
+                if (!compareTypedLiteral(
+                            type, leftValue, rightLiteral,
+                            valueComparison))
+                {
+                    return format::fail(
+                            error_,
+                            format::ErrorCode::MALFORMED_PROTOBUF,
+                            "scan order value cannot be compared");
+                }
+                return true;
+            },
+            comparison);
+}
+
+bool InspectionSession::consumeScanChild(
+        const std::vector<std::string> &values)
+{
+    ScanRuntime &scan = scanRequest_;
+    if (scan.progress.phase == 1 && !scan.projecting)
+    {
+        if (scan.inputColumnIndex >= scan.inputValues.size())
+        {
+            return format::fail(
+                    error_, format::ErrorCode::INVALID_STATE,
+                    "scan input child index is inconsistent");
+        }
+        scan.inputValues[scan.inputColumnIndex++] = values;
+    }
+    else
+    {
+        if (scan.projectionColumn >= operationColumnValues_.size())
+        {
+            return format::fail(
+                    error_, format::ErrorCode::INVALID_STATE,
+                    "scan projection child index is inconsistent");
+        }
+        operationColumnValues_[scan.projectionColumn++] = values;
+    }
+    return continueScan();
 }
 
 bool InspectionSession::continueRows()
@@ -4253,6 +4840,498 @@ bool InspectionSession::finishFilter(bool completed)
     }
     operation_ = Operation::NONE;
     resetOperation();
+    state_ = State::PAGE_READY;
+    return true;
+}
+
+bool InspectionSession::continueScan()
+{
+    ScanRuntime &scan = scanRequest_;
+    const proto::Footer &footer = fileTail_.footer();
+
+    if (scan.progress.phase == 2)
+    {
+        if (scan.projectionCandidate >= scan.candidates.size())
+        {
+            return finishScan(true);
+        }
+        ScanCandidate &candidate =
+                scan.candidates[scan.projectionCandidate];
+        if (operationColumnValues_.empty())
+        {
+            operationColumnValues_.assign(
+                    operationColumns_.size(),
+                    std::vector<std::string>());
+            scan.projectionColumn = 0;
+        }
+        if (scan.projectionColumn < operationColumns_.size())
+        {
+            return startOperationPage(
+                    candidate.rowGroup,
+                    operationColumns_[scan.projectionColumn],
+                    candidate.localRow, 1);
+        }
+        candidate.values.clear();
+        candidate.values.reserve(operationColumnValues_.size());
+        for (const std::vector<std::string> &column :
+             operationColumnValues_)
+        {
+            if (column.size() != 1)
+            {
+                return transitionFailure(
+                        format::ErrorCode::INVALID_STATE,
+                        "ordered scan projection is not rectangular");
+            }
+            candidate.values.push_back(column.front());
+        }
+        operationColumnValues_.clear();
+        scan.projectionColumn = 0;
+        ++scan.projectionCandidate;
+        return continueScan();
+    }
+
+    if (scan.locatingOrderedAnchor)
+    {
+        if (scan.inputValues.empty())
+        {
+            scan.batchCount = 1;
+            scan.inputValues.assign(
+                    scan.inputColumns.size(),
+                    std::vector<std::string>());
+            scan.inputColumnIndex = 0;
+        }
+        if (scan.inputColumnIndex < scan.inputColumns.size())
+        {
+            return startOperationPage(
+                    scan.anchor.rowGroup,
+                    scan.inputColumns[scan.inputColumnIndex],
+                    scan.anchor.localRow, 1);
+        }
+        bool matches = false;
+        if (!evaluateScanRow(0, matches) || !matches)
+        {
+            return transitionFailure(
+                    format::ErrorCode::INVALID_ARGUMENT,
+                    "ordered scan cursor anchor no longer matches");
+        }
+        scan.anchor.keys.clear();
+        for (const ScanOrderKey &key : scan.plan.order)
+        {
+            const auto column = std::find(
+                    scan.inputColumns.begin(),
+                    scan.inputColumns.end(), key.column);
+            const std::size_t index = static_cast<std::size_t>(
+                    column - scan.inputColumns.begin());
+            scan.anchor.keys.push_back(scan.inputValues[index][0]);
+            scan.anchor.keyBytes += scan.anchor.keys.back().size();
+        }
+        scan.locatingOrderedAnchor = false;
+        scan.rowGroup = 0;
+        scan.rowOffset = 0;
+        scan.batchCount = 0;
+        scan.inputValues.clear();
+        scan.inputColumnIndex = 0;
+        scan.inputsReady = false;
+        return continueScan();
+    }
+
+    if (scan.projecting)
+    {
+        while (scan.projectionColumn < operationColumns_.size())
+        {
+            const std::uint32_t column =
+                    operationColumns_[scan.projectionColumn];
+            const auto existing = std::find(
+                    scan.inputColumns.begin(),
+                    scan.inputColumns.end(), column);
+            if (existing != scan.inputColumns.end())
+            {
+                operationColumnValues_[scan.projectionColumn] =
+                        scan.inputValues[static_cast<std::size_t>(
+                                existing - scan.inputColumns.begin())];
+                ++scan.projectionColumn;
+                continue;
+            }
+            return startOperationPage(
+                    scan.rowGroup, column, scan.rowOffset,
+                    scan.batchCount);
+        }
+        for (std::uint32_t match : scan.matchingRows)
+        {
+            ScanCandidate candidate;
+            candidate.rowGroup = scan.rowGroup;
+            candidate.localRow = scan.rowOffset + match;
+            candidate.absoluteRow = absoluteRow(
+                    candidate.rowGroup, candidate.localRow);
+            for (const std::vector<std::string> &column :
+                 operationColumnValues_)
+            {
+                if (column.size() != scan.batchCount)
+                {
+                    return transitionFailure(
+                            format::ErrorCode::INVALID_STATE,
+                            "natural scan projection is not rectangular");
+                }
+                candidate.values.push_back(column[match]);
+            }
+            scan.candidates.push_back(std::move(candidate));
+        }
+        const bool full =
+                scan.candidates.size() >= scan.plan.limit;
+        scan.projecting = false;
+        scan.inputsReady = false;
+        scan.inputValues.clear();
+        scan.matchingRows.clear();
+        operationColumnValues_.clear();
+        scan.inputColumnIndex = 0;
+        scan.projectionColumn = 0;
+        scan.rowOffset += scan.batchCount;
+        if (full)
+        {
+            return finishScan(false);
+        }
+    }
+
+    if (!scan.inputsReady && scan.inputColumnIndex != 0)
+    {
+        if (scan.inputColumnIndex < scan.inputColumns.size())
+        {
+            return startOperationPage(
+                    scan.rowGroup,
+                    scan.inputColumns[scan.inputColumnIndex],
+                    scan.rowOffset, scan.batchCount);
+        }
+        scan.inputsReady = true;
+    }
+
+    while (!scan.inputsReady)
+    {
+        if (scan.rowGroup
+            >= static_cast<std::uint32_t>(
+                    footer.rowgroupinfos_size()))
+        {
+            if (scan.plan.order.empty())
+            {
+                return finishScan(true);
+            }
+            if (!sortAndRetainBest(
+                        scan.candidates, scan.candidates.size(),
+                        [this](
+                                const ScanCandidate &left,
+                                const ScanCandidate &right,
+                                int &comparison)
+                        {
+                            return compareScanCandidates(
+                                    left, right, comparison);
+                        }))
+            {
+                state_ = State::FAILED;
+                return false;
+            }
+            const std::size_t first = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(
+                            scan.plan.offset,
+                            scan.candidates.size()));
+            const std::size_t last = std::min<std::size_t>(
+                    scan.candidates.size(), first + scan.plan.limit);
+            std::vector<ScanCandidate> selected(
+                    scan.candidates.begin() + first,
+                    scan.candidates.begin() + last);
+            scan.candidates.swap(selected);
+            scan.progress.retained =
+                    static_cast<std::uint32_t>(
+                            scan.candidates.size());
+            scan.progress.phase = 2;
+            scan.progress.currentRowGroup =
+                    static_cast<std::uint32_t>(-1);
+            scan.projectionCandidate = 0;
+            scan.projectionColumn = 0;
+            operationColumnValues_.clear();
+            return continueScan();
+        }
+        const proto::RowGroupInformation &information =
+                footer.rowgroupinfos(static_cast<int>(scan.rowGroup));
+        if (!information.has_numberofrows())
+        {
+            return transitionFailure(
+                    format::ErrorCode::MALFORMED_PROTOBUF,
+                    "scan row group is missing its row count");
+        }
+        if (scan.rowOffset >= information.numberofrows())
+        {
+            ++scan.rowGroup;
+            scan.rowOffset = 0;
+            continue;
+        }
+        if (scan.rowOffset == 0)
+        {
+            bool pruned = false;
+            if (!scanRowGroupCanBePruned(scan.rowGroup, pruned))
+            {
+                state_ = State::FAILED;
+                return false;
+            }
+            if (pruned)
+            {
+                ++scan.progress.rowGroupsConsidered;
+                ++scan.progress.prunedRowGroups;
+                scan.progress.prunedRows +=
+                        information.numberofrows();
+                ++scan.rowGroup;
+                continue;
+            }
+        }
+        if (scan.countedRowGroup != scan.rowGroup)
+        {
+            ++scan.progress.rowGroupsConsidered;
+            ++scan.progress.scannedRowGroups;
+            scan.countedRowGroup = scan.rowGroup;
+        }
+        scan.progress.currentRowGroup = scan.rowGroup;
+        scan.batchCount = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(
+                        information.numberofrows() - scan.rowOffset,
+                        MAX_OPERATION_ROWS));
+        scan.inputValues.assign(
+                scan.inputColumns.size(), std::vector<std::string>());
+        scan.inputColumnIndex = 0;
+        if (scan.inputColumns.empty())
+        {
+            scan.inputsReady = true;
+            break;
+        }
+        return startOperationPage(
+                scan.rowGroup, scan.inputColumns.front(),
+                scan.rowOffset, scan.batchCount);
+    }
+
+    if (scan.inputColumnIndex < scan.inputColumns.size())
+    {
+        return startOperationPage(
+                scan.rowGroup,
+                scan.inputColumns[scan.inputColumnIndex],
+                scan.rowOffset, scan.batchCount);
+    }
+    scan.inputsReady = true;
+    scan.progress.scannedRows += scan.batchCount;
+    scan.matchingRows.clear();
+    for (std::uint32_t row = 0; row < scan.batchCount; ++row)
+    {
+        bool matches = false;
+        if (!evaluateScanRow(row, matches))
+        {
+            state_ = State::FAILED;
+            return false;
+        }
+        if (!matches)
+        {
+            continue;
+        }
+        ++scan.progress.matchedRows;
+        if (scan.plan.order.empty())
+        {
+            if (scan.skippedMatches < scan.plan.offset)
+            {
+                ++scan.skippedMatches;
+            }
+            else if (scan.candidates.size()
+                     + scan.matchingRows.size()
+                     < scan.plan.limit)
+            {
+                scan.matchingRows.push_back(row);
+            }
+        }
+        else
+        {
+            ScanCandidate candidate;
+            candidate.rowGroup = scan.rowGroup;
+            candidate.localRow = scan.rowOffset + row;
+            candidate.absoluteRow = absoluteRow(
+                    candidate.rowGroup, candidate.localRow);
+            std::size_t keyBytes = 0;
+            for (const ScanOrderKey &key : scan.plan.order)
+            {
+                const auto column = std::find(
+                        scan.inputColumns.begin(),
+                        scan.inputColumns.end(), key.column);
+                const std::size_t index = static_cast<std::size_t>(
+                        column - scan.inputColumns.begin());
+                candidate.keys.push_back(
+                        scan.inputValues[index][row]);
+                keyBytes += candidate.keys.back().size();
+            }
+            if (keyBytes > 65536)
+            {
+                return transitionFailure(
+                        format::ErrorCode::OUT_OF_BOUNDS,
+                        "one scan sort key exceeds 64 KiB");
+            }
+            const std::size_t retain =
+                    scan.hasCursor
+                    ? scan.plan.limit
+                    : static_cast<std::size_t>(
+                            scan.plan.offset + scan.plan.limit);
+            if (scan.hasCursor)
+            {
+                int anchorComparison = 0;
+                if (!compareScanCandidates(
+                            candidate, scan.anchor,
+                            anchorComparison))
+                {
+                    state_ = State::FAILED;
+                    return false;
+                }
+                if (anchorComparison <= 0)
+                {
+                    continue;
+                }
+            }
+            ++scan.eligibleMatches;
+            candidate.keyBytes = keyBytes;
+            const ScanTopKResult inserted = insertTopK(
+                    scan.candidates, std::move(candidate), retain,
+                    16U * 1024U * 1024U,
+                    scan.retainedKeyBytes,
+                    [this](
+                            const ScanCandidate &left,
+                            const ScanCandidate &right,
+                            int &comparison)
+                    {
+                        return compareScanCandidates(
+                                left, right, comparison);
+                    });
+            if (inserted != ScanTopKResult::OK)
+            {
+                return transitionFailure(
+                        inserted
+                                == ScanTopKResult::KEY_BUDGET_EXCEEDED
+                        ? format::ErrorCode::OUT_OF_BOUNDS
+                        : format::ErrorCode::INVALID_STATE,
+                        inserted
+                                == ScanTopKResult::KEY_BUDGET_EXCEEDED
+                        ? "scan Top-K keys exceed 16 MiB"
+                        : "scan Top-K comparison failed");
+            }
+            scan.progress.retained = static_cast<std::uint32_t>(
+                    scan.candidates.size());
+        }
+    }
+
+    if (scan.plan.order.empty() && !scan.matchingRows.empty())
+    {
+        scan.projecting = true;
+        operationColumnValues_.assign(
+                operationColumns_.size(),
+                std::vector<std::string>());
+        scan.projectionColumn = 0;
+        return continueScan();
+    }
+    scan.rowOffset += scan.batchCount;
+    scan.inputsReady = false;
+    scan.inputValues.clear();
+    scan.inputColumnIndex = 0;
+    return continueScan();
+}
+
+bool InspectionSession::finishScan(bool complete)
+{
+    ScanRuntime &scan = scanRequest_;
+    scan.progress.phase = 3;
+    scan.progress.currentRowGroup =
+            static_cast<std::uint32_t>(-1);
+    std::ostringstream output;
+    output << "{\"operation\":\"scan-v2\",\"columns\":[";
+    for (std::size_t column = 0;
+         column < operationColumns_.size(); ++column)
+    {
+        if (column != 0)
+        {
+            output << ",";
+        }
+        const std::uint32_t id = operationColumns_[column];
+        const proto::Type &type =
+                fileTail_.footer().types(static_cast<int>(id));
+        output << "{\"id\":" << id
+               << ",\"name\":\"" << escapeJson(type.name())
+               << "\",\"kind\":" << static_cast<int>(type.kind())
+               << "}";
+    }
+    output << "],\"rows\":[";
+    for (std::size_t row = 0; row < scan.candidates.size(); ++row)
+    {
+        if (row != 0)
+        {
+            output << ",";
+        }
+        const ScanCandidate &candidate = scan.candidates[row];
+        output << "{\"rowGroup\":" << candidate.rowGroup
+               << ",\"localRow\":\"" << candidate.localRow
+               << "\",\"absoluteRow\":\"" << candidate.absoluteRow
+               << "\",\"values\":[";
+        for (std::size_t column = 0;
+             column < candidate.values.size(); ++column)
+        {
+            if (column != 0)
+            {
+                output << ",";
+            }
+            output << candidate.values[column];
+        }
+        output << "]}";
+    }
+    const bool ordered = !scan.plan.order.empty();
+    const bool continuation =
+            ordered
+            ? scan.eligibleMatches
+              > (scan.hasCursor ? scan.candidates.size()
+                                : scan.plan.offset
+                                  + scan.candidates.size())
+            : !complete;
+    output << "],\"page\":{\"offsetApplied\":\""
+           << scan.plan.offset << "\",\"limit\":" << scan.plan.limit
+           << ",\"returned\":" << scan.candidates.size()
+           << ",\"continuationAvailable\":"
+           << (continuation ? "true" : "false")
+           << ",\"hasMoreExact\":" << (ordered ? "true" : "false")
+           << ",\"cursor\":";
+    if (continuation && !scan.candidates.empty())
+    {
+        output << "\"" << encodeScanCursor(ScanCursor{
+                ordered, scan.planFingerprint,
+                scan.sourceSignature,
+                scan.candidates.back().absoluteRow}) << "\"";
+    }
+    else
+    {
+        output << "null";
+    }
+    output << "},\"scan\":{\"ordered\":"
+           << (ordered ? "true" : "false")
+           << ",\"completion\":\""
+           << (complete ? "complete" : "limit")
+           << "\"},\"progress\":{\"rowGroupsTotal\":"
+           << scan.progress.rowGroupsTotal
+           << ",\"rowGroupsConsidered\":"
+           << scan.progress.rowGroupsConsidered
+           << ",\"scannedRowGroups\":"
+           << scan.progress.scannedRowGroups
+           << ",\"prunedRowGroups\":"
+           << scan.progress.prunedRowGroups
+           << ",\"rowsTotal\":\"" << scan.progress.rowsTotal
+           << "\",\"scannedRows\":\"" << scan.progress.scannedRows
+           << "\",\"prunedRows\":\"" << scan.progress.prunedRows
+           << "\",\"matchedRows\":\"" << scan.progress.matchedRows
+           << "\"}}";
+    result_ = output.str();
+    if (result_.size() > MAX_RESULT_OUTPUT_BYTES)
+    {
+        result_.clear();
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "scan result exceeds the bounded output limit");
+    }
+    operationChild_.reset();
+    operation_ = Operation::NONE;
     state_ = State::PAGE_READY;
     return true;
 }

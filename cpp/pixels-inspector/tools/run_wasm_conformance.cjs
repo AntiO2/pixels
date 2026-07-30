@@ -6,8 +6,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 
+function makeDefaultScanPacket() {
+  const packet = new Uint8Array(68);
+  const view = new DataView(packet.buffer);
+  packet.set([0x50, 0x58, 0x53, 0x56]);
+  view.setUint16(4, 1, true);
+  view.setUint16(6, 48, true);
+  view.setUint32(8, packet.length, true);
+  view.setUint32(12, 1, true);
+  view.setUint16(18, 1, true);
+  return packet;
+}
+
 const EXPECTED_METADATA =
-  '{"abi":3,"version":1,"magic":"PIXELS","rows":10,' +
+  '{"abi":4,"version":1,"magic":"PIXELS","rows":10,' +
   '"pixelStride":10000,"schemaCount":4,"rowGroupCount":1,' +
   '"firstColumn":{"name":"id","kind":4},' +
   '"postscript":{"contentLength":"352","compression":0,' +
@@ -121,7 +133,7 @@ async function main() {
   let handle = 0;
   let rangeCopies = 0;
   try {
-    requireCondition(module._pixels_inspector_abi_version() === 3,
+    requireCondition(module._pixels_inspector_abi_version() === 4,
       "unexpected inspector ABI");
     requireCondition(
       module._pixels_inspector_capabilities_size(scratch) === 0,
@@ -153,12 +165,19 @@ async function main() {
       module._free(capabilityPointer);
     }
     requireCondition(
-      capabilities.abi === 3 &&
+      capabilities.abi === 4 &&
         capabilities.page === "generic-v1" &&
         capabilities.rows === "rows-v1" &&
         capabilities.filter === "filter-v1" &&
+        capabilities.scan === "scan-v2" &&
         capabilities.maxRows === 500 &&
         capabilities.defaultRows === 100 &&
+        capabilities.defaultScanRows === 20 &&
+        capabilities.maxScanRows === 500 &&
+        capabilities.maxProjectionColumns === 128 &&
+        capabilities.maxExpressionNodes === 64 &&
+        capabilities.maxOrderKeys === 8 &&
+        capabilities.maxOrderedWindowRows === 4096 &&
         capabilities.compression?.payload === "inactive" &&
         JSON.stringify(capabilities.compression?.metadata) ===
           JSON.stringify(["NONE", "ZLIB", "SNAPPY", "LZO", "LZ4", "ZSTD"]) &&
@@ -381,6 +400,58 @@ async function main() {
           filter.cursor === null,
         "WASM filter-v1 differs from the native contract",
       );
+
+      const scanPacket = makeDefaultScanPacket();
+      const scanPointer = module._malloc(scanPacket.length);
+      const progressPointer = module._malloc(64);
+      try {
+        module.HEAPU8.set(scanPacket, scanPointer);
+        requireCondition(
+          module._pixels_inspector_begin_scan(
+            handle, scanPointer, scanPacket.length,
+          ) === 1,
+          "scan-v2 did not start",
+        );
+        status = 1;
+        suppliedRanges = 0;
+        while (status === 1) {
+          requireCondition(
+            module._pixels_inspector_copy_scan_progress(
+              handle, progressPointer, 64,
+            ) === 0,
+            "scan-v2 progress was unavailable",
+          );
+          status = supplyRange(nextRange());
+          suppliedRanges += 1;
+          requireCondition(suppliedRanges < 256,
+            "scan-v2 did not converge");
+        }
+        requireCondition(status === 2,
+          "scan-v2 did not produce a result");
+        const scan = JSON.parse(readResult());
+        requireCondition(
+          scan.operation === "scan-v2" &&
+            scan.page.limit === 20 &&
+            scan.page.returned === 10 &&
+            scan.scan.ordered === false &&
+            scan.scan.completion === "complete" &&
+            scan.rows[0].absoluteRow === "0" &&
+            scan.rows[9].absoluteRow === "9",
+          "WASM scan-v2 differs from the native contract",
+        );
+        requireCondition(
+          module._pixels_inspector_copy_scan_progress(
+            handle, progressPointer, 64,
+          ) === 0 &&
+            new DataView(
+              module.HEAPU8.buffer, progressPointer, 64,
+            ).getUint32(4, true) === 3,
+          "scan-v2 terminal progress differs",
+        );
+      } finally {
+        module._free(progressPointer);
+        module._free(scanPointer);
+      }
     } finally {
       module._free(literalPointer);
       module._free(projectionPointer);
@@ -391,7 +462,7 @@ async function main() {
       const corpus = JSON.parse(
         fs.readFileSync(path.join(corpusPath, "manifest.json"), "utf8"),
       );
-      requireCondition(corpus.abi === 3 && corpus.cases.length === 20 &&
+      requireCondition(corpus.abi === 4 && corpus.cases.length === 20 &&
         Array.isArray(corpus.compatibility) && corpus.compatibility.length > 0,
         "conformance corpus inventory is incomplete");
       const expectedNames = capabilities.types.map((type) => type.name);
@@ -525,7 +596,7 @@ async function main() {
     );
 
     const metrics = {
-      abi: 3,
+      abi: 4,
       capabilities,
       corpusCases,
       wasmBytes: fs.statSync(wasmPath).size,

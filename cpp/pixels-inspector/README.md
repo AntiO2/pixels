@@ -51,7 +51,8 @@ node cpp/pixels-inspector/tools/run_wasm_worker_conformance.cjs \
 ```
 
 The conformance runner validates the ABI, exact metadata, row-group layout,
-generic pages, `rows-v1`, `filter-v1`, cancellation, mismatched ranges, all 20
+generic pages, `rows-v1`, `filter-v1`, `scan-v2`, cancellation, mismatched
+ranges, all 20
 logical kinds, the declared encoding compatibility matrix, DECIMAL precision
 boundaries, TIMESTAMP precision and writer-timezone provenance, bounded linear
 memory, and the Emscripten import allowlist.
@@ -67,16 +68,25 @@ rows. `filter-v1` accepts one typed root-scalar predicate, returns at most 500
 matching rows (100 when the ABI limit argument is zero), and uses a Core-owned
 continuation. Missing or ambiguous statistics always fall back to scanning.
 
+`scan-v2` accepts one canonical little-endian `PXSV` packet. It supports
+projection-all or an ordered root projection, bounded postfix AND/OR/NOT
+predicates with SQL-style three-valued logic, natural offset/limit paging,
+and up to eight explicit sort keys. Ordered scans retain at most 4,096
+candidates in a 16 MiB Top-K key budget, use absolute row as the final stable
+tie-break, and read projected values only after the ordered page is selected.
+Both natural and ordered continuations use a Core-owned PXC2 cursor bound to
+the normalized semantic plan and immutable source signature.
+
 Pixels V1 declares `NONE`, `ZLIB`, `SNAPPY`, `LZO`, `LZ4`, and `ZSTD` in
 PostScript, but the format marks the compression fields as currently unused.
-ABI v3 therefore preserves all six recognized metadata values and advertises
+ABI v4 therefore preserves all six recognized metadata values and advertises
 compression payload capability as `inactive`; it does not route chunk bytes
 through a guessed decompressor.
 
 ## Range protocol
 
 1. create a session with the immutable file size;
-2. begin metadata, row-group layout, page, row projection, or filter;
+2. begin metadata, row-group layout, page, row projection, filter, or scan;
 3. call `next_range`;
 4. asynchronously read that exact range in the host;
 5. call `supply_range`;

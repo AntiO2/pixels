@@ -135,6 +135,11 @@ target_link_libraries(pixels-format PUBLIC pixels-inspector-proto)
 add_dependencies(pixels-format pixels-inspector-check-dependencies)
 
 add_library(pixels-inspector STATIC
+    lib/ScanComparator.cpp
+    lib/ScanCursor.cpp
+    lib/ScanExpression.cpp
+    lib/ScanPlan.cpp
+    lib/ScanRuntime.cpp
     lib/InspectionSession.cpp
     lib/pixels_inspector.cpp)
 target_include_directories(pixels-inspector PUBLIC
@@ -192,6 +197,20 @@ if(PIXELS_INSPECTOR_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     add_test(NAME pixels-inspector-tests COMMAND pixels-inspector-tests)
 
     add_executable(
+        pixels-inspector-scan-plan-tests tests/ScanPlanTests.cpp)
+    target_link_libraries(
+        pixels-inspector-scan-plan-tests PRIVATE pixels-inspector)
+    if(PIXELS_INSPECTOR_ENABLE_SANITIZERS)
+        target_compile_options(pixels-inspector-scan-plan-tests PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(pixels-inspector-scan-plan-tests PRIVATE
+            -fsanitize=address,undefined)
+    endif()
+    add_test(
+        NAME pixels-inspector-scan-plan-tests
+        COMMAND pixels-inspector-scan-plan-tests)
+
+    add_executable(
         pixels-inspector-rle-tests tests/RunLengthDecoderTests.cpp)
     target_link_libraries(
         pixels-inspector-rle-tests PRIVATE pixels-format)
@@ -245,5 +264,5 @@ if(EMSCRIPTEN)
         "SHELL:-sMAXIMUM_MEMORY=268435456"
         "SHELL:-sINCOMING_MODULE_JS_API=['wasmBinary','locateFile','print','printErr','noInitialRun']"
         "SHELL:-sEXPORTED_RUNTIME_METHODS=['HEAPU8']"
-        "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_pixels_inspector_abi_version','_pixels_inspector_capabilities_size','_pixels_inspector_copy_capabilities','_pixels_inspector_create','_pixels_inspector_destroy','_pixels_inspector_begin_metadata','_pixels_inspector_begin_row_group','_pixels_inspector_begin_plain_long_page','_pixels_inspector_begin_page','_pixels_inspector_begin_rows','_pixels_inspector_begin_filter','_pixels_inspector_next_range','_pixels_inspector_supply_range','_pixels_inspector_result_size','_pixels_inspector_copy_result','_pixels_inspector_error_size','_pixels_inspector_copy_error','_pixels_inspector_cancel']")
+        "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_pixels_inspector_abi_version','_pixels_inspector_capabilities_size','_pixels_inspector_copy_capabilities','_pixels_inspector_create','_pixels_inspector_destroy','_pixels_inspector_begin_metadata','_pixels_inspector_begin_row_group','_pixels_inspector_begin_plain_long_page','_pixels_inspector_begin_page','_pixels_inspector_begin_rows','_pixels_inspector_begin_filter','_pixels_inspector_begin_scan','_pixels_inspector_copy_scan_progress','_pixels_inspector_next_range','_pixels_inspector_supply_range','_pixels_inspector_result_size','_pixels_inspector_copy_result','_pixels_inspector_error_size','_pixels_inspector_copy_error','_pixels_inspector_cancel']")
 endif()

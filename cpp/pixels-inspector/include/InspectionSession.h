@@ -18,6 +18,8 @@
 #include "format/PlainPixelPlanner.h"
 #include "format/VariableLengthDecoder.h"
 #include "pixels.pb.h"
+#include "ScanPlan.h"
+#include "ScanRuntime.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -79,6 +81,10 @@ public:
             const std::vector<std::uint32_t> &columns,
             const std::string &cursor, std::uint32_t limit);
 
+    [[nodiscard]] bool beginScan(const format::ByteSpan &packet);
+    [[nodiscard]] bool copyScanProgress(
+            std::uint8_t *destination, std::uint32_t size) const;
+
     [[nodiscard]] bool beginRowGroup(std::uint32_t rowGroup);
 
     [[nodiscard]] bool nextRange(format::FileRange &range) const;
@@ -125,7 +131,8 @@ private:
     {
         NONE = 0,
         ROWS = 1,
-        FILTER = 2
+        FILTER = 2,
+        SCAN = 3
     };
 
     struct FilterRequest
@@ -178,6 +185,21 @@ private:
     [[nodiscard]] bool continueFilter();
     [[nodiscard]] bool finishRows();
     [[nodiscard]] bool finishFilter(bool completed);
+    [[nodiscard]] bool consumeScanChild(
+            const std::vector<std::string> &values);
+    [[nodiscard]] bool continueScan();
+    [[nodiscard]] bool finishScan(bool complete);
+    [[nodiscard]] bool validateScanPlan();
+    [[nodiscard]] bool evaluateScanRow(
+            std::uint32_t row, bool &matches);
+    [[nodiscard]] bool scanRowGroupCanBePruned(
+            std::uint32_t rowGroup, bool &pruned);
+    [[nodiscard]] bool scanValueTruth(
+            const ScanExpressionNode &node,
+            const std::string &value, std::uint8_t &truth);
+    [[nodiscard]] bool compareScanCandidates(
+            const ScanCandidate &left, const ScanCandidate &right,
+            int &comparison);
     [[nodiscard]] bool validateProjection(
             const std::vector<std::uint32_t> &columns);
     [[nodiscard]] bool isRootColumn(std::uint32_t column) const;
@@ -267,6 +289,7 @@ private:
     std::uint64_t operationRowOffset_ = 0;
     std::uint32_t operationRowCount_ = 0;
     FilterRequest filterRequest_;
+    ScanRuntime scanRequest_;
     std::vector<std::uint32_t> filterResultRowGroups_;
     std::vector<std::uint64_t> filterResultLocalRows_;
     std::vector<std::vector<std::string>> filterResultRows_;

@@ -32,8 +32,15 @@ const std::string CAPABILITIES =
         "\"rowGroup\":\"layout-v1\","
         "\"rows\":\"rows-v1\","
         "\"filter\":\"filter-v1\","
+        "\"scan\":\"scan-v2\","
         "\"maxRows\":500,"
         "\"defaultRows\":100,"
+        "\"defaultScanRows\":20,"
+        "\"maxScanRows\":500,"
+        "\"maxProjectionColumns\":128,"
+        "\"maxExpressionNodes\":64,"
+        "\"maxOrderKeys\":8,"
+        "\"maxOrderedWindowRows\":4096,"
         "\"types\":["
         "{\"kind\":0,\"name\":\"BOOLEAN\"},"
         "{\"kind\":1,\"name\":\"BYTE\"},"
@@ -401,6 +408,73 @@ pixels_inspector_status pixels_inspector_begin_filter(
             return currentStatus(*session);
         }
         return currentStatus(*session);
+    }
+    catch (...)
+    {
+        return PIXELS_INSPECTOR_INTERNAL_ERROR;
+    }
+}
+
+pixels_inspector_status pixels_inspector_begin_scan(
+        pixels_inspector_handle handle, const std::uint8_t *plan,
+        std::uint32_t planSize)
+{
+    if (planSize == 0)
+    {
+        return PIXELS_INSPECTOR_INVALID_ARGUMENT;
+    }
+    if (planSize > PIXELS_INSPECTOR_MAX_SCAN_PLAN_BYTES)
+    {
+        return PIXELS_INSPECTOR_OUT_OF_BOUNDS;
+    }
+    if (plan == nullptr)
+    {
+        return PIXELS_INSPECTOR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        InspectionSession *session = findSession(handle);
+        if (session == nullptr)
+        {
+            return PIXELS_INSPECTOR_INVALID_HANDLE;
+        }
+        if (!session->beginScan(
+                    pixels::format::ByteSpan(plan, planSize)))
+        {
+            return currentStatus(*session);
+        }
+        return currentStatus(*session);
+    }
+    catch (...)
+    {
+        return PIXELS_INSPECTOR_INTERNAL_ERROR;
+    }
+}
+
+pixels_inspector_status pixels_inspector_copy_scan_progress(
+        pixels_inspector_handle handle, std::uint8_t *destination,
+        std::uint32_t destinationSize)
+{
+    if (destination == nullptr)
+    {
+        return PIXELS_INSPECTOR_INVALID_ARGUMENT;
+    }
+    if (destinationSize < PIXELS_INSPECTOR_SCAN_PROGRESS_V1_BYTES)
+    {
+        return PIXELS_INSPECTOR_BUFFER_TOO_SMALL;
+    }
+    try
+    {
+        InspectionSession *session = findSession(handle);
+        if (session == nullptr)
+        {
+            return PIXELS_INSPECTOR_INVALID_HANDLE;
+        }
+        if (!session->copyScanProgress(destination, destinationSize))
+        {
+            return PIXELS_INSPECTOR_INVALID_STATE;
+        }
+        return PIXELS_INSPECTOR_OK;
     }
     catch (...)
     {
