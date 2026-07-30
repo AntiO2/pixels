@@ -29,6 +29,7 @@ const std::string CAPABILITIES =
         std::string("{\"abi\":")
         + std::to_string(PIXELS_INSPECTOR_ABI_VERSION)
         + ",\"page\":\"generic-v1\","
+        "\"rowGroup\":\"layout-v1\","
         "\"types\":["
         "{\"kind\":0,\"name\":\"BOOLEAN\"},"
         "{\"kind\":1,\"name\":\"BYTE\"},"
@@ -219,6 +220,28 @@ pixels_inspector_status pixels_inspector_begin_metadata(
             return PIXELS_INSPECTOR_INVALID_HANDLE;
         }
         if (!session->beginMetadata())
+        {
+            return currentStatus(*session);
+        }
+        return currentStatus(*session);
+    }
+    catch (...)
+    {
+        return PIXELS_INSPECTOR_INTERNAL_ERROR;
+    }
+}
+
+pixels_inspector_status pixels_inspector_begin_row_group(
+        pixels_inspector_handle handle, std::uint32_t rowGroup)
+{
+    try
+    {
+        InspectionSession *session = findSession(handle);
+        if (session == nullptr)
+        {
+            return PIXELS_INSPECTOR_INVALID_HANDLE;
+        }
+        if (!session->beginRowGroup(rowGroup))
         {
             return currentStatus(*session);
         }

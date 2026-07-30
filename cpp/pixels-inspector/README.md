@@ -50,9 +50,10 @@ node cpp/pixels-inspector/tools/run_wasm_worker_conformance.cjs \
   <corpus-dir>
 ```
 
-The conformance runner validates the ABI, exact metadata/page output,
-cancellation, mismatched ranges, all 20 logical kinds through the generic page
-operation, bounded linear memory, and the Emscripten import allowlist.
+The conformance runner validates the ABI, exact metadata, row-group layout,
+and page output, cancellation, mismatched ranges, all 20 logical kinds through
+the generic page operation, bounded linear memory, and the Emscripten import
+allowlist.
 
 The generic page operation supports bounded pages across pixels, padded and
 compacted null layouts, integer RLE, dictionary and plain variable-width
@@ -63,7 +64,7 @@ falling back to guessed bytes.
 ## Range protocol
 
 1. create a session with the immutable file size;
-2. begin metadata or a bounded page request;
+2. begin metadata, a row-group layout request, or a bounded page request;
 3. call `next_range`;
 4. asynchronously read that exact range in the host;
 5. call `supply_range`;

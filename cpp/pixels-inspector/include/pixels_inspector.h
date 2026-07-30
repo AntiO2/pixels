@@ -54,6 +54,9 @@ pixels_inspector_status pixels_inspector_destroy(
 pixels_inspector_status pixels_inspector_begin_metadata(
         pixels_inspector_handle handle);
 
+pixels_inspector_status pixels_inspector_begin_row_group(
+        pixels_inspector_handle handle, uint32_t row_group);
+
 pixels_inspector_status pixels_inspector_begin_plain_long_page(
         pixels_inspector_handle handle, uint32_t row_group, uint32_t column,
         uint64_t row_offset, uint32_t row_count);

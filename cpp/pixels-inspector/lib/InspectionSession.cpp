@@ -44,7 +44,7 @@ const std::uint32_t MAX_DICTIONARY_ENTRIES = 1048576;
 const std::uint64_t MAX_DICTIONARY_BYTES = 67108864;
 const std::uint32_t MAX_NESTED_ELEMENTS = 65536;
 const std::uint64_t MAX_VALUE_BYTES = 16777216;
-const std::uint64_t MAX_PAGE_OUTPUT_BYTES = 67108864;
+const std::uint64_t MAX_RESULT_OUTPUT_BYTES = 67108864;
 
 bool checkedMultiply(std::uint64_t left, std::uint64_t right,
                      std::uint64_t &result) noexcept
@@ -397,6 +397,209 @@ std::string formatFloating(Floating value)
     return output.str();
 }
 
+void appendStatisticJson(
+        std::ostringstream &output,
+        const proto::ColumnStatistic &statistic)
+{
+    output << "{\"numberOfValues\":\""
+           << (statistic.has_numberofvalues()
+               ? statistic.numberofvalues() : 0)
+           << "\",\"containsNull\":"
+           << (statistic.has_hasnull() && statistic.hasnull()
+               ? "true" : "false");
+    if (statistic.has_intstatistics())
+    {
+        const proto::IntegerStatistic &value =
+                statistic.intstatistics();
+        output << ",\"integer\":{";
+        bool separator = false;
+        if (value.has_minimum())
+        {
+            output << "\"minimum\":\"" << value.minimum() << "\"";
+            separator = true;
+        }
+        if (value.has_maximum())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximum\":\"" << value.maximum() << "\"";
+            separator = true;
+        }
+        if (value.has_sum())
+        {
+            output << (separator ? "," : "")
+                   << "\"sum\":\"" << value.sum() << "\"";
+        }
+        output << "}";
+    }
+    if (statistic.has_doublestatistics())
+    {
+        const proto::DoubleStatistic &value =
+                statistic.doublestatistics();
+        output << ",\"double\":{";
+        bool separator = false;
+        if (value.has_minimum())
+        {
+            output << "\"minimum\":"
+                   << formatFloating(value.minimum());
+            separator = true;
+        }
+        if (value.has_maximum())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximum\":"
+                   << formatFloating(value.maximum());
+            separator = true;
+        }
+        if (value.has_sum())
+        {
+            output << (separator ? "," : "")
+                   << "\"sum\":" << formatFloating(value.sum());
+        }
+        output << "}";
+    }
+    if (statistic.has_stringstatistics())
+    {
+        const proto::StringStatistic &value =
+                statistic.stringstatistics();
+        output << ",\"string\":{";
+        bool separator = false;
+        if (value.has_minimum())
+        {
+            output << "\"minimum\":\""
+                   << escapeJson(value.minimum()) << "\"";
+            separator = true;
+        }
+        if (value.has_maximum())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximum\":\""
+                   << escapeJson(value.maximum()) << "\"";
+            separator = true;
+        }
+        if (value.has_sum())
+        {
+            output << (separator ? "," : "")
+                   << "\"sum\":\"" << value.sum() << "\"";
+        }
+        output << "}";
+    }
+    if (statistic.has_binarystatistics())
+    {
+        const proto::BinaryStatistic &value =
+                statistic.binarystatistics();
+        output << ",\"binary\":{";
+        if (value.has_sum())
+        {
+            output << "\"sum\":\"" << value.sum() << "\"";
+        }
+        output << "}";
+    }
+    if (statistic.has_timestampstatistics())
+    {
+        const proto::TimestampStatistic &value =
+                statistic.timestampstatistics();
+        output << ",\"timestamp\":{";
+        bool separator = false;
+        if (value.has_minimum())
+        {
+            output << "\"minimum\":\"" << value.minimum() << "\"";
+            separator = true;
+        }
+        if (value.has_maximum())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximum\":\"" << value.maximum() << "\"";
+        }
+        output << "}";
+    }
+    if (statistic.has_datestatistics())
+    {
+        const proto::DateStatistic &value =
+                statistic.datestatistics();
+        output << ",\"date\":{";
+        bool separator = false;
+        if (value.has_minimum())
+        {
+            output << "\"minimum\":\"" << value.minimum() << "\"";
+            separator = true;
+        }
+        if (value.has_maximum())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximum\":\"" << value.maximum() << "\"";
+        }
+        output << "}";
+    }
+    if (statistic.has_timestatistics())
+    {
+        const proto::TimeStatistic &value =
+                statistic.timestatistics();
+        output << ",\"time\":{";
+        bool separator = false;
+        if (value.has_minimum())
+        {
+            output << "\"minimum\":\"" << value.minimum() << "\"";
+            separator = true;
+        }
+        if (value.has_maximum())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximum\":\"" << value.maximum() << "\"";
+        }
+        output << "}";
+    }
+    if (statistic.has_bucketstatistics())
+    {
+        output << ",\"buckets\":[";
+        const proto::BucketStatistic &value =
+                statistic.bucketstatistics();
+        for (int index = 0; index < value.count_size(); ++index)
+        {
+            if (index != 0)
+            {
+                output << ",";
+            }
+            output << "\"" << value.count(index) << "\"";
+        }
+        output << "]";
+    }
+    if (statistic.has_int128statistics())
+    {
+        const proto::Integer128Statistic &value =
+                statistic.int128statistics();
+        output << ",\"integer128\":{";
+        bool separator = false;
+        if (value.has_minimum_high())
+        {
+            output << "\"minimumHigh\":\""
+                   << value.minimum_high() << "\"";
+            separator = true;
+        }
+        if (value.has_minimum_low())
+        {
+            output << (separator ? "," : "")
+                   << "\"minimumLow\":\""
+                   << value.minimum_low() << "\"";
+            separator = true;
+        }
+        if (value.has_maximum_high())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximumHigh\":\""
+                   << value.maximum_high() << "\"";
+            separator = true;
+        }
+        if (value.has_maximum_low())
+        {
+            output << (separator ? "," : "")
+                   << "\"maximumLow\":\""
+                   << value.maximum_low() << "\"";
+        }
+        output << "}";
+    }
+    output << "}";
+}
+
 } // namespace
 
 InspectionSession::InspectionSession(std::uint64_t fileSize)
@@ -445,12 +648,44 @@ bool InspectionSession::beginPage(
             rowGroup, column, rowOffset, rowCount, false);
 }
 
+bool InspectionSession::beginRowGroup(std::uint32_t rowGroup)
+{
+    if (state_ != State::METADATA_READY
+        && state_ != State::PAGE_READY)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_STATE,
+                "row-group inspection requires ready metadata");
+    }
+    if (rowGroup >= static_cast<std::uint32_t>(
+                            fileTail_.footer().rowgroupinfos_size()))
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "row-group index is out of bounds");
+    }
+    rowGroupRequest_ = true;
+    requestedRowGroup_ = rowGroup;
+    result_.clear();
+    error_.clear();
+    const proto::RowGroupInformation &information =
+            fileTail_.footer().rowgroupinfos(
+                    static_cast<int>(rowGroup));
+    setPendingRange(
+            format::FileRange{
+                    information.footeroffset(),
+                    information.footerlength()},
+            State::AWAITING_ROW_GROUP_FOOTER);
+    return true;
+}
+
 bool InspectionSession::beginPageRequest(
         std::uint32_t rowGroup, std::uint32_t column,
         std::uint64_t rowOffset, std::uint32_t rowCount,
         bool legacyLongResult)
 {
-    if (state_ != State::METADATA_READY)
+    if (state_ != State::METADATA_READY
+        && state_ != State::PAGE_READY)
     {
         return transitionFailure(format::ErrorCode::INVALID_STATE,
                                  "page decoding requires ready metadata");
@@ -502,6 +737,7 @@ bool InspectionSession::beginPageRequest(
     nestedChildIndex_ = 0;
     nestedChildBase_ = 0;
     nestedChildCount_ = 0;
+    rowGroupRequest_ = false;
     result_.clear();
     error_.clear();
 
@@ -653,7 +889,11 @@ bool InspectionSession::consumeFileTail(const format::ByteSpan &bytes)
         state_ = State::FAILED;
         return false;
     }
-    buildMetadataResult();
+    if (!buildMetadataResult())
+    {
+        state_ = State::FAILED;
+        return false;
+    }
     state_ = State::METADATA_READY;
     return true;
 }
@@ -665,6 +905,16 @@ bool InspectionSession::consumeRowGroupFooter(const format::ByteSpan &bytes)
     {
         state_ = State::FAILED;
         return false;
+    }
+    if (rowGroupRequest_)
+    {
+        if (!buildRowGroupResult())
+        {
+            state_ = State::FAILED;
+            return false;
+        }
+        state_ = State::PAGE_READY;
+        return true;
     }
     if (!validatePageRequest())
     {
@@ -2851,7 +3101,7 @@ void InspectionSession::setPendingRange(
     state_ = state;
 }
 
-void InspectionSession::buildMetadataResult()
+bool InspectionSession::buildMetadataResult()
 {
     const proto::PostScript &postScript = fileTail_.postscript();
     const proto::Footer &footer = fileTail_.footer();
@@ -2867,8 +3117,259 @@ void InspectionSession::buildMetadataResult()
            << ",\"rowGroupCount\":" << footer.rowgroupinfos_size()
            << ",\"firstColumn\":{\"name\":\""
            << escapeJson(firstType.name()) << "\",\"kind\":"
-           << static_cast<int>(firstType.kind()) << "}}";
+           << static_cast<int>(firstType.kind()) << "}"
+           << ",\"postscript\":{"
+           << "\"contentLength\":\""
+           << (postScript.has_contentlength()
+               ? postScript.contentlength() : 0)
+           << "\",\"compression\":"
+           << (postScript.has_compression()
+               ? static_cast<int>(postScript.compression()) : 0)
+           << ",\"compressionBlockSize\":"
+           << (postScript.has_compressionblocksize()
+               ? postScript.compressionblocksize() : 0)
+           << ",\"writerTimezone\":\""
+           << escapeJson(
+                   postScript.has_writertimezone()
+                   ? postScript.writertimezone() : "")
+           << "\",\"partitioned\":"
+           << (postScript.has_partitioned() && postScript.partitioned()
+               ? "true" : "false")
+           << ",\"columnChunkAlignment\":"
+           << (postScript.has_columnchunkalignment()
+               ? postScript.columnchunkalignment() : 0)
+           << ",\"hasHiddenColumn\":"
+           << (postScript.has_hashiddencolumn()
+               && postScript.hashiddencolumn()
+               ? "true" : "false")
+           << "},\"schema\":[";
+    for (int index = 0; index < footer.types_size(); ++index)
+    {
+        if (index != 0)
+        {
+            output << ",";
+        }
+        const proto::Type &type = footer.types(index);
+        output << "{\"id\":" << index
+               << ",\"name\":\"" << escapeJson(type.name()) << "\""
+               << ",\"kind\":" << static_cast<int>(type.kind())
+               << ",\"subtypes\":[";
+        for (int child = 0; child < type.subtypes_size(); ++child)
+        {
+            if (child != 0)
+            {
+                output << ",";
+            }
+            output << type.subtypes(child);
+        }
+        output << "]";
+        if (type.has_maximumlength())
+        {
+            output << ",\"maximumLength\":"
+                   << type.maximumlength();
+        }
+        if (type.has_precision())
+        {
+            output << ",\"precision\":" << type.precision();
+        }
+        if (type.has_scale())
+        {
+            output << ",\"scale\":" << type.scale();
+        }
+        if (type.has_dimension())
+        {
+            output << ",\"dimension\":" << type.dimension();
+        }
+        output << "}";
+    }
+    output << "],\"fileStatistics\":[";
+    for (int index = 0; index < footer.columnstats_size(); ++index)
+    {
+        if (index != 0)
+        {
+            output << ",";
+        }
+        appendStatisticJson(output, footer.columnstats(index));
+    }
+    output << "],\"rowGroups\":[";
+    for (int index = 0;
+         index < footer.rowgroupinfos_size(); ++index)
+    {
+        if (index != 0)
+        {
+            output << ",";
+        }
+        const proto::RowGroupInformation &rowGroup =
+                footer.rowgroupinfos(index);
+        output << "{\"index\":" << index
+               << ",\"footerOffset\":\""
+               << rowGroup.footeroffset() << "\""
+               << ",\"footerLength\":"
+               << rowGroup.footerlength()
+               << ",\"dataLength\":"
+               << (rowGroup.has_datalength()
+                   ? rowGroup.datalength() : 0)
+               << ",\"rows\":"
+               << (rowGroup.has_numberofrows()
+                   ? rowGroup.numberofrows() : 0);
+        if (rowGroup.has_partitioninfo())
+        {
+            const proto::PartitionInformation &partition =
+                    rowGroup.partitioninfo();
+            output << ",\"partition\":{\"hash\":"
+                   << (partition.has_hashvalue()
+                       ? partition.hashvalue() : 0)
+                   << ",\"columns\":[";
+            for (int column = 0;
+                 column < partition.columnids_size(); ++column)
+            {
+                if (column != 0)
+                {
+                    output << ",";
+                }
+                output << partition.columnids(column);
+            }
+            output << "]}";
+        }
+        output << "}";
+    }
+    output << "],\"rowGroupStatistics\":[";
+    for (int rowGroup = 0;
+         rowGroup < footer.rowgroupstats_size(); ++rowGroup)
+    {
+        if (rowGroup != 0)
+        {
+            output << ",";
+        }
+        const proto::RowGroupStatistic &statistics =
+                footer.rowgroupstats(rowGroup);
+        output << "[";
+        for (int column = 0;
+             column < statistics.columnchunkstats_size(); ++column)
+        {
+            if (column != 0)
+            {
+                output << ",";
+            }
+            appendStatisticJson(
+                    output, statistics.columnchunkstats(column));
+        }
+        output << "]";
+    }
+    output << "]}";
     result_ = output.str();
+    if (result_.size() > MAX_RESULT_OUTPUT_BYTES)
+    {
+        result_.clear();
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "metadata result exceeds the bounded output limit");
+    }
+    return true;
+}
+
+bool InspectionSession::buildRowGroupResult()
+{
+    const proto::RowGroupIndex &index =
+            rowGroupFooter_.rowgroupindexentry();
+    const proto::RowGroupEncoding &encodings =
+            rowGroupFooter_.rowgroupencoding();
+    const int schemaCount = fileTail_.footer().types_size();
+    if (index.columnchunkindexentries_size() != schemaCount
+        || encodings.columnchunkencodings_size() != schemaCount)
+    {
+        return format::fail(
+                error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                "row-group column metadata does not match the schema");
+    }
+
+    std::ostringstream output;
+    output << "{\"rowGroup\":" << requestedRowGroup_
+           << ",\"columns\":[";
+    for (int column = 0; column < schemaCount; ++column)
+    {
+        if (column != 0)
+        {
+            output << ",";
+        }
+        const proto::ColumnChunkIndex &chunk =
+                index.columnchunkindexentries(column);
+        const proto::ColumnEncoding &encoding =
+                encodings.columnchunkencodings(column);
+        output << "{\"column\":" << column
+               << ",\"encoding\":{\"kind\":"
+               << static_cast<int>(encoding.kind());
+        if (encoding.has_dictionarysize())
+        {
+            output << ",\"dictionarySize\":"
+                   << encoding.dictionarysize();
+        }
+        if (encoding.has_cascadeencoding()
+            && encoding.cascadeencoding().has_kind())
+        {
+            output << ",\"cascadeKind\":"
+                   << static_cast<int>(
+                           encoding.cascadeencoding().kind());
+        }
+        output << "},\"chunk\":{\"offset\":\""
+               << chunk.chunkoffset() << "\""
+               << ",\"length\":" << chunk.chunklength()
+               << ",\"nullOffset\":"
+               << (chunk.has_isnulloffset()
+                   ? chunk.isnulloffset() : chunk.chunklength())
+               << ",\"littleEndian\":"
+               << (chunk.has_littleendian() && chunk.littleendian()
+                   ? "true" : "false")
+               << ",\"nullsPadding\":"
+               << (chunk.has_nullspadding() && chunk.nullspadding()
+                   ? "true" : "false")
+               << ",\"nullAlignment\":"
+               << (chunk.has_isnullalignment()
+                   ? chunk.isnullalignment() : 0)
+               << ",\"pixels\":[";
+        if (chunk.pixelpositions_size()
+            != chunk.pixelstatistics_size())
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "row-group pixel positions and statistics differ");
+        }
+        for (int pixel = 0;
+             pixel < chunk.pixelpositions_size(); ++pixel)
+        {
+            if (pixel != 0)
+            {
+                output << ",";
+            }
+            output << "{\"index\":" << pixel
+                   << ",\"position\":"
+                   << chunk.pixelpositions(pixel)
+                   << ",\"statistics\":";
+            const proto::PixelStatistic &pixelStatistic =
+                    chunk.pixelstatistics(pixel);
+            if (pixelStatistic.has_statistic())
+            {
+                appendStatisticJson(
+                        output, pixelStatistic.statistic());
+            }
+            else
+            {
+                output << "null";
+            }
+            output << "}";
+        }
+        output << "]}}";
+    }
+    output << "]}";
+    result_ = output.str();
+    if (result_.size() > MAX_RESULT_OUTPUT_BYTES)
+    {
+        result_.clear();
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "row-group result exceeds the bounded output limit");
+    }
+    return true;
 }
 
 bool InspectionSession::buildPageResult(
@@ -2879,7 +3380,7 @@ bool InspectionSession::buildPageResult(
     {
         if (!format::checkedAdd(
                     outputBytes, value.size() + 1U, outputBytes)
-            || outputBytes > MAX_PAGE_OUTPUT_BYTES)
+            || outputBytes > MAX_RESULT_OUTPUT_BYTES)
         {
             state_ = State::FAILED;
             return format::fail(
@@ -2903,7 +3404,7 @@ bool InspectionSession::buildPageResult(
     }
     output << "]}";
     result_ = output.str();
-    if (result_.size() > MAX_PAGE_OUTPUT_BYTES)
+    if (result_.size() > MAX_RESULT_OUTPUT_BYTES)
     {
         result_.clear();
         state_ = State::FAILED;

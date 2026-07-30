@@ -33,10 +33,47 @@ namespace
 const std::string EXPECTED_METADATA =
         "{\"abi\":2,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
         "\"pixelStride\":10000,\"schemaCount\":4,\"rowGroupCount\":1,"
-        "\"firstColumn\":{\"name\":\"id\",\"kind\":4}}";
+        "\"firstColumn\":{\"name\":\"id\",\"kind\":4},"
+        "\"postscript\":{\"contentLength\":\"352\",\"compression\":0,"
+        "\"compressionBlockSize\":1,"
+        "\"writerTimezone\":\"Central European Standard Time\","
+        "\"partitioned\":false,\"columnChunkAlignment\":32,"
+        "\"hasHiddenColumn\":false},\"schema\":["
+        "{\"id\":0,\"name\":\"id\",\"kind\":4,\"subtypes\":[]},"
+        "{\"id\":1,\"name\":\"name\",\"kind\":16,\"subtypes\":[],"
+        "\"maximumLength\":25},"
+        "{\"id\":2,\"name\":\"birthday\",\"kind\":15,\"subtypes\":[]},"
+        "{\"id\":3,\"name\":\"score\",\"kind\":14,\"subtypes\":[],"
+        "\"precision\":15,\"scale\":2}],\"fileStatistics\":["
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"integer\":{\"minimum\":\"0\",\"maximum\":\"9\","
+        "\"sum\":\"45\"}},"
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"string\":{\"minimum\":\"Alice\",\"maximum\":\"Tom\","
+        "\"sum\":\"47\"}},"
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"date\":{\"minimum\":\"-25202\",\"maximum\":\"14389\"}},"
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"integer\":{\"minimum\":\"740\",\"maximum\":\"10001\","
+        "\"sum\":\"66057\"}}],\"rowGroups\":["
+        "{\"index\":0,\"footerOffset\":\"352\",\"footerLength\":154,"
+        "\"dataLength\":352,\"rows\":10}],"
+        "\"rowGroupStatistics\":[["
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"integer\":{\"minimum\":\"0\",\"maximum\":\"9\","
+        "\"sum\":\"45\"}},"
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"string\":{\"minimum\":\"Alice\",\"maximum\":\"Tom\","
+        "\"sum\":\"47\"}},"
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"date\":{\"minimum\":\"-25202\",\"maximum\":\"14389\"}},"
+        "{\"numberOfValues\":\"10\",\"containsNull\":false,"
+        "\"integer\":{\"minimum\":\"740\",\"maximum\":\"10001\","
+        "\"sum\":\"66057\"}}]]}";
 
 const std::string EXPECTED_CAPABILITIES =
-        "{\"abi\":2,\"page\":\"generic-v1\",\"types\":["
+        "{\"abi\":2,\"page\":\"generic-v1\","
+        "\"rowGroup\":\"layout-v1\",\"types\":["
         "{\"kind\":0,\"name\":\"BOOLEAN\"},"
         "{\"kind\":1,\"name\":\"BYTE\"},"
         "{\"kind\":2,\"name\":\"SHORT\"},"
@@ -64,6 +101,37 @@ const std::string EXPECTED_PAGE =
         "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":10,"
         "\"values\":[\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\","
         "\"7\",\"8\",\"9\"]}";
+
+const std::string EXPECTED_ROW_GROUP =
+        "{\"rowGroup\":0,\"columns\":["
+        "{\"column\":0,\"encoding\":{\"kind\":0},\"chunk\":{"
+        "\"offset\":\"0\",\"length\":80,\"nullOffset\":80,"
+        "\"littleEndian\":true,\"nullsPadding\":false,"
+        "\"nullAlignment\":0,\"pixels\":[{\"index\":0,\"position\":0,"
+        "\"statistics\":{\"numberOfValues\":\"10\","
+        "\"containsNull\":false,\"integer\":{\"minimum\":\"0\","
+        "\"maximum\":\"9\",\"sum\":\"45\"}}}]}},"
+        "{\"column\":1,\"encoding\":{\"kind\":0},\"chunk\":{"
+        "\"offset\":\"96\",\"length\":95,\"nullOffset\":47,"
+        "\"littleEndian\":true,\"nullsPadding\":false,"
+        "\"nullAlignment\":0,\"pixels\":[{\"index\":0,\"position\":0,"
+        "\"statistics\":{\"numberOfValues\":\"10\","
+        "\"containsNull\":false,\"string\":{\"minimum\":\"Alice\","
+        "\"maximum\":\"Tom\",\"sum\":\"47\"}}}]}},"
+        "{\"column\":2,\"encoding\":{\"kind\":0},\"chunk\":{"
+        "\"offset\":\"192\",\"length\":40,\"nullOffset\":40,"
+        "\"littleEndian\":true,\"nullsPadding\":false,"
+        "\"nullAlignment\":0,\"pixels\":[{\"index\":0,\"position\":0,"
+        "\"statistics\":{\"numberOfValues\":\"10\","
+        "\"containsNull\":false,\"date\":{\"minimum\":\"-25202\","
+        "\"maximum\":\"14389\"}}}]}},"
+        "{\"column\":3,\"encoding\":{\"kind\":0},\"chunk\":{"
+        "\"offset\":\"256\",\"length\":80,\"nullOffset\":80,"
+        "\"littleEndian\":true,\"nullsPadding\":false,"
+        "\"nullAlignment\":0,\"pixels\":[{\"index\":0,\"position\":0,"
+        "\"statistics\":{\"numberOfValues\":\"10\","
+        "\"containsNull\":false,\"integer\":{\"minimum\":\"740\","
+        "\"maximum\":\"10001\",\"sum\":\"66057\"}}}]}}]}";
 
 void require(bool condition, const std::string &message)
 {
@@ -1535,6 +1603,39 @@ void testBoundedPageRange()
             "bounded page result differs from the golden");
 }
 
+void testRowGroupLayoutAndRepeatedPages()
+{
+    const std::vector<std::uint8_t> file = readFixture();
+    Session session(file.size());
+    driveMetadata(session, file);
+    require(pixels_inspector_begin_row_group(session.handle(), 0)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "row-group layout did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "row-group footer did not produce layout");
+    require(readResult(session) == EXPECTED_ROW_GROUP,
+            "row-group layout differs from the golden");
+
+    for (std::uint64_t offset : {0U, 2U})
+    {
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, offset, 2)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "repeated page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "repeated page footer did not request values");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "repeated page values did not produce a result");
+    }
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":2,\"count\":2,"
+               "\"values\":[\"2\",\"3\"]}",
+            "second page differs from the golden");
+}
+
 void testGenericPlainScalarPages()
 {
     const std::vector<std::uint8_t> file = readFixture();
@@ -2153,11 +2254,18 @@ void testNestedPage()
     const std::vector<std::uint8_t> file = makeNestedFixture();
     Session session(file.size());
     driveMetadataFlexible(session, file);
-    require(readResult(session)
-            == "{\"abi\":2,\"version\":1,\"magic\":\"PIXELS\","
-               "\"rows\":3,\"pixelStride\":10,\"schemaCount\":7,"
-               "\"rowGroupCount\":1,"
-               "\"firstColumn\":{\"name\":\"root\",\"kind\":12}}",
+    const std::string metadata = readResult(session);
+    require(metadata.find(
+                    "\"rows\":3,\"pixelStride\":10,"
+                    "\"schemaCount\":7,\"rowGroupCount\":1")
+            != std::string::npos
+            && metadata.find(
+                    "\"firstColumn\":{\"name\":\"root\",\"kind\":12}")
+               != std::string::npos
+            && metadata.find(
+                    "{\"id\":0,\"name\":\"root\",\"kind\":12,"
+                    "\"subtypes\":[1,3,6]}")
+               != std::string::npos,
             "nested metadata differs from the golden");
     require(pixels_inspector_begin_page(
                     session.handle(), 0, 0, 0, 3)
@@ -3160,6 +3268,33 @@ int main(int argc, char **argv)
             std::cout << "pixels-inspector conformance corpus: PASS\n";
             return EXIT_SUCCESS;
         }
+        if (argc == 2
+            && std::string(argv[1])
+               == "--print-canonical-metadata")
+        {
+            const std::vector<std::uint8_t> file = readFixture();
+            Session session(file.size());
+            driveMetadata(session, file);
+            std::cout << readResult(session) << "\n";
+            return EXIT_SUCCESS;
+        }
+        if (argc == 2
+            && std::string(argv[1])
+               == "--print-canonical-row-group")
+        {
+            const std::vector<std::uint8_t> file = readFixture();
+            Session session(file.size());
+            driveMetadata(session, file);
+            require(pixels_inspector_begin_row_group(
+                            session.handle(), 0)
+                    == PIXELS_INSPECTOR_RANGE_READY,
+                    "row-group inspection did not start");
+            require(supply(session, nextRange(session), file)
+                    == PIXELS_INSPECTOR_RESULT_READY,
+                    "row-group footer did not produce a result");
+            std::cout << readResult(session) << "\n";
+            return EXIT_SUCCESS;
+        }
         require(pixels_inspector_abi_version()
                 == PIXELS_INSPECTOR_ABI_VERSION,
                 "unexpected inspector ABI version");
@@ -3171,6 +3306,7 @@ int main(int argc, char **argv)
         testFixedScalarTypePages();
         testRemainingVariableTypePages();
         testBoundedPageRange();
+        testRowGroupLayoutAndRepeatedPages();
         testGenericPlainScalarPages();
         testMultiPixelPlainPages();
         testMultiPixelRunLengthPages();

@@ -67,6 +67,8 @@ public:
             std::uint32_t rowGroup, std::uint32_t column,
             std::uint64_t rowOffset, std::uint32_t rowCount);
 
+    [[nodiscard]] bool beginRowGroup(std::uint32_t rowGroup);
+
     [[nodiscard]] bool nextRange(format::FileRange &range) const;
 
     [[nodiscard]] bool supplyRange(
@@ -169,7 +171,8 @@ private:
             format::ErrorCode code, const std::string &message);
 
     void setPendingRange(const format::FileRange &range, State state);
-    void buildMetadataResult();
+    [[nodiscard]] bool buildMetadataResult();
+    [[nodiscard]] bool buildRowGroupResult();
     [[nodiscard]] bool buildPageResult(
             const std::vector<std::string> &values);
 
@@ -193,6 +196,8 @@ private:
     std::size_t nestedChildIndex_ = 0;
     std::uint64_t nestedChildBase_ = 0;
     std::uint32_t nestedChildCount_ = 0;
+    bool rowGroupRequest_ = false;
+    std::uint32_t requestedRowGroup_ = 0;
     std::unique_ptr<bool[]> pageValidity_;
     std::vector<std::string> pageValues_;
     std::string result_;

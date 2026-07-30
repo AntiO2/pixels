@@ -9,7 +9,35 @@ const { performance } = require("node:perf_hooks");
 const EXPECTED_METADATA =
   '{"abi":2,"version":1,"magic":"PIXELS","rows":10,' +
   '"pixelStride":10000,"schemaCount":4,"rowGroupCount":1,' +
-  '"firstColumn":{"name":"id","kind":4}}';
+  '"firstColumn":{"name":"id","kind":4},' +
+  '"postscript":{"contentLength":"352","compression":0,' +
+  '"compressionBlockSize":1,' +
+  '"writerTimezone":"Central European Standard Time",' +
+  '"partitioned":false,"columnChunkAlignment":32,' +
+  '"hasHiddenColumn":false},"schema":[' +
+  '{"id":0,"name":"id","kind":4,"subtypes":[]},' +
+  '{"id":1,"name":"name","kind":16,"subtypes":[],"maximumLength":25},' +
+  '{"id":2,"name":"birthday","kind":15,"subtypes":[]},' +
+  '{"id":3,"name":"score","kind":14,"subtypes":[],' +
+  '"precision":15,"scale":2}],"fileStatistics":[' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"integer":{"minimum":"0","maximum":"9","sum":"45"}},' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"string":{"minimum":"Alice","maximum":"Tom","sum":"47"}},' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"date":{"minimum":"-25202","maximum":"14389"}},' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"integer":{"minimum":"740","maximum":"10001","sum":"66057"}}],' +
+  '"rowGroups":[{"index":0,"footerOffset":"352","footerLength":154,' +
+  '"dataLength":352,"rows":10}],"rowGroupStatistics":[[' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"integer":{"minimum":"0","maximum":"9","sum":"45"}},' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"string":{"minimum":"Alice","maximum":"Tom","sum":"47"}},' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"date":{"minimum":"-25202","maximum":"14389"}},' +
+  '{"numberOfValues":"10","containsNull":false,' +
+  '"integer":{"minimum":"740","maximum":"10001","sum":"66057"}}]]}';
 
 const EXPECTED_PAGE =
   '{"rowGroup":0,"column":0,"offset":0,"count":10,' +
@@ -219,6 +247,23 @@ async function main() {
       "FileTail did not produce metadata");
     requireCondition(readResult() === EXPECTED_METADATA,
       "WASM metadata differs from the native golden");
+
+    requireCondition(
+      module._pixels_inspector_begin_row_group(handle, 0) === 1,
+      "row-group layout did not request its footer",
+    );
+    requireCondition(supplyRange(nextRange()) === 2,
+      "row-group footer did not produce layout");
+    const rowGroupLayout = JSON.parse(readResult());
+    requireCondition(
+      rowGroupLayout.rowGroup === 0 &&
+        rowGroupLayout.columns.length === 4 &&
+        rowGroupLayout.columns[0].chunk.offset === "0" &&
+        rowGroupLayout.columns[1].chunk.length === 95 &&
+        rowGroupLayout.columns[3].chunk.pixels[0]
+          .statistics.integer.sum === "66057",
+      "WASM row-group layout differs from the native golden",
+    );
 
     const pageStartedAt = performance.now();
     requireCondition(
