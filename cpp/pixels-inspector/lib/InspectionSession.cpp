@@ -16,6 +16,7 @@
 #include "format/PlainScalarDecoder.h"
 #include "format/RunLengthByteDecoder.h"
 #include "format/RunLengthIntDecoder.h"
+#include "format/SchemaValidator.h"
 #include "format/VariableLengthDecoder.h"
 
 #include <algorithm>
@@ -40,6 +41,7 @@ const std::uint32_t MAX_VECTOR_DIMENSION = 4096;
 const std::uint64_t MAX_PAGE_SCALARS = 1048576;
 const std::uint32_t MAX_DICTIONARY_ENTRIES = 1048576;
 const std::uint64_t MAX_DICTIONARY_BYTES = 67108864;
+const std::uint32_t MAX_NESTED_ELEMENTS = 65536;
 
 bool checkedMultiply(std::uint64_t left, std::uint64_t right,
                      std::uint64_t &result) noexcept
@@ -147,13 +149,15 @@ bool plainValueWidth(const proto::Type &type, std::uint64_t &width)
             return true;
         case proto::Type_Kind_STRING:
         case proto::Type_Kind_BINARY:
-        case proto::Type_Kind_ARRAY:
-        case proto::Type_Kind_MAP:
         case proto::Type_Kind_STRUCT:
         case proto::Type_Kind_VARBINARY:
         case proto::Type_Kind_VARCHAR:
         case proto::Type_Kind_CHAR:
             return false;
+        case proto::Type_Kind_ARRAY:
+        case proto::Type_Kind_MAP:
+            width = 16;
+            return true;
         case proto::Type_Kind_VECTOR:
             if (!type.has_dimension()
                 || type.dimension() == 0
@@ -235,6 +239,13 @@ bool isLengthPrefixedBinary(const proto::Type &type)
             || type.kind() == proto::Type_Kind_VARBINARY)
            && type.has_maximumlength()
            && type.maximumlength() > 0;
+}
+
+bool isNestedType(const proto::Type &type)
+{
+    return type.kind() == proto::Type_Kind_ARRAY
+           || type.kind() == proto::Type_Kind_MAP
+           || type.kind() == proto::Type_Kind_STRUCT;
 }
 
 std::string encodeBase64(const format::ByteSpan &bytes)
@@ -482,6 +493,12 @@ bool InspectionSession::beginPageRequest(
     variableRanges_.clear();
     dictionaryRanges_.clear();
     dictionaryContent_.clear();
+    collectionRanges_.clear();
+    nestedChild_.reset();
+    nestedChildValues_.clear();
+    nestedChildIndex_ = 0;
+    nestedChildBase_ = 0;
+    nestedChildCount_ = 0;
     result_.clear();
     error_.clear();
 
@@ -552,6 +569,8 @@ bool InspectionSession::supplyRange(
             return consumeDictionaryStarts(bytes);
         case State::AWAITING_DICTIONARY_CONTENT:
             return consumeDictionaryContent(bytes);
+        case State::AWAITING_NESTED_CHILD:
+            return consumeNestedChild(bytes);
         case State::IDLE:
         case State::METADATA_READY:
         case State::PAGE_READY:
@@ -581,6 +600,12 @@ bool InspectionSession::cancel()
         case State::AWAITING_DICTIONARY_TRAILER:
         case State::AWAITING_DICTIONARY_STARTS:
         case State::AWAITING_DICTIONARY_CONTENT:
+        case State::AWAITING_NESTED_CHILD:
+            if (state_ == State::AWAITING_NESTED_CHILD
+                && nestedChild_)
+            {
+                (void) nestedChild_->cancel();
+            }
             state_ = State::CANCELLED;
             hasPendingRange_ = false;
             result_.clear();
@@ -619,6 +644,12 @@ bool InspectionSession::consumeFileTail(const format::ByteSpan &bytes)
         state_ = State::FAILED;
         return false;
     }
+    if (!format::SchemaValidator::validate(
+                fileTail_.footer(), error_))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
     buildMetadataResult();
     state_ = State::METADATA_READY;
     return true;
@@ -640,6 +671,9 @@ bool InspectionSession::consumeRowGroupFooter(const format::ByteSpan &bytes)
 
     pageValidity_.reset(new bool[pageRequest_.rowCount]);
     pageValues_.assign(pageRequest_.rowCount, std::string());
+    collectionRanges_.assign(
+            pageRequest_.rowCount,
+            format::VariableValueRange{});
     const std::uint32_t pixelStride =
             fileTail_.postscript().pixelstride();
     pageRequest_.pixel = static_cast<std::uint32_t>(
@@ -995,6 +1029,12 @@ bool InspectionSession::requestPixelValues()
 
     const proto::Type &type = fileTail_.footer().types(
             static_cast<int>(pageRequest_.column));
+    if (type.kind() == proto::Type_Kind_STRUCT)
+    {
+        return finishCurrentPixel(
+                std::vector<std::string>(
+                        pagePlan_.physicalCount, "{}"));
+    }
     if (isPlainVariablePage())
     {
         return requestVariableValues();
@@ -1348,8 +1388,9 @@ bool InspectionSession::validatePageRequest()
     }
     const bool variableString = isPlainVariableString(type);
     const bool binary = isLengthPrefixedBinary(type);
+    const bool nested = isNestedType(type);
     std::uint64_t valueWidth = 0;
-    if (!variableString && !binary
+    if (!variableString && !binary && !nested
         && !plainValueWidth(type, valueWidth))
     {
         return format::fail(
@@ -1388,6 +1429,13 @@ bool InspectionSession::validatePageRequest()
         return format::fail(
                 error_, format::ErrorCode::MALFORMED_PROTOBUF,
                 "column encoding kind is missing");
+    }
+    if (nested
+        && encoding.kind() != proto::ColumnEncoding_Kind_NONE)
+    {
+        return format::fail(
+                error_, format::ErrorCode::UNSUPPORTED_ENCODING,
+                "nested parent columns require NONE encoding");
     }
     if (encoding.kind() == proto::ColumnEncoding_Kind_RUNLENGTH)
     {
@@ -1551,6 +1599,47 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
     const bool littleEndian =
             pageChunk_.has_littleendian() && pageChunk_.littleendian();
     std::vector<std::string> physicalValues(pagePlan_.physicalCount);
+    if (type.kind() == proto::Type_Kind_ARRAY
+        || type.kind() == proto::Type_Kind_MAP)
+    {
+        if (pagePlan_.physicalCount
+            > std::numeric_limits<std::size_t>::max() / 2U)
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "nested collection range count overflows");
+        }
+        const std::size_t scalarCount =
+                pagePlan_.physicalCount * 2U;
+        std::vector<std::int64_t> decodedRanges(scalarCount);
+        if (!format::PlainScalarDecoder::decodeInt64(
+                    bytes, littleEndian, 0, scalarCount,
+                    decodedRanges.data(), decodedRanges.size(), error_))
+        {
+            state_ = State::FAILED;
+            return false;
+        }
+        std::vector<format::VariableValueRange> ranges(
+                pagePlan_.physicalCount);
+        for (std::size_t index = 0;
+             index < ranges.size(); ++index)
+        {
+            const std::int64_t start = decodedRanges[index * 2U];
+            const std::int64_t end = decodedRanges[index * 2U + 1U];
+            if (start < 0 || end < start)
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                        "nested collection range is negative or reversed");
+            }
+            ranges[index].offset = static_cast<std::uint64_t>(start);
+            ranges[index].length =
+                    static_cast<std::uint64_t>(end - start);
+        }
+        return finishCollectionPixel(ranges);
+    }
     if (isDictionaryPage())
     {
         std::vector<std::int64_t> pixelIds(
@@ -2023,6 +2112,47 @@ bool InspectionSession::finishCurrentPixel(
     return advancePixel();
 }
 
+bool InspectionSession::finishCollectionPixel(
+        const std::vector<format::VariableValueRange> &ranges)
+{
+    const bool nullsPadding = usesNullPadding();
+    std::size_t physicalIndex = 0;
+    for (std::uint32_t index = 0;
+         index < pageRequest_.pixelRowCount; ++index)
+    {
+        const std::size_t resultIndex =
+                static_cast<std::size_t>(pageRequest_.resultOffset) + index;
+        if (pageValidity_[resultIndex])
+        {
+            if (physicalIndex >= ranges.size())
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                        "nested collection ranges end before the pixel");
+            }
+            collectionRanges_[resultIndex] = ranges[physicalIndex];
+            pageValues_[resultIndex] = "[]";
+        }
+        else
+        {
+            pageValues_[resultIndex] = "null";
+        }
+        if (nullsPadding || pageValidity_[resultIndex])
+        {
+            ++physicalIndex;
+        }
+    }
+    if (physicalIndex != ranges.size())
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                "nested collection physical range count is inconsistent");
+    }
+    return advancePixel();
+}
+
 bool InspectionSession::usesRunLengthEncoding() const
 {
     const proto::RowGroupEncoding &encodings =
@@ -2133,6 +2263,16 @@ bool InspectionSession::isDictionaryPage() const
               == proto::ColumnEncoding_Kind_DICTIONARY;
 }
 
+bool InspectionSession::isNestedPage() const
+{
+    return pageRequest_.column
+           < static_cast<std::uint32_t>(
+                   fileTail_.footer().types_size())
+           && isNestedType(
+                   fileTail_.footer().types(
+                           static_cast<int>(pageRequest_.column)));
+}
+
 bool InspectionSession::computeVariablePhysicalBase(
         const format::ByteSpan &prefixNullBitmaps)
 {
@@ -2189,6 +2329,344 @@ bool InspectionSession::computeVariablePhysicalBase(
     return true;
 }
 
+bool InspectionSession::beginNestedChildren()
+{
+    const proto::Type &type = fileTail_.footer().types(
+            static_cast<int>(pageRequest_.column));
+    nestedChild_.reset();
+    nestedChildValues_.clear();
+    nestedChildIndex_ = 0;
+    nestedChildBase_ = 0;
+    nestedChildCount_ = 0;
+
+    if (type.kind() == proto::Type_Kind_STRUCT)
+    {
+        nestedChildBase_ = pageRequest_.rowOffset;
+        nestedChildCount_ = pageRequest_.rowCount;
+        return startNestedChild();
+    }
+
+    bool hasRange = false;
+    std::uint64_t expected = 0;
+    for (std::size_t index = 0;
+         index < collectionRanges_.size(); ++index)
+    {
+        if (!pageValidity_[index])
+        {
+            continue;
+        }
+        const format::VariableValueRange &range =
+                collectionRanges_[index];
+        std::uint64_t end = 0;
+        if (!format::checkedAdd(range.offset, range.length, end))
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "nested collection range end overflows");
+        }
+        if (!hasRange)
+        {
+            nestedChildBase_ = range.offset;
+            expected = range.offset;
+            hasRange = true;
+        }
+        if (range.offset != expected)
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "nested collection ranges are not contiguous");
+        }
+        expected = end;
+    }
+    if (hasRange)
+    {
+        const std::uint64_t count = expected - nestedChildBase_;
+        if (count > MAX_NESTED_ELEMENTS
+            || count > std::numeric_limits<std::uint32_t>::max())
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "nested collection page exceeds the element limit");
+        }
+        nestedChildCount_ = static_cast<std::uint32_t>(count);
+    }
+    return startNestedChild();
+}
+
+bool InspectionSession::logicalRowsForColumn(
+        std::uint32_t column, std::uint32_t &rows)
+{
+    const proto::RowGroupIndex &index =
+            rowGroupFooter_.rowgroupindexentry();
+    if (column >= static_cast<std::uint32_t>(
+                          index.columnchunkindexentries_size()))
+    {
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "nested child column metadata is missing");
+    }
+    const proto::ColumnChunkIndex &chunk =
+            index.columnchunkindexentries(static_cast<int>(column));
+    std::uint64_t total = 0;
+    for (int pixel = 0;
+         pixel < chunk.pixelstatistics_size(); ++pixel)
+    {
+        const proto::PixelStatistic &pixelStatistic =
+                chunk.pixelstatistics(pixel);
+        if (!pixelStatistic.has_statistic()
+            || !pixelStatistic.statistic().has_numberofvalues()
+            || !format::checkedAdd(
+                    total,
+                    pixelStatistic.statistic().numberofvalues(),
+                    total)
+            || total > std::numeric_limits<std::uint32_t>::max())
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "nested child logical row count is missing or invalid");
+        }
+    }
+    rows = static_cast<std::uint32_t>(total);
+    return true;
+}
+
+void InspectionSession::initializeNestedChild(
+        const proto::FileTail &fileTail,
+        std::uint32_t rowGroup, std::uint32_t logicalRows)
+{
+    fileTail_ = fileTail;
+    fileTail_.mutable_footer()
+            ->mutable_rowgroupinfos(static_cast<int>(rowGroup))
+            ->set_numberofrows(logicalRows);
+    result_.clear();
+    error_.clear();
+    state_ = State::METADATA_READY;
+    hasPendingRange_ = false;
+}
+
+bool InspectionSession::startNestedChild()
+{
+    const proto::Type &type = fileTail_.footer().types(
+            static_cast<int>(pageRequest_.column));
+    if (nestedChildIndex_
+        >= static_cast<std::size_t>(type.subtypes_size()))
+    {
+        return finishNestedPage();
+    }
+
+    const std::uint32_t childColumn =
+            type.subtypes(static_cast<int>(nestedChildIndex_));
+    std::uint32_t logicalRows = 0;
+    if (!logicalRowsForColumn(childColumn, logicalRows))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    std::uint64_t childEnd = 0;
+    if (!format::checkedAdd(
+                nestedChildBase_, nestedChildCount_, childEnd)
+        || childEnd > logicalRows)
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "nested child page exceeds its logical row count");
+    }
+    if (nestedChildCount_ == 0)
+    {
+        nestedChildValues_.push_back(std::vector<std::string>());
+        ++nestedChildIndex_;
+        return startNestedChild();
+    }
+
+    nestedChild_.reset(new InspectionSession(fileSize_));
+    nestedChild_->initializeNestedChild(
+            fileTail_, pageRequest_.rowGroup, logicalRows);
+    if (!nestedChild_->beginPage(
+                pageRequest_.rowGroup, childColumn,
+                nestedChildBase_, nestedChildCount_))
+    {
+        error_ = nestedChild_->error();
+        state_ = State::FAILED;
+        return false;
+    }
+    format::FileRange range;
+    if (!nestedChild_->nextRange(range))
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "nested child did not request row-group metadata");
+    }
+    setPendingRange(range, State::AWAITING_NESTED_CHILD);
+    return true;
+}
+
+bool InspectionSession::consumeNestedChild(
+        const format::ByteSpan &bytes)
+{
+    if (!nestedChild_
+        || !nestedChild_->supplyRange(pendingRange_, bytes))
+    {
+        if (nestedChild_)
+        {
+            error_ = nestedChild_->error();
+        }
+        else
+        {
+            (void) format::fail(
+                    error_, format::ErrorCode::INVALID_STATE,
+                    "nested child session is missing");
+        }
+        state_ = State::FAILED;
+        return false;
+    }
+
+    format::FileRange range;
+    if (nestedChild_->nextRange(range))
+    {
+        setPendingRange(range, State::AWAITING_NESTED_CHILD);
+        return true;
+    }
+    if (nestedChild_->state() != State::PAGE_READY)
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "nested child stopped before producing a page");
+    }
+    nestedChildValues_.push_back(nestedChild_->pageValues_);
+    nestedChild_.reset();
+    ++nestedChildIndex_;
+    return startNestedChild();
+}
+
+bool InspectionSession::finishNestedPage()
+{
+    const proto::Type &type = fileTail_.footer().types(
+            static_cast<int>(pageRequest_.column));
+    if (nestedChildValues_.size()
+        != static_cast<std::size_t>(type.subtypes_size()))
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "nested child result count is inconsistent");
+    }
+
+    if (type.kind() == proto::Type_Kind_STRUCT)
+    {
+        for (std::size_t row = 0; row < pageValues_.size(); ++row)
+        {
+            if (!pageValidity_[row])
+            {
+                pageValues_[row] = "null";
+                continue;
+            }
+            std::string value = "{";
+            for (std::size_t child = 0;
+                 child < nestedChildValues_.size(); ++child)
+            {
+                if (nestedChildValues_[child].size()
+                    != pageValues_.size())
+                {
+                    state_ = State::FAILED;
+                    return format::fail(
+                            error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                            "STRUCT child row count is inconsistent");
+                }
+                if (child != 0)
+                {
+                    value += ",";
+                }
+                const std::uint32_t childColumn =
+                        type.subtypes(static_cast<int>(child));
+                const proto::Type &childType =
+                        fileTail_.footer().types(
+                                static_cast<int>(childColumn));
+                value += "\"" + escapeJson(childType.name()) + "\":";
+                value += nestedChildValues_[child][row];
+            }
+            value += "}";
+            pageValues_[row] = value;
+        }
+    }
+    else
+    {
+        const bool map = type.kind() == proto::Type_Kind_MAP;
+        if (nestedChildValues_.empty()
+            || (map && nestedChildValues_.size() != 2U))
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::INVALID_STATE,
+                    "collection child result count is inconsistent");
+        }
+        for (std::size_t row = 0; row < pageValues_.size(); ++row)
+        {
+            if (!pageValidity_[row])
+            {
+                pageValues_[row] = "null";
+                continue;
+            }
+            const format::VariableValueRange &range =
+                    collectionRanges_[row];
+            if (range.offset < nestedChildBase_)
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                        "collection range precedes the child page");
+            }
+            const std::uint64_t relative =
+                    range.offset - nestedChildBase_;
+            std::uint64_t end = 0;
+            if (!format::checkedAdd(relative, range.length, end)
+                || end > nestedChildValues_[0].size()
+                || (map && end > nestedChildValues_[1].size()))
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::OUT_OF_BOUNDS,
+                        "collection range exceeds the child page");
+            }
+            std::string value = "[";
+            for (std::uint64_t index = relative;
+                 index < end; ++index)
+            {
+                if (index != relative)
+                {
+                    value += ",";
+                }
+                if (map)
+                {
+                    value += "[";
+                    value += nestedChildValues_[0][
+                            static_cast<std::size_t>(index)];
+                    value += ",";
+                    value += nestedChildValues_[1][
+                            static_cast<std::size_t>(index)];
+                    value += "]";
+                }
+                else
+                {
+                    value += nestedChildValues_[0][
+                            static_cast<std::size_t>(index)];
+                }
+            }
+            value += "]";
+            pageValues_[row] = value;
+        }
+    }
+
+    buildPageResult(pageValues_);
+    state_ = State::PAGE_READY;
+    return true;
+}
+
 bool InspectionSession::advancePixel()
 {
     std::uint32_t pixelRows = 0;
@@ -2227,6 +2705,10 @@ bool InspectionSession::advancePixel()
     pageRequest_.resultOffset += pageRequest_.pixelRowCount;
     if (pageRequest_.resultOffset == pageRequest_.rowCount)
     {
+        if (isNestedPage())
+        {
+            return beginNestedChildren();
+        }
         buildPageResult(pageValues_);
         state_ = State::PAGE_READY;
         return true;

@@ -5,9 +5,9 @@ native Pixels Reader. It contains:
 
 - checked immutable byte spans and integer/range operations;
 - FileTail and RowGroupFooter protobuf parsing and validation;
-- pure per-encoding decoders (the current `NONE` scalar slice includes packed
-  BOOLEAN, BYTE, 32/64-bit integers, FLOAT/DOUBLE, temporal values, and
-  short/long-decimal storage words);
+- pure per-encoding decoders for packed BOOLEAN, fixed-width scalars,
+  temporal values, exact short/long decimals, variable-width strings,
+  binary values, VECTOR, and recursively nested ARRAY/MAP/STRUCT values;
 - a host-driven byte-range state machine;
 - a versioned C ABI compiled from the same sources for native and WebAssembly.
 
@@ -52,11 +52,11 @@ The conformance runner validates the ABI, exact metadata/page output,
 cancellation, mismatched ranges, legacy LONG plus generic DATE output, bounded
 linear memory, and the Emscripten import allowlist.
 
-The generic page operation currently promotes `NONE` scalar pages within one
-pixel, including padded and compacted null layouts with exact bitmap/value
-ranges. Multi-pixel pages, RLE, variable-width, vector, and nested values remain
-explicit follow-up work; the API returns an unsupported status instead of
-guessing their layout.
+The generic page operation supports bounded pages across pixels, padded and
+compacted null layouts, integer RLE, dictionary and plain variable-width
+strings, binary values, VECTOR, and the portable nested-column contract in
+`NESTED_LAYOUT.md`. Unsupported encodings return an explicit error instead of
+falling back to guessed bytes.
 
 ## Range protocol
 

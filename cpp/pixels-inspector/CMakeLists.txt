@@ -127,6 +127,7 @@ add_library(pixels-format STATIC
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainLongDecoder.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/RunLengthByteDecoder.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/RunLengthIntDecoder.cpp"
+    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/SchemaValidator.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/VariableLengthDecoder.cpp")
 target_include_directories(pixels-format PUBLIC
     "${PIXELS_CPP_ROOT}/pixels-core/include")

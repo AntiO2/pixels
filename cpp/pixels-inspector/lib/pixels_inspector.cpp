@@ -76,6 +76,7 @@ pixels_inspector_status currentStatus(const InspectionSession &session)
         case InspectionSession::State::AWAITING_DICTIONARY_TRAILER:
         case InspectionSession::State::AWAITING_DICTIONARY_STARTS:
         case InspectionSession::State::AWAITING_DICTIONARY_CONTENT:
+        case InspectionSession::State::AWAITING_NESTED_CHILD:
             return PIXELS_INSPECTOR_RANGE_READY;
         case InspectionSession::State::METADATA_READY:
         case InspectionSession::State::PAGE_READY:

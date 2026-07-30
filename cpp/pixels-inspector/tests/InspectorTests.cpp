@@ -10,6 +10,7 @@
 #include "format/PlainLongDecoder.h"
 #include "format/PlainPixelPlanner.h"
 #include "format/PlainScalarDecoder.h"
+#include "format/SchemaValidator.h"
 #include "pixels.pb.h"
 
 #include <algorithm>
@@ -904,6 +905,156 @@ std::vector<std::uint8_t> makeByteRleFixture()
     return file;
 }
 
+std::vector<std::uint8_t> makeNestedFixture()
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse nested fixture FileTail");
+    pixels::proto::Footer *footer = fileTail.mutable_footer();
+    footer->clear_types();
+    footer->clear_columnstats();
+    footer->clear_rowgroupinfos();
+    footer->clear_rowgroupstats();
+
+    pixels::proto::Type *root = footer->add_types();
+    root->set_kind(pixels::proto::Type_Kind_STRUCT);
+    root->set_name("root");
+    root->add_subtypes(1);
+    root->add_subtypes(3);
+    root->add_subtypes(6);
+    pixels::proto::Type *array = footer->add_types();
+    array->set_kind(pixels::proto::Type_Kind_ARRAY);
+    array->set_name("tags");
+    array->add_subtypes(2);
+    pixels::proto::Type *item = footer->add_types();
+    item->set_kind(pixels::proto::Type_Kind_LONG);
+    item->set_name("item");
+    pixels::proto::Type *map = footer->add_types();
+    map->set_kind(pixels::proto::Type_Kind_MAP);
+    map->set_name("attrs");
+    map->add_subtypes(4);
+    map->add_subtypes(5);
+    pixels::proto::Type *key = footer->add_types();
+    key->set_kind(pixels::proto::Type_Kind_LONG);
+    key->set_name("key");
+    pixels::proto::Type *mapValue = footer->add_types();
+    mapValue->set_kind(pixels::proto::Type_Kind_VARCHAR);
+    mapValue->set_name("value");
+    mapValue->set_maximumlength(8);
+    pixels::proto::Type *label = footer->add_types();
+    label->set_kind(pixels::proto::Type_Kind_VARCHAR);
+    label->set_name("label");
+    label->set_maximumlength(8);
+
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    std::vector<std::uint8_t> data;
+    const auto addChunk =
+            [&](const std::vector<std::uint8_t> &chunkBytes,
+                std::uint32_t dataLength, std::uint64_t logicalRows,
+                bool hasNull, bool nullsPadding)
+    {
+        pixels::proto::ColumnChunkIndex *chunk =
+                rowGroupFooter.mutable_rowgroupindexentry()
+                        ->add_columnchunkindexentries();
+        chunk->set_chunkoffset(data.size());
+        chunk->set_chunklength(chunkBytes.size());
+        chunk->set_isnulloffset(dataLength);
+        chunk->add_pixelpositions(0);
+        pixels::proto::ColumnStatistic *statistic =
+                chunk->add_pixelstatistics()->mutable_statistic();
+        statistic->set_numberofvalues(logicalRows);
+        statistic->set_hasnull(hasNull);
+        chunk->set_littleendian(true);
+        chunk->set_nullspadding(nullsPadding);
+        rowGroupFooter.mutable_rowgroupencoding()
+                ->add_columnchunkencodings()
+                ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+        data.insert(data.end(), chunkBytes.begin(), chunkBytes.end());
+    };
+
+    addChunk({0x02}, 0, 3, true, false);
+
+    std::vector<std::uint8_t> arrayRanges;
+    for (const std::int64_t value :
+         std::vector<std::int64_t>{0, 2, 2, 3, 3, 5})
+    {
+        appendLittleInt64(arrayRanges, value);
+    }
+    addChunk(arrayRanges, arrayRanges.size(), 3, false, false);
+
+    std::vector<std::uint8_t> items;
+    for (std::int64_t value = 10; value < 15; ++value)
+    {
+        appendLittleInt64(items, value);
+    }
+    addChunk(items, items.size(), 5, false, false);
+
+    std::vector<std::uint8_t> mapRanges;
+    for (const std::int64_t value :
+         std::vector<std::int64_t>{0, 1, 1, 3, 3, 3})
+    {
+        appendLittleInt64(mapRanges, value);
+    }
+    addChunk(mapRanges, mapRanges.size(), 3, false, false);
+
+    std::vector<std::uint8_t> keys;
+    for (const std::int64_t value :
+         std::vector<std::int64_t>{1, 2, 3})
+    {
+        appendLittleInt64(keys, value);
+    }
+    addChunk(keys, keys.size(), 3, false, false);
+
+    std::vector<std::uint8_t> values = {'a', 'b', 'b', 'c'};
+    for (const std::uint32_t start :
+         std::vector<std::uint32_t>{0, 1, 3, 4})
+    {
+        appendLittleUint32(values, start);
+    }
+    appendLittleUint32(values, 4);
+    addChunk(values, 4, 3, false, false);
+
+    std::vector<std::uint8_t> labels = {'x', 'y', 'z'};
+    for (const std::uint32_t start :
+         std::vector<std::uint32_t>{0, 1, 2, 3})
+    {
+        appendLittleUint32(labels, start);
+    }
+    appendLittleUint32(labels, 3);
+    addChunk(labels, 3, 3, false, false);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize nested RowGroupFooter");
+    pixels::proto::RowGroupInformation *rowGroup =
+            footer->add_rowgroupinfos();
+    rowGroup->set_footeroffset(data.size());
+    rowGroup->set_footerlength(serializedFooter.size());
+    rowGroup->set_datalength(data.size());
+    rowGroup->set_numberofrows(3);
+    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_numberofrows(3);
+    fileTail.mutable_postscript()->set_contentlength(
+            data.size() + serializedFooter.size());
+
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize nested FileTail");
+    std::vector<std::uint8_t> file = data;
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
 std::string readResult(const Session &session)
 {
     std::uint64_t size = 0;
@@ -1632,6 +1783,142 @@ void testByteRlePage()
             "BYTE RLE page differs from the golden");
 }
 
+void testNestedPage()
+{
+    const std::vector<std::uint8_t> file = makeNestedFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(readResult(session)
+            == "{\"abi\":1,\"version\":1,\"magic\":\"PIXELS\","
+               "\"rows\":3,\"pixelStride\":10,\"schemaCount\":7,"
+               "\"rowGroupCount\":1,"
+               "\"firstColumn\":{\"name\":\"root\",\"kind\":12}}",
+            "nested metadata differs from the golden");
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 0, 3)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "nested page did not request its footer");
+
+    pixels_inspector_status status = PIXELS_INSPECTOR_RANGE_READY;
+    std::size_t suppliedRanges = 0;
+    while (status == PIXELS_INSPECTOR_RANGE_READY)
+    {
+        status = supply(session, nextRange(session), file);
+        ++suppliedRanges;
+        require(suppliedRanges < 32,
+                "nested page did not converge");
+    }
+    require(status == PIXELS_INSPECTOR_RESULT_READY,
+            "nested ranges did not produce a page");
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":3,"
+               "\"values\":[{\"tags\":[\"10\",\"11\"],"
+               "\"attrs\":[[\"1\",\"a\"]],\"label\":\"x\"},null,"
+               "{\"tags\":[\"13\",\"14\"],\"attrs\":[],"
+               "\"label\":\"z\"}]}",
+            "nested page differs from the golden");
+}
+
+void testNestedCancellation()
+{
+    const std::vector<std::uint8_t> file = makeNestedFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 0, 3)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "nested cancellation page did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "nested footer did not request the root bitmap");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "nested root did not request child metadata");
+    require(pixels_inspector_cancel(session.handle())
+            == PIXELS_INSPECTOR_CANCELLED,
+            "nested child wait was not cancellable");
+}
+
+void testMalformedNestedRange()
+{
+    std::vector<std::uint8_t> file = makeNestedFixture();
+    require(file.size() > 41, "nested fixture is unexpectedly short");
+    file[41] = 9;
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 0, 3)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "malformed nested page did not request its footer");
+    pixels_inspector_status status = PIXELS_INSPECTOR_RANGE_READY;
+    while (status == PIXELS_INSPECTOR_RANGE_READY)
+    {
+        status = supply(session, nextRange(session), file);
+    }
+    require(status == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+            "collection range beyond its child rows was accepted");
+}
+
+void testSchemaValidation()
+{
+    pixels::format::FormatError error;
+    {
+        pixels::proto::Footer footer;
+        pixels::proto::Type *root = footer.add_types();
+        root->set_kind(pixels::proto::Type_Kind_STRUCT);
+        root->set_name("root");
+        root->add_subtypes(1);
+        root->add_subtypes(2);
+        pixels::proto::Type *first = footer.add_types();
+        first->set_kind(pixels::proto::Type_Kind_LONG);
+        first->set_name("duplicate");
+        pixels::proto::Type *second = footer.add_types();
+        second->set_kind(pixels::proto::Type_Kind_LONG);
+        second->set_name("duplicate");
+        require(!pixels::format::SchemaValidator::validate(
+                        footer, error)
+                && error.code
+                   == pixels::format::ErrorCode::MALFORMED_PROTOBUF,
+                "duplicate STRUCT field names were accepted");
+    }
+    {
+        pixels::proto::Footer footer;
+        pixels::proto::Type *left = footer.add_types();
+        left->set_kind(pixels::proto::Type_Kind_ARRAY);
+        left->set_name("left");
+        left->add_subtypes(2);
+        pixels::proto::Type *right = footer.add_types();
+        right->set_kind(pixels::proto::Type_Kind_ARRAY);
+        right->set_name("right");
+        right->add_subtypes(2);
+        pixels::proto::Type *shared = footer.add_types();
+        shared->set_kind(pixels::proto::Type_Kind_LONG);
+        shared->set_name("shared");
+        require(!pixels::format::SchemaValidator::validate(
+                        footer, error)
+                && error.code
+                   == pixels::format::ErrorCode::MALFORMED_PROTOBUF,
+                "shared nested child was accepted");
+    }
+    {
+        pixels::proto::Footer footer;
+        for (std::uint32_t depth = 0; depth < 33; ++depth)
+        {
+            pixels::proto::Type *array = footer.add_types();
+            array->set_kind(pixels::proto::Type_Kind_ARRAY);
+            array->set_name("level");
+            array->add_subtypes(depth + 1U);
+        }
+        pixels::proto::Type *leaf = footer.add_types();
+        leaf->set_kind(pixels::proto::Type_Kind_LONG);
+        leaf->set_name("leaf");
+        require(!pixels::format::SchemaValidator::validate(
+                        footer, error)
+                && error.code == pixels::format::ErrorCode::OUT_OF_BOUNDS,
+                "schema above the nesting-depth limit was accepted");
+    }
+}
+
 void testMultiPixelMalformedMetadata()
 {
     {
@@ -2349,6 +2636,10 @@ int main()
         testDictionaryPages();
         testLongDecimalPage();
         testByteRlePage();
+        testNestedPage();
+        testNestedCancellation();
+        testMalformedNestedRange();
+        testSchemaValidation();
         testMultiPixelMalformedMetadata();
         testLifecycleAndBuffers();
         testInvalidRangeAndTerminalState();

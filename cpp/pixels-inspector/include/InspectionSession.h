@@ -51,7 +51,8 @@ public:
         AWAITING_VARIABLE_CONTENT = 13,
         AWAITING_DICTIONARY_TRAILER = 14,
         AWAITING_DICTIONARY_STARTS = 15,
-        AWAITING_DICTIONARY_CONTENT = 16
+        AWAITING_DICTIONARY_CONTENT = 16,
+        AWAITING_NESTED_CHILD = 17
     };
 
     explicit InspectionSession(std::uint64_t fileSize);
@@ -125,6 +126,8 @@ private:
             const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeDictionaryContent(
             const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeNestedChild(
+            const format::ByteSpan &bytes);
     [[nodiscard]] bool validatePageRequest();
     [[nodiscard]] bool preparePageLayout();
     [[nodiscard]] bool requestCurrentPixel();
@@ -132,6 +135,16 @@ private:
     [[nodiscard]] bool requestVariableValues();
     [[nodiscard]] bool finishVariableValues(
             const format::ByteSpan &bytes);
+    [[nodiscard]] bool finishCollectionPixel(
+            const std::vector<format::VariableValueRange> &ranges);
+    [[nodiscard]] bool beginNestedChildren();
+    [[nodiscard]] bool startNestedChild();
+    [[nodiscard]] bool finishNestedPage();
+    [[nodiscard]] bool logicalRowsForColumn(
+            std::uint32_t column, std::uint32_t &rows);
+    void initializeNestedChild(
+            const proto::FileTail &fileTail,
+            std::uint32_t rowGroup, std::uint32_t logicalRows);
     [[nodiscard]] bool computeVariablePhysicalBase(
             const format::ByteSpan &prefixNullBitmaps);
     [[nodiscard]] bool usesRunLengthEncoding() const;
@@ -139,6 +152,7 @@ private:
     [[nodiscard]] bool usesNullPadding() const;
     [[nodiscard]] bool isPlainVariablePage() const;
     [[nodiscard]] bool isDictionaryPage() const;
+    [[nodiscard]] bool isNestedPage() const;
     [[nodiscard]] bool finishCurrentPixel(
             const std::vector<std::string> &physicalValues);
     [[nodiscard]] bool advancePixel();
@@ -172,6 +186,12 @@ private:
     std::vector<format::VariableValueRange> variableRanges_;
     std::vector<format::VariableValueRange> dictionaryRanges_;
     std::vector<std::uint8_t> dictionaryContent_;
+    std::vector<format::VariableValueRange> collectionRanges_;
+    std::unique_ptr<InspectionSession> nestedChild_;
+    std::vector<std::vector<std::string>> nestedChildValues_;
+    std::size_t nestedChildIndex_ = 0;
+    std::uint64_t nestedChildBase_ = 0;
+    std::uint32_t nestedChildCount_ = 0;
     std::unique_ptr<bool[]> pageValidity_;
     std::vector<std::string> pageValues_;
     std::string result_;
