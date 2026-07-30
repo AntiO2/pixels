@@ -1361,6 +1361,203 @@ std::vector<std::uint8_t> makeNestedFixture()
     return file;
 }
 
+std::vector<std::uint8_t> makeTpchLineitemFixture()
+{
+    const char *const names[] = {
+            "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber",
+            "l_quantity", "l_extendedprice", "l_discount", "l_tax",
+            "l_returnflag", "l_linestatus", "l_shipdate",
+            "l_commitdate", "l_receiptdate", "l_shipinstruct",
+            "l_shipmode", "l_comment"};
+    const pixels::proto::Type_Kind kinds[] = {
+            pixels::proto::Type_Kind_LONG,
+            pixels::proto::Type_Kind_LONG,
+            pixels::proto::Type_Kind_LONG,
+            pixels::proto::Type_Kind_INT,
+            pixels::proto::Type_Kind_DECIMAL,
+            pixels::proto::Type_Kind_DECIMAL,
+            pixels::proto::Type_Kind_DECIMAL,
+            pixels::proto::Type_Kind_DECIMAL,
+            pixels::proto::Type_Kind_CHAR,
+            pixels::proto::Type_Kind_CHAR,
+            pixels::proto::Type_Kind_DATE,
+            pixels::proto::Type_Kind_DATE,
+            pixels::proto::Type_Kind_DATE,
+            pixels::proto::Type_Kind_CHAR,
+            pixels::proto::Type_Kind_CHAR,
+            pixels::proto::Type_Kind_VARCHAR};
+    const std::vector<std::vector<std::string>> strings = {
+            {"N", "R"}, {"O", "F"}, {"DELIVER", "TAKE"},
+            {"AIR", "SHIP"}, {"first line", "second line"}};
+
+    pixels::proto::FileTail fileTail;
+    pixels::proto::PostScript *postScript =
+            fileTail.mutable_postscript();
+    postScript->set_version(1);
+    postScript->set_numberofrows(2);
+    postScript->set_pixelstride(2);
+    postScript->set_compression(
+            pixels::proto::NONE);
+    postScript->set_compressionblocksize(1);
+    postScript->set_writertimezone("UTC");
+    postScript->set_partitioned(false);
+    postScript->set_columnchunkalignment(1);
+    postScript->set_hashiddencolumn(false);
+    postScript->set_magic("PIXELS");
+
+    pixels::proto::Footer *footer = fileTail.mutable_footer();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    pixels::proto::RowGroupStatistic *rowStatistics =
+            footer->add_rowgroupstats();
+    std::vector<std::uint8_t> data;
+
+    const auto appendVariable =
+            [](std::vector<std::uint8_t> &target,
+               const std::vector<std::string> &values)
+    {
+        std::vector<std::uint32_t> starts;
+        starts.push_back(0);
+        for (const std::string &value : values)
+        {
+            target.insert(target.end(), value.begin(), value.end());
+            starts.push_back(
+                    static_cast<std::uint32_t>(target.size()));
+        }
+        const std::uint32_t startsOffset =
+                static_cast<std::uint32_t>(target.size());
+        for (const std::uint32_t start : starts)
+        {
+            appendLittleUint32(target, start);
+        }
+        appendLittleUint32(target, startsOffset);
+    };
+
+    std::size_t variableIndex = 0;
+    for (std::size_t column = 0; column < 16; ++column)
+    {
+        pixels::proto::Type *type = footer->add_types();
+        type->set_kind(kinds[column]);
+        type->set_name(names[column]);
+        if (kinds[column] == pixels::proto::Type_Kind_DECIMAL)
+        {
+            type->set_precision(15);
+            type->set_scale(2);
+        }
+        else if (kinds[column] == pixels::proto::Type_Kind_CHAR)
+        {
+            const std::uint32_t lengths[] = {1, 1, 25, 10};
+            type->set_maximumlength(lengths[variableIndex]);
+        }
+        else if (kinds[column] == pixels::proto::Type_Kind_VARCHAR)
+        {
+            type->set_maximumlength(44);
+        }
+
+        std::vector<std::uint8_t> chunkBytes;
+        switch (kinds[column])
+        {
+            case pixels::proto::Type_Kind_LONG:
+                appendLittleInt64(
+                        chunkBytes,
+                        static_cast<std::int64_t>(
+                                (column + 1U) * 10U + 1U));
+                appendLittleInt64(
+                        chunkBytes,
+                        static_cast<std::int64_t>(
+                                (column + 1U) * 10U + 2U));
+                break;
+            case pixels::proto::Type_Kind_INT:
+                appendLittleUint32(chunkBytes, 1);
+                appendLittleUint32(chunkBytes, 2);
+                break;
+            case pixels::proto::Type_Kind_DECIMAL:
+                appendLittleInt64(
+                        chunkBytes,
+                        static_cast<std::int64_t>(
+                                (column + 1U) * 100U + 25U));
+                appendLittleInt64(
+                        chunkBytes,
+                        static_cast<std::int64_t>(
+                                (column + 1U) * 100U + 50U));
+                break;
+            case pixels::proto::Type_Kind_DATE:
+                appendLittleUint32(chunkBytes, 9496);
+                appendLittleUint32(chunkBytes, 9497);
+                break;
+            case pixels::proto::Type_Kind_CHAR:
+            case pixels::proto::Type_Kind_VARCHAR:
+                appendVariable(chunkBytes, strings[variableIndex]);
+                ++variableIndex;
+                break;
+            default:
+                require(false, "unexpected TPC-H lineitem kind");
+        }
+
+        pixels::proto::ColumnChunkIndex *chunk =
+                rowGroupFooter.mutable_rowgroupindexentry()
+                        ->add_columnchunkindexentries();
+        chunk->set_chunkoffset(data.size());
+        chunk->set_chunklength(chunkBytes.size());
+        if (kinds[column] == pixels::proto::Type_Kind_CHAR
+            || kinds[column] == pixels::proto::Type_Kind_VARCHAR)
+        {
+            chunk->set_isnulloffset(
+                    strings[variableIndex - 1U][0].size()
+                    + strings[variableIndex - 1U][1].size());
+        }
+        else
+        {
+            chunk->set_isnulloffset(chunkBytes.size());
+        }
+        chunk->add_pixelpositions(0);
+        pixels::proto::ColumnStatistic *pixelStatistic =
+                chunk->add_pixelstatistics()->mutable_statistic();
+        pixelStatistic->set_numberofvalues(2);
+        pixelStatistic->set_hasnull(false);
+        chunk->set_littleendian(true);
+        chunk->set_nullspadding(false);
+        rowGroupFooter.mutable_rowgroupencoding()
+                ->add_columnchunkencodings()
+                ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+        data.insert(data.end(), chunkBytes.begin(), chunkBytes.end());
+
+        pixels::proto::ColumnStatistic *fileStatistic =
+                footer->add_columnstats();
+        fileStatistic->set_numberofvalues(2);
+        fileStatistic->set_hasnull(false);
+        pixels::proto::ColumnStatistic *rowStatistic =
+                rowStatistics->add_columnchunkstats();
+        rowStatistic->CopyFrom(*fileStatistic);
+    }
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize TPC-H lineitem RowGroupFooter");
+    pixels::proto::RowGroupInformation *rowGroup =
+            footer->add_rowgroupinfos();
+    rowGroup->set_footeroffset(data.size());
+    rowGroup->set_footerlength(serializedFooter.size());
+    rowGroup->set_datalength(data.size());
+    rowGroup->set_numberofrows(2);
+    postScript->set_contentlength(
+            data.size() + serializedFooter.size());
+
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize TPC-H lineitem FileTail");
+    std::vector<std::uint8_t> file = data;
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
 std::string readResult(const Session &session)
 {
     std::uint64_t size = 0;
@@ -2290,6 +2487,46 @@ void testNestedPage()
                "{\"tags\":[\"13\",\"14\"],\"attrs\":[],"
                "\"label\":\"z\"}]}",
             "nested page differs from the golden");
+}
+
+void testTpchLineitemFixture()
+{
+    const std::vector<std::uint8_t> file =
+            makeTpchLineitemFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    const std::string metadata = readResult(session);
+    require(metadata.find(
+                    "\"schemaCount\":16,\"rowGroupCount\":1")
+            != std::string::npos,
+            "TPC-H lineitem metadata has the wrong shape");
+    require(metadata.find(
+                    "{\"id\":0,\"name\":\"l_orderkey\",\"kind\":4")
+            != std::string::npos
+            && metadata.find(
+                    "{\"id\":15,\"name\":\"l_comment\",\"kind\":16")
+               != std::string::npos,
+            "TPC-H lineitem schema inventory differs");
+
+    require(pixels_inspector_begin_row_group(session.handle(), 0)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "TPC-H lineitem layout did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "TPC-H lineitem footer did not produce layout");
+    const std::string layout = readResult(session);
+    require(layout.find("\"column\":15") != std::string::npos,
+            "TPC-H lineitem layout omits its final column");
+
+    require(decodePage(file, 0, 0, 2)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+               "\"count\":2,\"values\":[\"11\",\"12\"]}",
+            "TPC-H lineitem LONG preview differs");
+    require(decodePage(file, 15, 0, 2)
+            == "{\"rowGroup\":0,\"column\":15,\"offset\":0,"
+               "\"count\":2,\"values\":[\"first line\","
+               "\"second line\"]}",
+            "TPC-H lineitem VARCHAR preview differs");
 }
 
 void testNestedCancellation()
@@ -3268,6 +3505,14 @@ int main(int argc, char **argv)
             std::cout << "pixels-inspector conformance corpus: PASS\n";
             return EXIT_SUCCESS;
         }
+        if (argc == 3
+            && std::string(argv[1])
+               == "--write-tpch-lineitem")
+        {
+            writeBytes(argv[2], makeTpchLineitemFixture());
+            std::cout << "pixels-inspector TPC-H lineitem fixture: PASS\n";
+            return EXIT_SUCCESS;
+        }
         if (argc == 2
             && std::string(argv[1])
                == "--print-canonical-metadata")
@@ -3316,6 +3561,7 @@ int main(int argc, char **argv)
         testDictionaryPages();
         testLongDecimalPage();
         testByteRlePage();
+        testTpchLineitemFixture();
         testNestedPage();
         testNestedCancellation();
         testMalformedNestedRange();
