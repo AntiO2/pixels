@@ -76,17 +76,28 @@ bool PlainPixelPlanner::plan(
                         "pixel null bitmap has an invalid size");
         }
         bool observedNull = false;
+        std::uint32_t nonNullCount = 0;
         for (std::uint32_t row = 0; row < pixelRows; ++row)
         {
-            observedNull = observedNull
-                           || isNullAt(
-                                   nullBitmap, row, littleEndian);
+            const bool isNull =
+                    isNullAt(nullBitmap, row, littleEndian);
+            observedNull = observedNull || isNull;
+            if (!isNull)
+            {
+                ++nonNullCount;
+            }
         }
         if (!observedNull)
         {
             return fail(error, ErrorCode::MALFORMED_PROTOBUF,
                         "pixel statistics declare nulls but bitmap has none");
         }
+        plan.pixelPhysicalCount =
+                nullsPadding ? pixelRows : nonNullCount;
+    }
+    else
+    {
+        plan.pixelPhysicalCount = pixelRows;
     }
 
     std::uint32_t nonNullBefore = 0;

@@ -164,6 +164,189 @@ void mutateRowGroupFooter(
     replaceSerializedRange(file, range, footer);
 }
 
+void appendLittleInt64(
+        std::vector<std::uint8_t> &bytes, std::int64_t value)
+{
+    const std::uint64_t bits = static_cast<std::uint64_t>(value);
+    for (std::uint32_t byte = 0; byte < 8; ++byte)
+    {
+        bytes.push_back(static_cast<std::uint8_t>(
+                bits >> (byte * 8U)));
+    }
+}
+
+void appendDirectRleInt64(
+        std::vector<std::uint8_t> &bytes,
+        const std::vector<std::int64_t> &values)
+{
+    require(!values.empty() && values.size() <= 512,
+            "RLE test run length is invalid");
+    std::vector<std::uint64_t> encoded(values.size());
+    std::uint64_t maximum = 0;
+    for (std::size_t index = 0; index < values.size(); ++index)
+    {
+        const std::uint64_t bits =
+                static_cast<std::uint64_t>(values[index]);
+        encoded[index] =
+                (bits << 1U)
+                ^ (static_cast<std::uint64_t>(0)
+                   - (bits >> 63U));
+        maximum = std::max(maximum, encoded[index]);
+    }
+    std::uint32_t width = 1;
+    while (width < 24U && (maximum >> width) != 0)
+    {
+        ++width;
+    }
+    require(width <= 24U, "RLE test value exceeds the compact helper");
+    const std::uint32_t encodedWidth = width - 1U;
+    const std::uint32_t encodedLength =
+            static_cast<std::uint32_t>(values.size() - 1U);
+    bytes.push_back(static_cast<std::uint8_t>(
+            0x40U | (encodedWidth << 1U)
+            | ((encodedLength >> 8U) & 1U)));
+    bytes.push_back(static_cast<std::uint8_t>(encodedLength));
+
+    std::uint8_t packed = 0;
+    std::uint32_t packedBits = 0;
+    for (const std::uint64_t value : encoded)
+    {
+        for (std::uint32_t bit = 0; bit < width; ++bit)
+        {
+            const std::uint32_t source = width - bit - 1U;
+            packed = static_cast<std::uint8_t>(
+                    (packed << 1U) | ((value >> source) & 1U));
+            ++packedBits;
+            if (packedBits == 8U)
+            {
+                bytes.push_back(packed);
+                packed = 0;
+                packedBits = 0;
+            }
+        }
+    }
+    if (packedBits != 0)
+    {
+        bytes.push_back(static_cast<std::uint8_t>(
+                packed << (8U - packedBits)));
+    }
+}
+
+std::vector<std::uint8_t> makeMultiPixelLongFixture(
+        bool nullsPadding,
+        const std::vector<std::uint8_t> &nullMasks,
+        const std::function<void(pixels::proto::RowGroupFooter &)> &mutation =
+                std::function<void(pixels::proto::RowGroupFooter &)>(),
+        bool runLengthEncoding = false)
+{
+    require(nullMasks.size() == 3,
+            "multi-pixel fixture requires three null masks");
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse canonical RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse canonical FileTail");
+
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->clear_pixelpositions();
+    chunk->clear_pixelstatistics();
+    chunk->set_littleendian(true);
+    chunk->set_nullspadding(nullsPadding);
+
+    std::vector<std::uint8_t> columnData;
+    for (std::uint32_t pixel = 0; pixel < 3; ++pixel)
+    {
+        chunk->add_pixelpositions(
+                static_cast<std::uint32_t>(columnData.size()));
+        pixels::proto::PixelStatistic *statistics =
+                chunk->add_pixelstatistics();
+        statistics->mutable_statistic()->set_hasnull(
+                nullMasks[pixel] != 0);
+        const std::uint32_t rowStart = pixel * 4U;
+        const std::uint32_t rows = pixel == 2 ? 2U : 4U;
+        std::vector<std::int64_t> pixelValues;
+        for (std::uint32_t row = 0; row < rows; ++row)
+        {
+            const bool isNull =
+                    ((nullMasks[pixel] >> row) & 1U) != 0;
+            if ((nullsPadding && !runLengthEncoding) || !isNull)
+            {
+                pixelValues.push_back(
+                        static_cast<std::int64_t>(rowStart + row));
+            }
+        }
+        if (runLengthEncoding)
+        {
+            if (!pixelValues.empty())
+            {
+                appendDirectRleInt64(columnData, pixelValues);
+            }
+        }
+        else
+        {
+            for (const std::int64_t value : pixelValues)
+            {
+                appendLittleInt64(columnData, value);
+            }
+        }
+    }
+    if (runLengthEncoding)
+    {
+        rowGroupFooter.mutable_rowgroupencoding()
+                ->mutable_columnchunkencodings(0)
+                ->set_kind(pixels::proto::ColumnEncoding_Kind_RUNLENGTH);
+    }
+    chunk->set_isnulloffset(
+            static_cast<std::uint32_t>(columnData.size()));
+    for (std::size_t pixel = 0; pixel < nullMasks.size(); ++pixel)
+    {
+        if (nullMasks[pixel] != 0)
+        {
+            columnData.push_back(nullMasks[pixel]);
+        }
+    }
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    if (mutation)
+    {
+        mutation(rowGroupFooter);
+    }
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize multi-pixel RowGroupFooter");
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_footerlength(serializedFooter.size());
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(4);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize multi-pixel FileTail");
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
 std::string readResult(const Session &session)
 {
     std::uint64_t size = 0;
@@ -209,6 +392,20 @@ void driveMetadata(Session &session,
     require(tail.offset == 506 && tail.length == 276,
             "unexpected FileTail range");
     require(supply(session, tail, file) == PIXELS_INSPECTOR_RESULT_READY,
+            "FileTail did not produce metadata");
+}
+
+void driveMetadataFlexible(
+        Session &session, const std::vector<std::uint8_t> &file)
+{
+    require(pixels_inspector_begin_metadata(session.handle())
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "metadata did not request the tail pointer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "tail pointer did not produce a FileTail request");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RESULT_READY,
             "FileTail did not produce metadata");
 }
 
@@ -361,6 +558,329 @@ void testGenericPlainScalarPages()
                    "\"values\":[\"0\",\"1\",null,\"2\",\"3\",\"4\",\"5\","
                    "\"6\",\"7\",\"8\"]}",
                 "unpadded null page differs from the golden");
+    }
+}
+
+void testMultiPixelPlainPages()
+{
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(false, {0, 0, 0});
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_plain_long_page(
+                        session.handle(), 0, 0, 2, 6)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "legacy multi-pixel LONG page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "multi-pixel footer did not produce the first value range");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 16 && range.length == 16,
+                "first bounded pixel range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "first pixel did not continue to the second pixel");
+        range = nextRange(session);
+        require(range.offset == 32 && range.length == 32,
+                "second bounded pixel range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "second pixel did not complete the page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":2,\"count\":6,"
+                   "\"values\":[\"2\",\"3\",\"4\",\"5\",\"6\",\"7\"]}",
+                "null-free multi-pixel page differs from the golden");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(false, {0x02, 0, 0x01});
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 10)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "unpadded multi-pixel page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "unpadded footer did not request the first bitmap");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 64 && range.length == 1,
+                "first unpadded null bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "first bitmap did not request its values");
+        range = nextRange(session);
+        require(range.offset == 0 && range.length == 24,
+                "first unpadded value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "first values did not continue to the null-free pixel");
+        range = nextRange(session);
+        require(range.offset == 24 && range.length == 32,
+                "middle unpadded value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "middle values did not request the final bitmap");
+        range = nextRange(session);
+        require(range.offset == 65 && range.length == 1,
+                "final unpadded null bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "final bitmap did not request its values");
+        range = nextRange(session);
+        require(range.offset == 56 && range.length == 8,
+                "final unpadded value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "final unpadded values did not complete the page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":10,"
+                   "\"values\":[\"0\",null,\"2\",\"3\",\"4\",\"5\",\"6\","
+                   "\"7\",null,\"9\"]}",
+                "unpadded multi-pixel page differs from the golden");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(true, {0x02, 0, 0x01});
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 10)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "padded multi-pixel page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "padded footer did not request the first bitmap");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 80 && range.length == 1,
+                "first padded null bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "first padded bitmap did not request values");
+        range = nextRange(session);
+        require(range.offset == 0 && range.length == 32,
+                "first padded value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "first padded values did not continue");
+        range = nextRange(session);
+        require(range.offset == 32 && range.length == 32,
+                "middle padded value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "middle padded values did not request the final bitmap");
+        range = nextRange(session);
+        require(range.offset == 81 && range.length == 1,
+                "final padded null bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "final padded bitmap did not request values");
+        range = nextRange(session);
+        require(range.offset == 64 && range.length == 16,
+                "final padded value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "final padded values did not complete the page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":10,"
+                   "\"values\":[\"0\",null,\"2\",\"3\",\"4\",\"5\",\"6\","
+                   "\"7\",null,\"9\"]}",
+                "padded multi-pixel page differs from the golden");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(false, {0x02, 0, 0x01});
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 8, 2)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "late-pixel page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "late-pixel footer did not request its bitmap");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 65 && range.length == 1,
+                "late-pixel bitmap did not skip the earlier bitmap");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "late-pixel bitmap did not request values");
+        range = nextRange(session);
+        require(range.offset == 56 && range.length == 8,
+                "late-pixel value range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "late-pixel values did not complete the page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":8,\"count\":2,"
+                   "\"values\":[null,\"9\"]}",
+                "late-pixel page differs from the golden");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(false, {0x0F, 0, 0});
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 6)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "all-null pixel page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "all-null pixel footer did not request its bitmap");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 48 && range.length == 1,
+                "all-null pixel bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "all-null pixel did not advance without a value range");
+        range = nextRange(session);
+        require(range.offset == 0 && range.length == 16,
+                "value range after the all-null pixel is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "values after the all-null pixel did not complete the page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":6,"
+                   "\"values\":[null,null,null,null,\"4\",\"5\"]}",
+                "all-null pixel page differs from the golden");
+    }
+}
+
+void testMultiPixelRunLengthPages()
+{
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        true, {0x02, 0, 0x01},
+                        std::function<void(
+                                pixels::proto::RowGroupFooter &)>(), true);
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 2, 7)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "RLE multi-pixel page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "RLE footer did not request the first bitmap");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 11 && range.length == 1,
+                "RLE first bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "RLE first bitmap did not request its full pixel");
+        range = nextRange(session);
+        require(range.offset == 0 && range.length == 4,
+                "RLE first pixel range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "RLE first pixel did not continue to the second pixel");
+        range = nextRange(session);
+        require(range.offset == 4 && range.length == 4,
+                "RLE second pixel range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "RLE second pixel did not request the final bitmap");
+        range = nextRange(session);
+        require(range.offset == 12 && range.length == 1,
+                "RLE final bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "all-null RLE page tail did not finish without content");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":2,\"count\":7,"
+                   "\"values\":[\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",null]}",
+                "RLE multi-pixel page differs from the golden");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        false, {0, 0, 0},
+                        [](pixels::proto::RowGroupFooter &footer) {
+                            footer.mutable_rowgroupindexentry()
+                                    ->mutable_columnchunkindexentries(0)
+                                    ->set_pixelpositions(1, 3);
+                        },
+                        true);
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 4)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "truncated RLE page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "truncated RLE footer did not request content");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+                "truncated RLE pixel was not rejected");
+    }
+}
+
+void testMultiPixelMalformedMetadata()
+{
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        false, {0, 0, 0},
+                        [](pixels::proto::RowGroupFooter &footer) {
+                            footer.mutable_rowgroupindexentry()
+                                    ->mutable_columnchunkindexentries(0)
+                                    ->set_pixelpositions(1, 8);
+                        });
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 4)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "short-pixel fixture did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+                "value range crossing its pixel was not rejected");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        false, {0x02, 0, 0x01},
+                        [](pixels::proto::RowGroupFooter &footer) {
+                            pixels::proto::ColumnChunkIndex *chunk =
+                                    footer.mutable_rowgroupindexentry()
+                                            ->mutable_columnchunkindexentries(0);
+                            chunk->set_chunklength(
+                                    chunk->isnulloffset() + 1U);
+                        });
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 10)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "short-bitmap fixture did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+                "truncated per-pixel null bitmaps were not rejected");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        false, {0, 0, 0},
+                        [](pixels::proto::RowGroupFooter &footer) {
+                            footer.mutable_rowgroupindexentry()
+                                    ->mutable_columnchunkindexentries(0)
+                                    ->mutable_pixelstatistics(1)
+                                    ->mutable_statistic()
+                                    ->clear_hasnull();
+                        });
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 10)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "missing-statistics fixture did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_MALFORMED_PROTOBUF,
+                "missing per-pixel null statistics were not rejected");
     }
 }
 
@@ -529,6 +1049,7 @@ void testPlainPixelPlanner()
                     plan, error)
             && plan.physicalOffset == 3
             && plan.physicalCount == 4
+            && plan.pixelPhysicalCount == 10
             && std::all_of(
                     validity, validity + 4,
                     [](bool value) { return value; }),
@@ -543,6 +1064,7 @@ void testPlainPixelPlanner()
                     validity, 6, plan, error)
             && plan.physicalOffset == 1
             && plan.physicalCount == 5
+            && plan.pixelPhysicalCount == 7
             && std::equal(validity, validity + 6, expected),
             "unpadded little-endian null plan differs");
 
@@ -553,6 +1075,7 @@ void testPlainPixelPlanner()
                     validity, 6, plan, error)
             && plan.physicalOffset == 2
             && plan.physicalCount == 6
+            && plan.pixelPhysicalCount == 10
             && std::equal(validity, validity + 6, expected),
             "padded null plan differs");
 
@@ -564,6 +1087,7 @@ void testPlainPixelPlanner()
                     validity, 6, plan, error)
             && plan.physicalOffset == 1
             && plan.physicalCount == 5
+            && plan.pixelPhysicalCount == 7
             && std::equal(validity, validity + 6, expected),
             "unpadded big-endian null plan differs");
 
@@ -772,7 +1296,7 @@ void testUnsupportedPageShape()
                             ->mutable_columnchunkencodings(0)
                             ->set_kind(
                                     pixels::proto::
-                                    ColumnEncoding_Kind_RUNLENGTH);
+                                    ColumnEncoding_Kind_DICTIONARY);
                 });
         Session session(file.size());
         driveMetadata(session, file);
@@ -782,7 +1306,7 @@ void testUnsupportedPageShape()
                 "page did not request its footer");
         require(supply(session, nextRange(session), file)
                 == PIXELS_INSPECTOR_UNSUPPORTED_ENCODING,
-                "RUNLENGTH validation page was not rejected");
+                "DICTIONARY validation page was not rejected");
     }
     {
         const std::vector<std::uint8_t> file = readFixture();
@@ -812,8 +1336,8 @@ void testUnsupportedPageShape()
                 == PIXELS_INSPECTOR_RANGE_READY,
                 "page did not request its footer");
         require(supply(session, nextRange(session), file)
-                == PIXELS_INSPECTOR_UNSUPPORTED_ENCODING,
-                "page crossing a pixel boundary was not rejected");
+                == PIXELS_INSPECTOR_MALFORMED_PROTOBUF,
+                "pixel stride inconsistent with pixel metadata was not rejected");
     }
     {
         std::vector<std::uint8_t> file = readFixture();
@@ -824,6 +1348,9 @@ void testUnsupportedPageShape()
                             ->mutable_pixelstatistics(0)
                             ->mutable_statistic()
                             ->set_hasnull(true);
+                    footer.mutable_rowgroupindexentry()
+                            ->mutable_columnchunkindexentries(0)
+                            ->set_chunklength(82);
                 });
         Session session(file.size());
         driveMetadata(session, file);
@@ -900,6 +1427,41 @@ void testCancellationStates()
                 == PIXELS_INSPECTOR_CANCELLED,
                 "column-chunk wait was not cancellable");
     }
+    {
+        const std::vector<std::uint8_t> multiPixel =
+                makeMultiPixelLongFixture(false, {0x02, 0, 0x01});
+        Session session(multiPixel.size());
+        driveMetadataFlexible(session, multiPixel);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 10)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "nullable page did not request its footer");
+        require(supply(session, nextRange(session), multiPixel)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "nullable footer did not request its bitmap");
+        require(pixels_inspector_cancel(session.handle())
+                == PIXELS_INSPECTOR_CANCELLED,
+                "per-pixel null bitmap wait was not cancellable");
+    }
+    {
+        const std::vector<std::uint8_t> multiPixel =
+                makeMultiPixelLongFixture(false, {0, 0, 0});
+        Session session(multiPixel.size());
+        driveMetadataFlexible(session, multiPixel);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 2, 6)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "cross-pixel page did not request its footer");
+        require(supply(session, nextRange(session), multiPixel)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "cross-pixel footer did not request values");
+        require(supply(session, nextRange(session), multiPixel)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "first pixel did not request second-pixel values");
+        require(pixels_inspector_cancel(session.handle())
+                == PIXELS_INSPECTOR_CANCELLED,
+                "second-pixel value wait was not cancellable");
+    }
 }
 
 void testInvalidPageRequests()
@@ -937,6 +1499,18 @@ void testInvalidPageRequests()
                 == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
                 "page above the bounded row limit was accepted");
     }
+    {
+        Session session(file.size());
+        driveMetadata(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0,
+                        std::numeric_limits<std::uint64_t>::max(), 1)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "overflowing page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+                "overflowing page row range was not rejected");
+    }
 }
 
 } // namespace
@@ -954,6 +1528,9 @@ int main()
         testCanonicalFixture();
         testBoundedPageRange();
         testGenericPlainScalarPages();
+        testMultiPixelPlainPages();
+        testMultiPixelRunLengthPages();
+        testMultiPixelMalformedMetadata();
         testLifecycleAndBuffers();
         testInvalidRangeAndTerminalState();
         testPartialRange();

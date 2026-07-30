@@ -89,6 +89,11 @@ private:
         std::uint32_t rowCount = 0;
         bool legacyLongResult = false;
         std::uint32_t bitOffset = 0;
+        std::uint32_t pixel = 0;
+        std::uint32_t pixelRowOffset = 0;
+        std::uint32_t pixelRowCount = 0;
+        std::uint32_t resultOffset = 0;
+        std::uint64_t nullBitmapByteOffset = 0;
     };
 
     [[nodiscard]] bool consumeTailPointer(const format::ByteSpan &bytes);
@@ -97,7 +102,18 @@ private:
     [[nodiscard]] bool consumeNullBitmap(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeColumnChunk(const format::ByteSpan &bytes);
     [[nodiscard]] bool validatePageRequest();
-    [[nodiscard]] bool requestPlainValues();
+    [[nodiscard]] bool requestCurrentPixel();
+    [[nodiscard]] bool requestPixelValues();
+    [[nodiscard]] bool usesRunLengthEncoding() const;
+    [[nodiscard]] bool usesNullPadding() const;
+    [[nodiscard]] bool finishCurrentPixel(
+            const std::vector<std::string> &physicalValues);
+    [[nodiscard]] bool advancePixel();
+    [[nodiscard]] bool currentPixelRows(std::uint32_t &rows) const;
+    [[nodiscard]] bool currentPixelDataRange(
+            std::uint64_t &offset, std::uint64_t &length) const;
+    [[nodiscard]] bool currentNullBitmapRange(
+            format::FileRange &range) const;
     [[nodiscard]] bool beginPageRequest(
             std::uint32_t rowGroup, std::uint32_t column,
             std::uint64_t rowOffset, std::uint32_t rowCount,
@@ -119,6 +135,7 @@ private:
     proto::ColumnChunkIndex pageChunk_;
     format::PlainPixelPlan pagePlan_;
     std::unique_ptr<bool[]> pageValidity_;
+    std::vector<std::string> pageValues_;
     std::string result_;
     format::FormatError error_;
 };

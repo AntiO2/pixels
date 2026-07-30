@@ -14,8 +14,10 @@
 #include "format/PixelsFormatReader.h"
 #include "format/PlainLongDecoder.h"
 #include "format/PlainScalarDecoder.h"
+#include "format/RunLengthIntDecoder.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -31,6 +33,18 @@ namespace
 {
 
 const std::uint32_t MAX_PAGE_ROWS = 65536;
+
+bool checkedMultiply(std::uint64_t left, std::uint64_t right,
+                     std::uint64_t &result) noexcept
+{
+    if (left != 0
+        && right > std::numeric_limits<std::uint64_t>::max() / left)
+    {
+        return false;
+    }
+    result = left * right;
+    return true;
+}
 
 std::string escapeJson(const std::string &value)
 {
@@ -126,6 +140,36 @@ bool plainValueWidth(const proto::Type &type, std::uint64_t &width)
             return true;
         case proto::Type_Kind_STRING:
         case proto::Type_Kind_BINARY:
+        case proto::Type_Kind_ARRAY:
+        case proto::Type_Kind_MAP:
+        case proto::Type_Kind_STRUCT:
+        case proto::Type_Kind_VARBINARY:
+        case proto::Type_Kind_VARCHAR:
+        case proto::Type_Kind_CHAR:
+        case proto::Type_Kind_VECTOR:
+            return false;
+    }
+    return false;
+}
+
+bool isRunLengthInteger(const proto::Type &type)
+{
+    switch (type.kind())
+    {
+        case proto::Type_Kind_SHORT:
+        case proto::Type_Kind_INT:
+        case proto::Type_Kind_LONG:
+        case proto::Type_Kind_DATE:
+        case proto::Type_Kind_TIME:
+        case proto::Type_Kind_TIMESTAMP:
+            return true;
+        case proto::Type_Kind_BOOLEAN:
+        case proto::Type_Kind_BYTE:
+        case proto::Type_Kind_FLOAT:
+        case proto::Type_Kind_DOUBLE:
+        case proto::Type_Kind_STRING:
+        case proto::Type_Kind_BINARY:
+        case proto::Type_Kind_DECIMAL:
         case proto::Type_Kind_ARRAY:
         case proto::Type_Kind_MAP:
         case proto::Type_Kind_STRUCT:
@@ -272,6 +316,11 @@ bool InspectionSession::beginPageRequest(
     pageRequest_.rowCount = rowCount;
     pageRequest_.legacyLongResult = legacyLongResult;
     pageRequest_.bitOffset = 0;
+    pageRequest_.pixel = 0;
+    pageRequest_.pixelRowOffset = 0;
+    pageRequest_.pixelRowCount = 0;
+    pageRequest_.resultOffset = 0;
+    pageRequest_.nullBitmapByteOffset = 0;
     result_.clear();
     error_.clear();
 
@@ -408,96 +457,130 @@ bool InspectionSession::consumeRowGroupFooter(const format::ByteSpan &bytes)
     }
 
     pageValidity_.reset(new bool[pageRequest_.rowCount]);
-    const proto::RowGroupInformation &rowGroup =
-            fileTail_.footer().rowgroupinfos(
-                    static_cast<int>(pageRequest_.rowGroup));
-    const std::uint32_t pixelRows = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(
-                    fileTail_.postscript().pixelstride(),
-                    rowGroup.numberofrows()));
-    if (pixelHasNull(pageChunk_, 0))
+    pageValues_.assign(pageRequest_.rowCount, std::string());
+    const std::uint32_t pixelStride =
+            fileTail_.postscript().pixelstride();
+    pageRequest_.pixel = static_cast<std::uint32_t>(
+            pageRequest_.rowOffset / pixelStride);
+    pageRequest_.pixelRowOffset = static_cast<std::uint32_t>(
+            pageRequest_.rowOffset % pixelStride);
+    pageRequest_.resultOffset = 0;
+    return requestCurrentPixel();
+}
+
+bool InspectionSession::requestCurrentPixel()
+{
+    std::uint32_t pixelRows = 0;
+    if (!currentPixelRows(pixelRows))
     {
-        if (!pageChunk_.has_isnulloffset())
-        {
-            state_ = State::FAILED;
-            return format::fail(
-                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
-                    "null-containing pixel has no null bitmap offset");
-        }
-        std::uint64_t nullFileOffset = 0;
-        if (!format::checkedAdd(
-                    pageChunk_.chunkoffset(), pageChunk_.isnulloffset(),
-                    nullFileOffset))
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "page pixel is outside the row group");
+    }
+    const std::uint32_t rowsRemaining =
+            pageRequest_.rowCount - pageRequest_.resultOffset;
+    pageRequest_.pixelRowCount = std::min(
+            rowsRemaining, pixelRows - pageRequest_.pixelRowOffset);
+
+    if (pixelHasNull(pageChunk_, pageRequest_.pixel))
+    {
+        format::FileRange nullRange;
+        if (!currentNullBitmapRange(nullRange))
         {
             state_ = State::FAILED;
             return format::fail(
                     error_, format::ErrorCode::OUT_OF_BOUNDS,
-                    "pixel null bitmap offset overflows");
+                    "pixel null bitmap range is out of bounds");
         }
-        const std::uint64_t nullBytes =
-                pixelRows / 8U + (pixelRows % 8U == 0 ? 0U : 1U);
-        setPendingRange(
-                format::FileRange{nullFileOffset, nullBytes},
-                State::AWAITING_NULL_BITMAP);
+        setPendingRange(nullRange, State::AWAITING_NULL_BITMAP);
         return true;
     }
 
     if (!format::PlainPixelPlanner::plan(
                 pixelRows,
-                static_cast<std::uint32_t>(pageRequest_.rowOffset),
-                pageRequest_.rowCount, false,
-                pageChunk_.has_nullspadding()
-                && pageChunk_.nullspadding(),
+                pageRequest_.pixelRowOffset,
+                pageRequest_.pixelRowCount, false,
+                usesNullPadding(),
                 pageChunk_.has_littleendian()
                 && pageChunk_.littleendian(),
-                format::ByteSpan(), pageValidity_.get(),
-                pageRequest_.rowCount, pagePlan_, error_))
-    {
-        state_ = State::FAILED;
-        return false;
-    }
-    return requestPlainValues();
-}
-
-bool InspectionSession::consumeNullBitmap(const format::ByteSpan &bytes)
-{
-    const proto::RowGroupInformation &rowGroup =
-            fileTail_.footer().rowgroupinfos(
-                    static_cast<int>(pageRequest_.rowGroup));
-    const std::uint32_t pixelRows = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(
-                    fileTail_.postscript().pixelstride(),
-                    rowGroup.numberofrows()));
-    if (!format::PlainPixelPlanner::plan(
-                pixelRows,
-                static_cast<std::uint32_t>(pageRequest_.rowOffset),
-                pageRequest_.rowCount, true,
-                pageChunk_.has_nullspadding()
-                && pageChunk_.nullspadding(),
-                pageChunk_.has_littleendian()
-                && pageChunk_.littleendian(),
-                bytes, pageValidity_.get(), pageRequest_.rowCount,
+                format::ByteSpan(),
+                pageValidity_.get() + pageRequest_.resultOffset,
+                pageRequest_.rowCount - pageRequest_.resultOffset,
                 pagePlan_, error_))
     {
         state_ = State::FAILED;
         return false;
     }
-    return requestPlainValues();
+    return requestPixelValues();
 }
 
-bool InspectionSession::requestPlainValues()
+bool InspectionSession::consumeNullBitmap(const format::ByteSpan &bytes)
+{
+    std::uint32_t pixelRows = 0;
+    if (!currentPixelRows(pixelRows))
+    {
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "page pixel is outside the row group");
+    }
+    if (!format::PlainPixelPlanner::plan(
+                pixelRows,
+                pageRequest_.pixelRowOffset,
+                pageRequest_.pixelRowCount, true,
+                usesNullPadding(),
+                pageChunk_.has_littleendian()
+                && pageChunk_.littleendian(),
+                bytes,
+                pageValidity_.get() + pageRequest_.resultOffset,
+                pageRequest_.rowCount - pageRequest_.resultOffset,
+                pagePlan_, error_))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    return requestPixelValues();
+}
+
+bool InspectionSession::requestPixelValues()
 {
     if (pagePlan_.physicalCount == 0)
     {
-        buildPageResult(
-                std::vector<std::string>(
-                        pageRequest_.rowCount, "null"));
-        state_ = State::PAGE_READY;
-        return true;
+        return finishCurrentPixel(std::vector<std::string>());
     }
 
     const proto::Type &type = fileTail_.footer().types(
             static_cast<int>(pageRequest_.column));
+    std::uint64_t pixelDataOffset = 0;
+    std::uint64_t pixelDataLength = 0;
+    if (!currentPixelDataRange(pixelDataOffset, pixelDataLength))
+    {
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "pixel data range is invalid");
+    }
+    if (usesRunLengthEncoding())
+    {
+        if (pixelDataLength == 0)
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "non-empty RLE pixel has no encoded content");
+        }
+        std::uint64_t pageFileOffset = 0;
+        if (!format::checkedAdd(pageChunk_.chunkoffset(), pixelDataOffset,
+                                pageFileOffset))
+        {
+            state_ = State::FAILED;
+            return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                                "RLE pixel file offset overflows");
+        }
+        setPendingRange(
+                format::FileRange{pageFileOffset, pixelDataLength},
+                State::AWAITING_COLUMN_CHUNK);
+        return true;
+    }
+
     std::uint64_t valueWidth = 0;
     if (!plainValueWidth(type, valueWidth))
     {
@@ -517,27 +600,35 @@ bool InspectionSession::requestPlainValues()
     }
     else
     {
-        pageByteOffset =
-                static_cast<std::uint64_t>(pagePlan_.physicalOffset)
-                * valueWidth;
-        pageByteLength =
-                static_cast<std::uint64_t>(pagePlan_.physicalCount)
-                * valueWidth;
+        if (!checkedMultiply(pagePlan_.physicalOffset, valueWidth,
+                             pageByteOffset)
+            || !checkedMultiply(pagePlan_.physicalCount, valueWidth,
+                                pageByteLength))
+        {
+            state_ = State::FAILED;
+            return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                                "plain scalar page byte count overflows");
+        }
     }
-    const std::uint64_t dataLength = pageChunk_.has_isnulloffset()
-                                     ? pageChunk_.isnulloffset()
-                                     : pageChunk_.chunklength();
     std::uint64_t pageByteEnd = 0;
     if (!format::checkedAdd(
                 pageByteOffset, pageByteLength, pageByteEnd)
-        || pageByteEnd > dataLength)
+        || pageByteEnd > pixelDataLength)
     {
         state_ = State::FAILED;
         return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
-                            "plain scalar page exceeds column data");
+                            "plain scalar page exceeds its pixel data");
+    }
+    std::uint64_t chunkByteOffset = 0;
+    if (!format::checkedAdd(pixelDataOffset, pageByteOffset,
+                            chunkByteOffset))
+    {
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "plain scalar chunk offset overflows");
     }
     std::uint64_t pageFileOffset = 0;
-    if (!format::checkedAdd(pageChunk_.chunkoffset(), pageByteOffset,
+    if (!format::checkedAdd(pageChunk_.chunkoffset(), chunkByteOffset,
                             pageFileOffset))
     {
         state_ = State::FAILED;
@@ -601,12 +692,26 @@ bool InspectionSession::validatePageRequest()
     const proto::ColumnEncoding &encoding =
             encodings.columnchunkencodings(
                     static_cast<int>(pageRequest_.column));
-    if (!encoding.has_kind()
-        || encoding.kind() != proto::ColumnEncoding_Kind_NONE)
+    if (!encoding.has_kind())
+    {
+        return format::fail(
+                error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                "column encoding kind is missing");
+    }
+    if (encoding.kind() == proto::ColumnEncoding_Kind_RUNLENGTH)
+    {
+        if (!isRunLengthInteger(type))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::UNSUPPORTED_ENCODING,
+                    "RLEv2 is not supported for this column type");
+        }
+    }
+    else if (encoding.kind() != proto::ColumnEncoding_Kind_NONE)
     {
         return format::fail(
                 error_, format::ErrorCode::UNSUPPORTED_ENCODING,
-                "plain scalar page requires NONE encoding");
+                "column encoding is not supported");
     }
 
     const proto::RowGroupInformation &rowGroup =
@@ -623,29 +728,109 @@ bool InspectionSession::validatePageRequest()
 
     const std::uint32_t pixelStride =
             fileTail_.postscript().pixelstride();
-    if (pageRequest_.rowOffset >= pixelStride || rowEnd > pixelStride)
+    if (pixelStride == 0)
     {
-        return format::fail(
-                error_, format::ErrorCode::UNSUPPORTED_ENCODING,
-                "plain scalar page must stay within the first pixel");
+        return format::fail(error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                            "pixel stride must be positive");
     }
 
     pageChunk_ = index.columnchunkindexentries(
             static_cast<int>(pageRequest_.column));
-    if (pageChunk_.pixelstatistics_size() == 0
-        || !pageChunk_.pixelstatistics(0).has_statistic()
-        || !pageChunk_.pixelstatistics(0).statistic().has_hasnull())
+    const std::uint64_t rowGroupRows = rowGroup.numberofrows();
+    const std::uint64_t pixelCount =
+            rowGroupRows == 0
+            ? 0
+            : (rowGroupRows - 1U) / pixelStride + 1U;
+    if (pixelCount == 0 || pixelCount > INT_MAX
+        || pageChunk_.pixelstatistics_size()
+           != static_cast<int>(pixelCount)
+        || pageChunk_.pixelpositions_size()
+           != static_cast<int>(pixelCount))
     {
         return format::fail(
                 error_, format::ErrorCode::MALFORMED_PROTOBUF,
-                "first pixel is missing explicit null statistics");
+                "pixel positions and statistics do not match row-group rows");
     }
-    if (pageChunk_.pixelpositions_size() == 0
-        || pageChunk_.pixelpositions(0) != 0)
+
+    const std::uint64_t dataLength =
+            pageChunk_.has_isnulloffset()
+            ? pageChunk_.isnulloffset()
+            : pageChunk_.chunklength();
+    std::uint64_t nullBitmapBytes = 0;
+    std::uint32_t previousPosition = 0;
+    for (std::uint64_t pixel = 0; pixel < pixelCount; ++pixel)
+    {
+        const int pixelIndex = static_cast<int>(pixel);
+        const proto::PixelStatistic &statistics =
+                pageChunk_.pixelstatistics(pixelIndex);
+        if (!statistics.has_statistic()
+            || !statistics.statistic().has_hasnull())
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "pixel is missing explicit null statistics");
+        }
+        const std::uint32_t position =
+                pageChunk_.pixelpositions(pixelIndex);
+        if ((pixel == 0 && position != 0)
+            || (pixel != 0 && position < previousPosition)
+            || position > dataLength)
+        {
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "pixel positions are unordered or outside column data");
+        }
+        previousPosition = position;
+        if (statistics.statistic().hasnull())
+        {
+            const std::uint64_t pixelStart = pixel * pixelStride;
+            const std::uint64_t rows = std::min<std::uint64_t>(
+                    pixelStride, rowGroupRows - pixelStart);
+            const std::uint64_t bitmapBytes =
+                    rows / 8U + (rows % 8U == 0 ? 0U : 1U);
+            if (!format::checkedAdd(
+                        nullBitmapBytes, bitmapBytes, nullBitmapBytes))
+            {
+                return format::fail(
+                        error_, format::ErrorCode::OUT_OF_BOUNDS,
+                        "pixel null bitmap byte count overflows");
+            }
+        }
+    }
+    if (nullBitmapBytes != 0 && !pageChunk_.has_isnulloffset())
     {
         return format::fail(
                 error_, format::ErrorCode::MALFORMED_PROTOBUF,
-                "first pixel position is missing or nonzero");
+                "null-containing chunk has no null bitmap offset");
+    }
+    std::uint64_t nullBitmapEnd = 0;
+    if (!format::checkedAdd(dataLength, nullBitmapBytes, nullBitmapEnd)
+        || nullBitmapEnd > pageChunk_.chunklength())
+    {
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "pixel null bitmaps exceed the column chunk");
+    }
+
+    const std::uint64_t firstPixel =
+            pageRequest_.rowOffset / pixelStride;
+    if (firstPixel > std::numeric_limits<std::uint32_t>::max())
+    {
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "page pixel index exceeds the supported range");
+    }
+    pageRequest_.nullBitmapByteOffset = 0;
+    for (std::uint64_t pixel = 0; pixel < firstPixel; ++pixel)
+    {
+        if (!pixelHasNull(pageChunk_, static_cast<std::uint32_t>(pixel)))
+        {
+            continue;
+        }
+        const std::uint64_t pixelStart = pixel * pixelStride;
+        const std::uint64_t rows = std::min<std::uint64_t>(
+                pixelStride, rowGroupRows - pixelStart);
+        const std::uint64_t bitmapBytes =
+                rows / 8U + (rows % 8U == 0 ? 0U : 1U);
+        pageRequest_.nullBitmapByteOffset += bitmapBytes;
     }
     return true;
 }
@@ -657,6 +842,39 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
     const bool littleEndian =
             pageChunk_.has_littleendian() && pageChunk_.littleendian();
     std::vector<std::string> physicalValues(pagePlan_.physicalCount);
+    if (usesRunLengthEncoding())
+    {
+        std::vector<std::int64_t> pixelValues(
+                pagePlan_.pixelPhysicalCount);
+        std::size_t consumedBytes = 0;
+        if (!format::RunLengthIntDecoder::decode(
+                    bytes, true, pixelValues.size(),
+                    pixelValues.data(), pixelValues.size(),
+                    consumedBytes, error_))
+        {
+            state_ = State::FAILED;
+            return false;
+        }
+        std::uint64_t physicalEnd = 0;
+        if (!format::checkedAdd(
+                    pagePlan_.physicalOffset, pagePlan_.physicalCount,
+                    physicalEnd)
+            || physicalEnd > pixelValues.size())
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "RLE page values exceed the decoded pixel");
+        }
+        for (std::size_t index = 0;
+             index < physicalValues.size(); ++index)
+        {
+            physicalValues[index] = quoteInteger(
+                    pixelValues[pagePlan_.physicalOffset + index]);
+        }
+        return finishCurrentPixel(physicalValues);
+    }
+
     bool decoded = false;
     switch (type.kind())
     {
@@ -804,21 +1022,35 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
         state_ = State::FAILED;
         return false;
     }
-    const bool nullsPadding =
-            pageChunk_.has_nullspadding() && pageChunk_.nullspadding();
-    std::vector<std::string> values(pageRequest_.rowCount);
+    return finishCurrentPixel(physicalValues);
+}
+
+bool InspectionSession::finishCurrentPixel(
+        const std::vector<std::string> &physicalValues)
+{
+    const bool nullsPadding = usesNullPadding();
     std::size_t physicalIndex = 0;
-    for (std::size_t index = 0; index < values.size(); ++index)
+    for (std::uint32_t index = 0;
+         index < pageRequest_.pixelRowCount; ++index)
     {
-        if (pageValidity_[index])
+        const std::size_t resultIndex =
+                static_cast<std::size_t>(pageRequest_.resultOffset) + index;
+        if (pageValidity_[resultIndex])
         {
-            values[index] = physicalValues[physicalIndex];
+            if (physicalIndex >= physicalValues.size())
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                        "plain scalar physical values end before the pixel");
+            }
+            pageValues_[resultIndex] = physicalValues[physicalIndex];
         }
         else
         {
-            values[index] = "null";
+            pageValues_[resultIndex] = "null";
         }
-        if (nullsPadding || pageValidity_[index])
+        if (nullsPadding || pageValidity_[resultIndex])
         {
             ++physicalIndex;
         }
@@ -830,9 +1062,150 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
                 error_, format::ErrorCode::MALFORMED_PROTOBUF,
                 "plain scalar physical value count is inconsistent");
     }
-    buildPageResult(values);
-    state_ = State::PAGE_READY;
+    return advancePixel();
+}
+
+bool InspectionSession::usesRunLengthEncoding() const
+{
+    const proto::RowGroupEncoding &encodings =
+            rowGroupFooter_.rowgroupencoding();
+    return pageRequest_.column
+           < static_cast<std::uint32_t>(
+                   encodings.columnchunkencodings_size())
+           && encodings.columnchunkencodings(
+                      static_cast<int>(pageRequest_.column)).has_kind()
+           && encodings.columnchunkencodings(
+                      static_cast<int>(pageRequest_.column)).kind()
+              == proto::ColumnEncoding_Kind_RUNLENGTH;
+}
+
+bool InspectionSession::usesNullPadding() const
+{
+    return !usesRunLengthEncoding()
+           && pageChunk_.has_nullspadding()
+           && pageChunk_.nullspadding();
+}
+
+bool InspectionSession::advancePixel()
+{
+    std::uint32_t pixelRows = 0;
+    if (!currentPixelRows(pixelRows))
+    {
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "page pixel is outside the row group");
+    }
+    if (pixelHasNull(pageChunk_, pageRequest_.pixel))
+    {
+        const std::uint64_t bitmapBytes =
+                pixelRows / 8U + (pixelRows % 8U == 0 ? 0U : 1U);
+        if (!format::checkedAdd(
+                    pageRequest_.nullBitmapByteOffset, bitmapBytes,
+                    pageRequest_.nullBitmapByteOffset))
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "pixel null bitmap offset overflows");
+        }
+    }
+
+    pageRequest_.resultOffset += pageRequest_.pixelRowCount;
+    if (pageRequest_.resultOffset == pageRequest_.rowCount)
+    {
+        buildPageResult(pageValues_);
+        state_ = State::PAGE_READY;
+        return true;
+    }
+    if (pageRequest_.pixel
+        == std::numeric_limits<std::uint32_t>::max())
+    {
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "page pixel index overflows");
+    }
+    ++pageRequest_.pixel;
+    pageRequest_.pixelRowOffset = 0;
+    return requestCurrentPixel();
+}
+
+bool InspectionSession::currentPixelRows(std::uint32_t &rows) const
+{
+    const std::uint64_t pixelStride =
+            fileTail_.postscript().pixelstride();
+    const std::uint64_t rowGroupRows =
+            fileTail_.footer().rowgroupinfos(
+                    static_cast<int>(pageRequest_.rowGroup)).numberofrows();
+    std::uint64_t pixelStart = 0;
+    if (pixelStride == 0
+        || !checkedMultiply(pageRequest_.pixel, pixelStride, pixelStart)
+        || pixelStart >= rowGroupRows)
+    {
+        rows = 0;
+        return false;
+    }
+    rows = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                    pixelStride, rowGroupRows - pixelStart));
     return true;
+}
+
+bool InspectionSession::currentPixelDataRange(
+        std::uint64_t &offset, std::uint64_t &length) const
+{
+    if (pageRequest_.pixel
+        >= static_cast<std::uint32_t>(
+                pageChunk_.pixelpositions_size()))
+    {
+        return false;
+    }
+    offset = pageChunk_.pixelpositions(
+            static_cast<int>(pageRequest_.pixel));
+    const std::uint64_t end =
+            pageRequest_.pixel + 1U
+                    < static_cast<std::uint32_t>(
+                              pageChunk_.pixelpositions_size())
+            ? pageChunk_.pixelpositions(
+                    static_cast<int>(pageRequest_.pixel + 1U))
+            : (pageChunk_.has_isnulloffset()
+               ? pageChunk_.isnulloffset()
+               : pageChunk_.chunklength());
+    if (end < offset)
+    {
+        return false;
+    }
+    length = end - offset;
+    return true;
+}
+
+bool InspectionSession::currentNullBitmapRange(
+        format::FileRange &range) const
+{
+    if (!pageChunk_.has_isnulloffset())
+    {
+        return false;
+    }
+    std::uint32_t pixelRows = 0;
+    if (!currentPixelRows(pixelRows))
+    {
+        return false;
+    }
+    const std::uint64_t bitmapBytes =
+            pixelRows / 8U + (pixelRows % 8U == 0 ? 0U : 1U);
+    std::uint64_t chunkOffset = 0;
+    std::uint64_t chunkEnd = 0;
+    if (!format::checkedAdd(
+                pageChunk_.isnulloffset(),
+                pageRequest_.nullBitmapByteOffset, chunkOffset)
+        || !format::checkedAdd(chunkOffset, bitmapBytes, chunkEnd)
+        || chunkEnd > pageChunk_.chunklength()
+        || !format::checkedAdd(
+                pageChunk_.chunkoffset(), chunkOffset, range.offset))
+    {
+        return false;
+    }
+    range.length = bitmapBytes;
+    return format::isRangeWithinFile(range, fileSize_);
 }
 
 bool InspectionSession::transitionFailure(

@@ -27,6 +27,7 @@ struct PlainPixelPlan
 {
     std::uint32_t physicalOffset = 0;
     std::uint32_t physicalCount = 0;
+    std::uint32_t pixelPhysicalCount = 0;
 };
 
 class PlainPixelPlanner
