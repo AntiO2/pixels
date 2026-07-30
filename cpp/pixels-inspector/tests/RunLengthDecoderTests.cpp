@@ -4,6 +4,7 @@
  * Native conformance tests for the portable Pixels RLEv2 decoder.
  */
 
+#include "format/RunLengthByteDecoder.h"
 #include "format/RunLengthIntDecoder.h"
 
 #include <algorithm>
@@ -127,6 +128,41 @@ void testMalformedStreams()
             "null RLE destination was not rejected");
 }
 
+void testByteEncoding()
+{
+    {
+        const std::uint8_t encoded[] = {
+                0x02, 0xFE,
+                0xFD, 0x01, 0xFF, 0x02};
+        const std::int8_t expected[] = {
+                -2, -2, -2, -2, -2, 1, -1, 2};
+        std::int8_t actual[8] = {};
+        std::size_t consumed = 0;
+        pixels::format::FormatError error;
+        require(pixels::format::RunLengthByteDecoder::decode(
+                        pixels::format::ByteSpan(
+                                encoded, sizeof(encoded)),
+                        8, actual, 8, consumed, error)
+                && std::equal(actual, actual + 8, expected)
+                && consumed == sizeof(encoded),
+                "RLE byte repeat/literal stream differs");
+    }
+    {
+        const std::uint8_t truncated[] = {0xFE, 0x01};
+        std::int8_t actual[2] = {};
+        std::size_t consumed = 7;
+        pixels::format::FormatError error;
+        require(!pixels::format::RunLengthByteDecoder::decode(
+                        pixels::format::ByteSpan(
+                                truncated, sizeof(truncated)),
+                        2, actual, 2, consumed, error)
+                && error.code
+                   == pixels::format::ErrorCode::OUT_OF_BOUNDS
+                && consumed == 0,
+                "truncated RLE byte literals were not rejected");
+    }
+}
+
 } // namespace
 
 int main()
@@ -137,6 +173,7 @@ int main()
         testMultipleRuns();
         testInt64Boundaries();
         testMalformedStreams();
+        testByteEncoding();
         std::cout << "pixels-inspector RLE conformance: PASS\n";
         return EXIT_SUCCESS;
     }

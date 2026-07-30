@@ -125,7 +125,9 @@ add_library(pixels-format STATIC
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainPixelPlanner.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainScalarDecoder.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainLongDecoder.cpp"
-    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/RunLengthIntDecoder.cpp")
+    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/RunLengthByteDecoder.cpp"
+    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/RunLengthIntDecoder.cpp"
+    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/VariableLengthDecoder.cpp")
 target_include_directories(pixels-format PUBLIC
     "${PIXELS_CPP_ROOT}/pixels-core/include")
 target_link_libraries(pixels-format PUBLIC pixels-inspector-proto)
@@ -201,6 +203,21 @@ if(PIXELS_INSPECTOR_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     add_test(
         NAME pixels-inspector-rle-tests
         COMMAND pixels-inspector-rle-tests)
+
+    add_executable(
+        pixels-inspector-variable-tests
+        tests/VariableLengthDecoderTests.cpp)
+    target_link_libraries(
+        pixels-inspector-variable-tests PRIVATE pixels-format)
+    if(PIXELS_INSPECTOR_ENABLE_SANITIZERS)
+        target_compile_options(pixels-inspector-variable-tests PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(pixels-inspector-variable-tests PRIVATE
+            -fsanitize=address,undefined)
+    endif()
+    add_test(
+        NAME pixels-inspector-variable-tests
+        COMMAND pixels-inspector-variable-tests)
 endif()
 
 if(EMSCRIPTEN)

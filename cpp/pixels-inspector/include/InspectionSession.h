@@ -16,6 +16,7 @@
 #include "format/ByteReader.h"
 #include "format/FormatError.h"
 #include "format/PlainPixelPlanner.h"
+#include "format/VariableLengthDecoder.h"
 #include "pixels.pb.h"
 
 #include <cstddef>
@@ -43,7 +44,14 @@ public:
         AWAITING_COLUMN_CHUNK = 6,
         PAGE_READY = 7,
         CANCELLED = 8,
-        FAILED = 9
+        FAILED = 9,
+        AWAITING_PREFIX_NULL_BITMAP = 10,
+        AWAITING_VARIABLE_TRAILER = 11,
+        AWAITING_VARIABLE_STARTS = 12,
+        AWAITING_VARIABLE_CONTENT = 13,
+        AWAITING_DICTIONARY_TRAILER = 14,
+        AWAITING_DICTIONARY_STARTS = 15,
+        AWAITING_DICTIONARY_CONTENT = 16
     };
 
     explicit InspectionSession(std::uint64_t fileSize);
@@ -94,6 +102,8 @@ private:
         std::uint32_t pixelRowCount = 0;
         std::uint32_t resultOffset = 0;
         std::uint64_t nullBitmapByteOffset = 0;
+        std::uint64_t pixelPhysicalBase = 0;
+        std::uint64_t variableContentBase = 0;
     };
 
     [[nodiscard]] bool consumeTailPointer(const format::ByteSpan &bytes);
@@ -101,11 +111,34 @@ private:
     [[nodiscard]] bool consumeRowGroupFooter(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeNullBitmap(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeColumnChunk(const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumePrefixNullBitmap(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeVariableTrailer(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeVariableStarts(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeVariableContent(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeDictionaryTrailer(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeDictionaryStarts(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeDictionaryContent(
+            const format::ByteSpan &bytes);
     [[nodiscard]] bool validatePageRequest();
+    [[nodiscard]] bool preparePageLayout();
     [[nodiscard]] bool requestCurrentPixel();
     [[nodiscard]] bool requestPixelValues();
+    [[nodiscard]] bool requestVariableValues();
+    [[nodiscard]] bool finishVariableValues(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool computeVariablePhysicalBase(
+            const format::ByteSpan &prefixNullBitmaps);
     [[nodiscard]] bool usesRunLengthEncoding() const;
+    [[nodiscard]] bool usesCascadeRunLengthEncoding() const;
     [[nodiscard]] bool usesNullPadding() const;
+    [[nodiscard]] bool isPlainVariablePage() const;
+    [[nodiscard]] bool isDictionaryPage() const;
     [[nodiscard]] bool finishCurrentPixel(
             const std::vector<std::string> &physicalValues);
     [[nodiscard]] bool advancePixel();
@@ -134,6 +167,11 @@ private:
     PageRequest pageRequest_;
     proto::ColumnChunkIndex pageChunk_;
     format::PlainPixelPlan pagePlan_;
+    format::PlainVariableLayout variableLayout_;
+    format::DictionaryVariableLayout dictionaryLayout_;
+    std::vector<format::VariableValueRange> variableRanges_;
+    std::vector<format::VariableValueRange> dictionaryRanges_;
+    std::vector<std::uint8_t> dictionaryContent_;
     std::unique_ptr<bool[]> pageValidity_;
     std::vector<std::string> pageValues_;
     std::string result_;

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <functional>
 #include <fstream>
@@ -175,23 +176,40 @@ void appendLittleInt64(
     }
 }
 
-void appendDirectRleInt64(
-        std::vector<std::uint8_t> &bytes,
-        const std::vector<std::int64_t> &values)
+void appendLittleUint32(
+        std::vector<std::uint8_t> &bytes, std::uint32_t value)
 {
-    require(!values.empty() && values.size() <= 512,
-            "RLE test run length is invalid");
-    std::vector<std::uint64_t> encoded(values.size());
-    std::uint64_t maximum = 0;
-    for (std::size_t index = 0; index < values.size(); ++index)
+    for (std::uint32_t byte = 0; byte < 4; ++byte)
     {
-        const std::uint64_t bits =
-                static_cast<std::uint64_t>(values[index]);
-        encoded[index] =
-                (bits << 1U)
-                ^ (static_cast<std::uint64_t>(0)
-                   - (bits >> 63U));
-        maximum = std::max(maximum, encoded[index]);
+        bytes.push_back(static_cast<std::uint8_t>(
+                value >> (byte * 8U)));
+    }
+}
+
+void appendBigDouble(
+        std::vector<std::uint8_t> &bytes, double value)
+{
+    std::uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value),
+                  "VECTOR fixture requires binary64");
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        bytes.push_back(static_cast<std::uint8_t>(
+                bits >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+}
+
+void appendDirectRleValues(
+        std::vector<std::uint8_t> &bytes,
+        const std::vector<std::uint64_t> &encoded)
+{
+    require(!encoded.empty() && encoded.size() <= 512,
+            "RLE test run length is invalid");
+    std::uint64_t maximum = 0;
+    for (const std::uint64_t value : encoded)
+    {
+        maximum = std::max(maximum, value);
     }
     std::uint32_t width = 1;
     while (width < 24U && (maximum >> width) != 0)
@@ -201,7 +219,7 @@ void appendDirectRleInt64(
     require(width <= 24U, "RLE test value exceeds the compact helper");
     const std::uint32_t encodedWidth = width - 1U;
     const std::uint32_t encodedLength =
-            static_cast<std::uint32_t>(values.size() - 1U);
+            static_cast<std::uint32_t>(encoded.size() - 1U);
     bytes.push_back(static_cast<std::uint8_t>(
             0x40U | (encodedWidth << 1U)
             | ((encodedLength >> 8U) & 1U)));
@@ -230,6 +248,32 @@ void appendDirectRleInt64(
         bytes.push_back(static_cast<std::uint8_t>(
                 packed << (8U - packedBits)));
     }
+}
+
+void appendDirectRleInt64(
+        std::vector<std::uint8_t> &bytes,
+        const std::vector<std::int64_t> &values)
+{
+    std::vector<std::uint64_t> encoded(values.size());
+    for (std::size_t index = 0; index < values.size(); ++index)
+    {
+        const std::uint64_t bits =
+                static_cast<std::uint64_t>(values[index]);
+        encoded[index] =
+                (bits << 1U)
+                ^ (static_cast<std::uint64_t>(0)
+                   - (bits >> 63U));
+    }
+    appendDirectRleValues(bytes, encoded);
+}
+
+void appendDirectRleUint32(
+        std::vector<std::uint8_t> &bytes,
+        const std::vector<std::uint32_t> &values)
+{
+    std::vector<std::uint64_t> encoded(
+            values.begin(), values.end());
+    appendDirectRleValues(bytes, encoded);
 }
 
 std::vector<std::uint8_t> makeMultiPixelLongFixture(
@@ -332,6 +376,519 @@ std::vector<std::uint8_t> makeMultiPixelLongFixture(
     std::string serializedTail;
     require(fileTail.SerializeToString(&serializedTail),
             "unable to serialize multi-pixel FileTail");
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
+std::vector<std::uint8_t> makeMultiPixelVarcharFixture()
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse VARCHAR fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse VARCHAR fixture FileTail");
+
+    std::vector<std::uint8_t> columnData = {
+            'a', 'c', 'c', 'c', 'd', 'e', 'e', 'f', 'g', 'g',
+            0x02, 0x04, 0x01};
+    const std::uint32_t starts[] = {0, 1, 1, 4, 5, 7, 8, 10};
+    for (const std::uint32_t start : starts)
+    {
+        appendLittleUint32(columnData, start);
+    }
+    appendLittleUint32(columnData, 13);
+
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->set_isnulloffset(10);
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->add_pixelpositions(4);
+    chunk->add_pixelpositions(8);
+    chunk->clear_pixelstatistics();
+    for (std::uint32_t pixel = 0; pixel < 3; ++pixel)
+    {
+        pixels::proto::ColumnStatistic *statistic =
+                chunk->add_pixelstatistics()->mutable_statistic();
+        statistic->set_numberofvalues(pixel == 2 ? 2 : 4);
+        statistic->set_hasnull(true);
+    }
+    chunk->set_littleendian(true);
+    chunk->set_nullspadding(false);
+    rowGroupFooter.mutable_rowgroupencoding()
+            ->mutable_columnchunkencodings(0)
+            ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(pixels::proto::Type_Kind_VARCHAR);
+    type->set_name("name");
+    type->set_maximumlength(16);
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(4);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize VARCHAR fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize VARCHAR fixture FileTail");
+
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
+std::vector<std::uint8_t> makeBinaryFixture()
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse binary fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse binary fixture FileTail");
+
+    std::vector<std::uint8_t> columnData = {
+            2, 0x00, 0xFF,
+            0,
+            1, 1,
+            1, 2,
+            1, 3,
+            1, 4,
+            1, 5,
+            1, 6,
+            1, 7,
+            0x02, 0x00};
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->set_isnulloffset(18);
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->clear_pixelstatistics();
+    pixels::proto::ColumnStatistic *statistic =
+            chunk->add_pixelstatistics()->mutable_statistic();
+    statistic->set_numberofvalues(10);
+    statistic->set_hasnull(true);
+    chunk->set_littleendian(true);
+    chunk->set_nullspadding(true);
+    rowGroupFooter.mutable_rowgroupencoding()
+            ->mutable_columnchunkencodings(0)
+            ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(pixels::proto::Type_Kind_VARBINARY);
+    type->set_name("payload");
+    type->set_maximumlength(7);
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize binary fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize binary fixture FileTail");
+
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
+std::vector<std::uint8_t> makeVectorFixture()
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse VECTOR fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse VECTOR fixture FileTail");
+
+    std::vector<std::uint8_t> columnData;
+    for (std::uint32_t row = 0; row < 10; ++row)
+    {
+        if (row == 2)
+        {
+            appendBigDouble(
+                    columnData,
+                    std::numeric_limits<double>::quiet_NaN());
+            appendBigDouble(
+                    columnData,
+                    std::numeric_limits<double>::infinity());
+        }
+        else
+        {
+            appendBigDouble(columnData, row * 2.0 + 1.0);
+            appendBigDouble(columnData, row * 2.0 + 2.0);
+        }
+    }
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->set_isnulloffset(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->clear_pixelstatistics();
+    pixels::proto::ColumnStatistic *statistic =
+            chunk->add_pixelstatistics()->mutable_statistic();
+    statistic->set_numberofvalues(10);
+    statistic->set_hasnull(false);
+    chunk->set_littleendian(false);
+    chunk->set_nullspadding(false);
+    rowGroupFooter.mutable_rowgroupencoding()
+            ->mutable_columnchunkencodings(0)
+            ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(pixels::proto::Type_Kind_VECTOR);
+    type->set_name("embedding");
+    type->set_dimension(2);
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize VECTOR fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize VECTOR fixture FileTail");
+
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
+std::vector<std::uint8_t> makeDictionaryFixture(bool cascadeRle)
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse dictionary fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse dictionary fixture FileTail");
+
+    std::vector<std::uint8_t> columnData;
+    if (cascadeRle)
+    {
+        appendDirectRleUint32(
+                columnData, {1, 2, 1, 2, 1, 2, 1, 2, 1});
+    }
+    else
+    {
+        const std::uint32_t ids[] = {
+                1, 0, 2, 1, 2, 1, 2, 1, 2, 1};
+        for (const std::uint32_t id : ids)
+        {
+            appendLittleUint32(columnData, id);
+        }
+    }
+    const std::uint32_t nullOffset =
+            static_cast<std::uint32_t>(columnData.size());
+    columnData.push_back(0x02);
+    columnData.push_back(0x00);
+    const std::uint32_t dictionaryContentOffset =
+            static_cast<std::uint32_t>(columnData.size());
+    columnData.insert(
+            columnData.end(),
+            {'c', 'a', 't', 'd', 'o', 'g'});
+    const std::uint32_t dictionaryStartsOffset =
+            static_cast<std::uint32_t>(columnData.size());
+    if (cascadeRle)
+    {
+        appendDirectRleUint32(columnData, {0, 0, 3, 6});
+    }
+    else
+    {
+        for (const std::uint32_t start :
+             std::vector<std::uint32_t>{0, 0, 3, 6})
+        {
+            appendLittleUint32(columnData, start);
+        }
+    }
+    appendLittleUint32(columnData, dictionaryContentOffset);
+    appendLittleUint32(columnData, dictionaryStartsOffset);
+
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->set_isnulloffset(nullOffset);
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->clear_pixelstatistics();
+    pixels::proto::ColumnStatistic *statistic =
+            chunk->add_pixelstatistics()->mutable_statistic();
+    statistic->set_numberofvalues(10);
+    statistic->set_hasnull(true);
+    chunk->set_littleendian(true);
+    chunk->set_nullspadding(true);
+
+    pixels::proto::ColumnEncoding *encoding =
+            rowGroupFooter.mutable_rowgroupencoding()
+                    ->mutable_columnchunkencodings(0);
+    encoding->set_kind(
+            pixels::proto::ColumnEncoding_Kind_DICTIONARY);
+    encoding->set_dictionarysize(3);
+    encoding->clear_cascadeencoding();
+    if (cascadeRle)
+    {
+        encoding->mutable_cascadeencoding()->set_kind(
+                pixels::proto::ColumnEncoding_Kind_RUNLENGTH);
+    }
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(pixels::proto::Type_Kind_VARCHAR);
+    type->set_name("animal");
+    type->set_maximumlength(8);
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize dictionary fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize dictionary fixture FileTail");
+
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
+std::vector<std::uint8_t> makeLongDecimalFixture()
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse long DECIMAL fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse long DECIMAL fixture FileTail");
+
+    std::vector<std::uint8_t> columnData;
+    appendLittleInt64(columnData, 0);
+    appendLittleInt64(columnData, 123456);
+    appendLittleInt64(columnData, -1);
+    appendLittleInt64(columnData, -1);
+    for (std::uint32_t row = 2; row < 10; ++row)
+    {
+        appendLittleInt64(columnData, 0);
+        appendLittleInt64(columnData, 0);
+    }
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->set_isnulloffset(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->clear_pixelstatistics();
+    pixels::proto::ColumnStatistic *statistic =
+            chunk->add_pixelstatistics()->mutable_statistic();
+    statistic->set_numberofvalues(10);
+    statistic->set_hasnull(false);
+    chunk->set_littleendian(true);
+    chunk->set_nullspadding(false);
+    rowGroupFooter.mutable_rowgroupencoding()
+            ->mutable_columnchunkencodings(0)
+            ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(pixels::proto::Type_Kind_DECIMAL);
+    type->set_name("amount");
+    type->set_precision(38);
+    type->set_scale(4);
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize long DECIMAL fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize long DECIMAL fixture FileTail");
+
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
+}
+
+std::vector<std::uint8_t> makeByteRleFixture()
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse BYTE RLE fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse BYTE RLE fixture FileTail");
+
+    std::vector<std::uint8_t> columnData = {
+            0x00, 0x01,
+            0xFA, 0xFE, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x02, 0x00};
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(
+            static_cast<std::uint32_t>(columnData.size()));
+    chunk->set_isnulloffset(9);
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->clear_pixelstatistics();
+    pixels::proto::ColumnStatistic *statistic =
+            chunk->add_pixelstatistics()->mutable_statistic();
+    statistic->set_numberofvalues(10);
+    statistic->set_hasnull(true);
+    chunk->set_littleendian(true);
+    chunk->set_nullspadding(true);
+    rowGroupFooter.mutable_rowgroupencoding()
+            ->mutable_columnchunkencodings(0)
+            ->set_kind(pixels::proto::ColumnEncoding_Kind_RUNLENGTH);
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(pixels::proto::Type_Kind_BYTE);
+    type->set_name("tiny");
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(10);
+    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_numberofrows(10);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize BYTE RLE fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize BYTE RLE fixture FileTail");
+
     std::vector<std::uint8_t> file(canonical.begin(),
                                    canonical.begin() + 352);
     std::copy(columnData.begin(), columnData.end(), file.begin());
@@ -511,12 +1068,34 @@ void testGenericPlainScalarPages()
         Session session(file.size());
         driveMetadata(session, file);
         require(pixels_inspector_begin_page(
-                        session.handle(), 0, 1, 0, 1)
+                        session.handle(), 0, 1, 8, 2)
                 == PIXELS_INSPECTOR_RANGE_READY,
                 "VARCHAR page did not request its row-group footer");
         require(supply(session, nextRange(session), file)
-                == PIXELS_INSPECTOR_UNSUPPORTED_TYPE,
-                "VARCHAR was accepted as a plain scalar");
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "VARCHAR footer did not request its layout trailer");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 187 && range.length == 4,
+                "VARCHAR trailer range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "VARCHAR trailer did not request starts");
+        range = nextRange(session);
+        require(range.offset == 175 && range.length == 12,
+                "VARCHAR starts range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "VARCHAR starts did not request content");
+        range = nextRange(session);
+        require(range.offset == 130 && range.length == 13,
+                "VARCHAR content range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "VARCHAR content did not produce a page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":1,\"offset\":8,\"count\":2,"
+                   "\"values\":[\"Liangyong\",\"Eric\"]}",
+                "VARCHAR page differs from the golden");
     }
     {
         std::vector<std::uint8_t> nullFile = file;
@@ -817,6 +1396,240 @@ void testMultiPixelRunLengthPages()
                 == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
                 "truncated RLE pixel was not rejected");
     }
+}
+
+void testMultiPixelVariablePages()
+{
+    const std::vector<std::uint8_t> file =
+            makeMultiPixelVarcharFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 4, 6)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR multi-pixel page did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR footer did not request its trailer");
+    pixels::format::FileRange range = nextRange(session);
+    require(range.offset == 45 && range.length == 4,
+            "VARCHAR fixture trailer range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR trailer did not request the prefix bitmap");
+    range = nextRange(session);
+    require(range.offset == 10 && range.length == 1,
+            "VARCHAR prefix bitmap range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR prefix bitmap did not request the current bitmap");
+    range = nextRange(session);
+    require(range.offset == 11 && range.length == 1,
+            "VARCHAR current bitmap range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR bitmap did not request starts");
+    range = nextRange(session);
+    require(range.offset == 25 && range.length == 16,
+            "VARCHAR first starts range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR starts did not request content");
+    range = nextRange(session);
+    require(range.offset == 4 && range.length == 4,
+            "VARCHAR first content range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR first content did not request final bitmap");
+    range = nextRange(session);
+    require(range.offset == 12 && range.length == 1,
+            "VARCHAR final bitmap range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR final bitmap did not request starts");
+    range = nextRange(session);
+    require(range.offset == 37 && range.length == 8,
+            "VARCHAR final starts range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARCHAR final starts did not request content");
+    range = nextRange(session);
+    require(range.offset == 8 && range.length == 2,
+            "VARCHAR final content range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "VARCHAR final content did not finish the page");
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":4,\"count\":6,"
+               "\"values\":[\"d\",\"ee\",null,\"f\",null,\"gg\"]}",
+            "VARCHAR multi-pixel page differs from the golden");
+}
+
+void testBinaryPage()
+{
+    const std::vector<std::uint8_t> file = makeBinaryFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 0, 4)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARBINARY page did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARBINARY footer did not request its bitmap");
+    pixels::format::FileRange range = nextRange(session);
+    require(range.offset == 18 && range.length == 2,
+            "VARBINARY bitmap range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VARBINARY bitmap did not request its pixel");
+    range = nextRange(session);
+    require(range.offset == 0 && range.length == 18,
+            "VARBINARY pixel range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "VARBINARY pixel did not produce a page");
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":4,"
+               "\"values\":[\"AP8=\",null,\"\",\"AQ==\"]}",
+            "VARBINARY page differs from the golden");
+}
+
+void testVectorPage()
+{
+    const std::vector<std::uint8_t> file = makeVectorFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 1, 2)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VECTOR page did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "VECTOR footer did not request its values");
+    const pixels::format::FileRange range = nextRange(session);
+    require(range.offset == 16 && range.length == 32,
+            "VECTOR value range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "VECTOR bytes did not produce a page");
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":1,\"count\":2,"
+               "\"values\":[[3,4],[\"NaN\",\"Infinity\"]]}",
+            "VECTOR page differs from the golden");
+}
+
+void testDictionaryPages()
+{
+    for (const bool cascadeRle : {false, true})
+    {
+        const std::vector<std::uint8_t> file =
+                makeDictionaryFixture(cascadeRle);
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 4)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "dictionary page did not request its footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "dictionary footer did not request its trailer");
+        pixels::format::FileRange range = nextRange(session);
+        require(range.offset == (cascadeRle ? 17U : 64U)
+                && range.length == 8,
+                "dictionary trailer range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "dictionary trailer did not request starts");
+        range = nextRange(session);
+        require(range.offset == (cascadeRle ? 13U : 48U)
+                && range.length == (cascadeRle ? 4U : 16U),
+                "dictionary starts range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "dictionary starts did not request content");
+        range = nextRange(session);
+        require(range.offset == (cascadeRle ? 7U : 42U)
+                && range.length == 6,
+                "dictionary content range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "dictionary content did not request the bitmap");
+        range = nextRange(session);
+        require(range.offset == (cascadeRle ? 5U : 40U)
+                && range.length == 2,
+                "dictionary bitmap range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "dictionary bitmap did not request IDs");
+        range = nextRange(session);
+        require(range.offset == 0
+                && range.length == (cascadeRle ? 5U : 40U),
+                "dictionary ID range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "dictionary IDs did not produce a page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":4,"
+                   "\"values\":[\"cat\",null,\"dog\",\"cat\"]}",
+                "dictionary page differs from the golden");
+    }
+}
+
+void testLongDecimalPage()
+{
+    const std::vector<std::uint8_t> file =
+            makeLongDecimalFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 0, 2)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "long DECIMAL page did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "long DECIMAL footer did not request values");
+    const pixels::format::FileRange range = nextRange(session);
+    require(range.offset == 0 && range.length == 32,
+            "long DECIMAL value range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "long DECIMAL bytes did not produce a page");
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":2,"
+               "\"values\":[\"12.3456\",\"-0.0001\"]}",
+            "long DECIMAL page differs from the golden");
+}
+
+void testByteRlePage()
+{
+    const std::vector<std::uint8_t> file =
+            makeByteRleFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, 0, 0, 5)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "BYTE RLE page did not request its footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "BYTE RLE footer did not request its bitmap");
+    pixels::format::FileRange range = nextRange(session);
+    require(range.offset == 9 && range.length == 2,
+            "BYTE RLE bitmap range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "BYTE RLE bitmap did not request content");
+    range = nextRange(session);
+    require(range.offset == 0 && range.length == 9,
+            "BYTE RLE content range is not exact");
+    require(supply(session, range, file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "BYTE RLE content did not produce a page");
+    require(readResult(session)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":5,"
+               "\"values\":[\"1\",null,\"1\",\"1\",\"-2\"]}",
+            "BYTE RLE page differs from the golden");
 }
 
 void testMultiPixelMalformedMetadata()
@@ -1530,6 +2343,12 @@ int main()
         testGenericPlainScalarPages();
         testMultiPixelPlainPages();
         testMultiPixelRunLengthPages();
+        testMultiPixelVariablePages();
+        testBinaryPage();
+        testVectorPage();
+        testDictionaryPages();
+        testLongDecimalPage();
+        testByteRlePage();
         testMultiPixelMalformedMetadata();
         testLifecycleAndBuffers();
         testInvalidRangeAndTerminalState();
