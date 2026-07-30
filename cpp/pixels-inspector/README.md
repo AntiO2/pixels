@@ -42,7 +42,7 @@ emcmake cmake -S cpp/pixels-inspector -B <wasm-build> \
   -DPIXELS_PROTOC_EXECUTABLE=<native-build>/third-party/protobuf/protoc
 cmake --build <wasm-build> --target pixels-inspector-wasm
 node cpp/pixels-inspector/tools/run_wasm_worker_conformance.cjs \
-  <wasm-build>/pixels-inspector-wasm.js \
+  <wasm-build>/pixels-inspector-wasm.cjs \
   cpp/tests/data/example.pxl
 ```
 

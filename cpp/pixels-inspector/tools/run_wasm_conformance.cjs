@@ -37,7 +37,7 @@ async function main() {
   const initializedAt = performance.now();
   const file = fs.readFileSync(fixturePath);
   requireCondition(file.length === 790, "canonical fixture length changed");
-  const wasmPath = modulePath.replace(/\.js$/, ".wasm");
+  const wasmPath = modulePath.replace(/\.(?:c?js)$/, ".wasm");
   const wasmBytes = fs.readFileSync(wasmPath);
   const rawWasmImports = WebAssembly.Module.imports(
     new WebAssembly.Module(wasmBytes),

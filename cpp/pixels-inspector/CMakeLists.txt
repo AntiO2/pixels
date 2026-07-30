@@ -189,7 +189,7 @@ endif()
 if(EMSCRIPTEN)
     add_executable(pixels-inspector-wasm tools/wasm_entry.cpp)
     target_link_libraries(pixels-inspector-wasm PRIVATE pixels-inspector)
-    set_target_properties(pixels-inspector-wasm PROPERTIES SUFFIX ".js")
+    set_target_properties(pixels-inspector-wasm PROPERTIES SUFFIX ".cjs")
     target_link_options(pixels-inspector-wasm PRIVATE
         "SHELL:--no-entry"
         "SHELL:-sFILESYSTEM=0"
@@ -199,6 +199,7 @@ if(EMSCRIPTEN)
         "SHELL:-sALLOW_MEMORY_GROWTH=1"
         "SHELL:-sINITIAL_MEMORY=16777216"
         "SHELL:-sMAXIMUM_MEMORY=268435456"
+        "SHELL:-sINCOMING_MODULE_JS_API=['wasmBinary','locateFile','print','printErr','noInitialRun']"
         "SHELL:-sEXPORTED_RUNTIME_METHODS=['HEAPU8']"
         "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_pixels_inspector_abi_version','_pixels_inspector_create','_pixels_inspector_destroy','_pixels_inspector_begin_metadata','_pixels_inspector_begin_plain_long_page','_pixels_inspector_next_range','_pixels_inspector_supply_range','_pixels_inspector_result_size','_pixels_inspector_copy_result','_pixels_inspector_error_size','_pixels_inspector_copy_error','_pixels_inspector_cancel']")
 endif()
