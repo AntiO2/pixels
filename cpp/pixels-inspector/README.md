@@ -52,10 +52,11 @@ The conformance runner validates the ABI, exact metadata/page output,
 cancellation, mismatched ranges, legacy LONG plus generic DATE output, bounded
 linear memory, and the Emscripten import allowlist.
 
-The generic page operation currently promotes null-free `NONE` scalar pages
-that remain within one pixel. Null streams, RLE, variable-width, vector, and
-nested values remain explicit follow-up work; the API returns an unsupported
-status instead of guessing their layout.
+The generic page operation currently promotes `NONE` scalar pages within one
+pixel, including padded and compacted null layouts with exact bitmap/value
+ranges. Multi-pixel pages, RLE, variable-width, vector, and nested values remain
+explicit follow-up work; the API returns an unsupported status instead of
+guessing their layout.
 
 ## Range protocol
 

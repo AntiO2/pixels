@@ -8,6 +8,7 @@
 
 #include "format/ByteReader.h"
 #include "format/PlainLongDecoder.h"
+#include "format/PlainPixelPlanner.h"
 #include "format/PlainScalarDecoder.h"
 #include "pixels.pb.h"
 
@@ -320,6 +321,47 @@ void testGenericPlainScalarPages()
                 == PIXELS_INSPECTOR_UNSUPPORTED_TYPE,
                 "VARCHAR was accepted as a plain scalar");
     }
+    {
+        std::vector<std::uint8_t> nullFile = file;
+        nullFile[80] = 0x04;
+        nullFile[81] = 0x00;
+        mutateRowGroupFooter(
+                nullFile, [](pixels::proto::RowGroupFooter &footer) {
+                    pixels::proto::ColumnChunkIndex *chunk =
+                            footer.mutable_rowgroupindexentry()
+                                    ->mutable_columnchunkindexentries(0);
+                    chunk->set_chunklength(82);
+                    chunk->mutable_pixelstatistics(0)
+                            ->mutable_statistic()
+                            ->set_hasnull(true);
+                });
+        Session session(nullFile.size());
+        driveMetadata(session, nullFile);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 10)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "null page did not request its row-group footer");
+        require(supply(session, nextRange(session), nullFile)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "null page did not request its bitmap");
+        const pixels::format::FileRange nullRange = nextRange(session);
+        require(nullRange.offset == 80 && nullRange.length == 2,
+                "null bitmap range is not exact");
+        require(supply(session, nullRange, nullFile)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "null bitmap did not produce a value range");
+        const pixels::format::FileRange valueRange = nextRange(session);
+        require(valueRange.offset == 0 && valueRange.length == 72,
+                "unpadded value range did not exclude the null");
+        require(supply(session, valueRange, nullFile)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "unpadded values did not produce a page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":10,"
+                   "\"values\":[\"0\",\"1\",null,\"2\",\"3\",\"4\",\"5\","
+                   "\"6\",\"7\",\"8\"]}",
+                "unpadded null page differs from the golden");
+    }
 }
 
 void testPlainLongDecoder()
@@ -473,6 +515,70 @@ void testPlainScalarDecoder()
                     false, 0, 2, doubleValues, 2, error)
             && error.code == pixels::format::ErrorCode::OUT_OF_BOUNDS,
             "truncated DOUBLE range was not rejected");
+}
+
+void testPlainPixelPlanner()
+{
+    pixels::format::FormatError error;
+    pixels::format::PlainPixelPlan plan;
+    bool validity[6] = {};
+
+    require(pixels::format::PlainPixelPlanner::plan(
+                    10, 3, 4, false, false, true,
+                    pixels::format::ByteSpan(), validity, 6,
+                    plan, error)
+            && plan.physicalOffset == 3
+            && plan.physicalCount == 4
+            && std::all_of(
+                    validity, validity + 4,
+                    [](bool value) { return value; }),
+            "null-free pixel plan differs");
+
+    const std::uint8_t littleNulls[] = {0x12, 0x01};
+    const bool expected[] = {true, true, false, true, true, true};
+    require(pixels::format::PlainPixelPlanner::plan(
+                    10, 2, 6, true, false, true,
+                    pixels::format::ByteSpan(
+                            littleNulls, sizeof(littleNulls)),
+                    validity, 6, plan, error)
+            && plan.physicalOffset == 1
+            && plan.physicalCount == 5
+            && std::equal(validity, validity + 6, expected),
+            "unpadded little-endian null plan differs");
+
+    require(pixels::format::PlainPixelPlanner::plan(
+                    10, 2, 6, true, true, true,
+                    pixels::format::ByteSpan(
+                            littleNulls, sizeof(littleNulls)),
+                    validity, 6, plan, error)
+            && plan.physicalOffset == 2
+            && plan.physicalCount == 6
+            && std::equal(validity, validity + 6, expected),
+            "padded null plan differs");
+
+    const std::uint8_t bigNulls[] = {0x48, 0x80};
+    require(pixels::format::PlainPixelPlanner::plan(
+                    10, 2, 6, true, false, false,
+                    pixels::format::ByteSpan(
+                            bigNulls, sizeof(bigNulls)),
+                    validity, 6, plan, error)
+            && plan.physicalOffset == 1
+            && plan.physicalCount == 5
+            && std::equal(validity, validity + 6, expected),
+            "unpadded big-endian null plan differs");
+
+    require(!pixels::format::PlainPixelPlanner::plan(
+                    10, 2, 6, true, false, true,
+                    pixels::format::ByteSpan(littleNulls, 1),
+                    validity, 6, plan, error)
+            && error.code == pixels::format::ErrorCode::INVALID_ARGUMENT,
+            "short null bitmap was not rejected");
+    require(!pixels::format::PlainPixelPlanner::plan(
+                    10, 8, 3, false, false, true,
+                    pixels::format::ByteSpan(), validity, 6,
+                    plan, error)
+            && error.code == pixels::format::ErrorCode::OUT_OF_BOUNDS,
+            "pixel row overflow was not rejected");
 }
 
 void testLifecycleAndBuffers()
@@ -726,8 +832,11 @@ void testUnsupportedPageShape()
                 == PIXELS_INSPECTOR_RANGE_READY,
                 "page did not request its footer");
         require(supply(session, nextRange(session), file)
-                == PIXELS_INSPECTOR_UNSUPPORTED_ENCODING,
-                "null-containing validation page was not rejected");
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "null-containing page did not request its bitmap");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_MALFORMED_PROTOBUF,
+                "inconsistent null bitmap was not rejected");
     }
     {
         std::vector<std::uint8_t> file = readFixture();
@@ -840,6 +949,7 @@ int main()
                 == PIXELS_INSPECTOR_ABI_VERSION,
                 "unexpected inspector ABI version");
         testPlainScalarDecoder();
+        testPlainPixelPlanner();
         testPlainLongDecoder();
         testCanonicalFixture();
         testBoundedPageRange();

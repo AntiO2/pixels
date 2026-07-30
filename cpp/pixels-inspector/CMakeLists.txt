@@ -122,6 +122,7 @@ target_link_libraries(pixels-inspector-proto PUBLIC libprotobuf-lite)
 
 add_library(pixels-format STATIC
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PixelsFormatReader.cpp"
+    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainPixelPlanner.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainScalarDecoder.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainLongDecoder.cpp")
 target_include_directories(pixels-format PUBLIC

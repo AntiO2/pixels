@@ -324,6 +324,8 @@ bool InspectionSession::supplyRange(
             return consumeFileTail(bytes);
         case State::AWAITING_ROW_GROUP_FOOTER:
             return consumeRowGroupFooter(bytes);
+        case State::AWAITING_NULL_BITMAP:
+            return consumeNullBitmap(bytes);
         case State::AWAITING_COLUMN_CHUNK:
             return consumeColumnChunk(bytes);
         case State::IDLE:
@@ -346,6 +348,7 @@ bool InspectionSession::cancel()
         case State::AWAITING_FILE_TAIL:
         case State::METADATA_READY:
         case State::AWAITING_ROW_GROUP_FOOTER:
+        case State::AWAITING_NULL_BITMAP:
         case State::AWAITING_COLUMN_CHUNK:
             state_ = State::CANCELLED;
             hasPendingRange_ = false;
@@ -404,6 +407,95 @@ bool InspectionSession::consumeRowGroupFooter(const format::ByteSpan &bytes)
         return false;
     }
 
+    pageValidity_.reset(new bool[pageRequest_.rowCount]);
+    const proto::RowGroupInformation &rowGroup =
+            fileTail_.footer().rowgroupinfos(
+                    static_cast<int>(pageRequest_.rowGroup));
+    const std::uint32_t pixelRows = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                    fileTail_.postscript().pixelstride(),
+                    rowGroup.numberofrows()));
+    if (pixelHasNull(pageChunk_, 0))
+    {
+        if (!pageChunk_.has_isnulloffset())
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "null-containing pixel has no null bitmap offset");
+        }
+        std::uint64_t nullFileOffset = 0;
+        if (!format::checkedAdd(
+                    pageChunk_.chunkoffset(), pageChunk_.isnulloffset(),
+                    nullFileOffset))
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "pixel null bitmap offset overflows");
+        }
+        const std::uint64_t nullBytes =
+                pixelRows / 8U + (pixelRows % 8U == 0 ? 0U : 1U);
+        setPendingRange(
+                format::FileRange{nullFileOffset, nullBytes},
+                State::AWAITING_NULL_BITMAP);
+        return true;
+    }
+
+    if (!format::PlainPixelPlanner::plan(
+                pixelRows,
+                static_cast<std::uint32_t>(pageRequest_.rowOffset),
+                pageRequest_.rowCount, false,
+                pageChunk_.has_nullspadding()
+                && pageChunk_.nullspadding(),
+                pageChunk_.has_littleendian()
+                && pageChunk_.littleendian(),
+                format::ByteSpan(), pageValidity_.get(),
+                pageRequest_.rowCount, pagePlan_, error_))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    return requestPlainValues();
+}
+
+bool InspectionSession::consumeNullBitmap(const format::ByteSpan &bytes)
+{
+    const proto::RowGroupInformation &rowGroup =
+            fileTail_.footer().rowgroupinfos(
+                    static_cast<int>(pageRequest_.rowGroup));
+    const std::uint32_t pixelRows = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                    fileTail_.postscript().pixelstride(),
+                    rowGroup.numberofrows()));
+    if (!format::PlainPixelPlanner::plan(
+                pixelRows,
+                static_cast<std::uint32_t>(pageRequest_.rowOffset),
+                pageRequest_.rowCount, true,
+                pageChunk_.has_nullspadding()
+                && pageChunk_.nullspadding(),
+                pageChunk_.has_littleendian()
+                && pageChunk_.littleendian(),
+                bytes, pageValidity_.get(), pageRequest_.rowCount,
+                pagePlan_, error_))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    return requestPlainValues();
+}
+
+bool InspectionSession::requestPlainValues()
+{
+    if (pagePlan_.physicalCount == 0)
+    {
+        buildPageResult(
+                std::vector<std::string>(
+                        pageRequest_.rowCount, "null"));
+        state_ = State::PAGE_READY;
+        return true;
+    }
+
     const proto::Type &type = fileTail_.footer().types(
             static_cast<int>(pageRequest_.column));
     std::uint64_t valueWidth = 0;
@@ -417,28 +509,32 @@ bool InspectionSession::consumeRowGroupFooter(const format::ByteSpan &bytes)
     std::uint64_t pageByteLength = 0;
     if (type.kind() == proto::Type_Kind_BOOLEAN)
     {
-        pageRequest_.bitOffset =
-                static_cast<std::uint32_t>(pageRequest_.rowOffset % 8U);
-        pageByteOffset = pageRequest_.rowOffset / 8U;
+        pageRequest_.bitOffset = pagePlan_.physicalOffset % 8U;
+        pageByteOffset = pagePlan_.physicalOffset / 8U;
         pageByteLength =
                 (static_cast<std::uint64_t>(pageRequest_.bitOffset)
-                 + pageRequest_.rowCount + 7U) / 8U;
+                 + pagePlan_.physicalCount + 7U) / 8U;
     }
     else
     {
-        if (pageRequest_.rowOffset
-            > std::numeric_limits<std::uint64_t>::max() / valueWidth
-            || pageRequest_.rowCount
-               > std::numeric_limits<std::uint64_t>::max() / valueWidth)
-        {
-            state_ = State::FAILED;
-            return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
-                                "plain scalar page byte range overflows");
-        }
-        pageByteOffset = pageRequest_.rowOffset * valueWidth;
-        pageByteLength =
-                static_cast<std::uint64_t>(pageRequest_.rowCount)
+        pageByteOffset =
+                static_cast<std::uint64_t>(pagePlan_.physicalOffset)
                 * valueWidth;
+        pageByteLength =
+                static_cast<std::uint64_t>(pagePlan_.physicalCount)
+                * valueWidth;
+    }
+    const std::uint64_t dataLength = pageChunk_.has_isnulloffset()
+                                     ? pageChunk_.isnulloffset()
+                                     : pageChunk_.chunklength();
+    std::uint64_t pageByteEnd = 0;
+    if (!format::checkedAdd(
+                pageByteOffset, pageByteLength, pageByteEnd)
+        || pageByteEnd > dataLength)
+    {
+        state_ = State::FAILED;
+        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                            "plain scalar page exceeds column data");
     }
     std::uint64_t pageFileOffset = 0;
     if (!format::checkedAdd(pageChunk_.chunkoffset(), pageByteOffset,
@@ -544,27 +640,12 @@ bool InspectionSession::validatePageRequest()
                 error_, format::ErrorCode::MALFORMED_PROTOBUF,
                 "first pixel is missing explicit null statistics");
     }
-    if (pixelHasNull(pageChunk_, 0))
+    if (pageChunk_.pixelpositions_size() == 0
+        || pageChunk_.pixelpositions(0) != 0)
     {
         return format::fail(
-                error_, format::ErrorCode::UNSUPPORTED_ENCODING,
-                "plain scalar page does not yet support null values");
-    }
-
-    const std::uint64_t dataLength = pageChunk_.has_isnulloffset()
-                                     ? pageChunk_.isnulloffset()
-                                     : pageChunk_.chunklength();
-    const bool exceedsData =
-            type.kind() == proto::Type_Kind_BOOLEAN
-            ? (rowEnd / 8U + (rowEnd % 8U == 0 ? 0U : 1U)
-               > dataLength)
-            : (pageRequest_.rowOffset
-               > std::numeric_limits<std::uint64_t>::max() / valueWidth
-               || rowEnd > dataLength / valueWidth);
-    if (exceedsData)
-    {
-        return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
-                            "plain scalar page exceeds column data");
+                error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                "first pixel position is missing or nonzero");
     }
     return true;
 }
@@ -575,38 +656,42 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
             static_cast<int>(pageRequest_.column));
     const bool littleEndian =
             pageChunk_.has_littleendian() && pageChunk_.littleendian();
-    std::vector<std::string> values(pageRequest_.rowCount);
+    std::vector<std::string> physicalValues(pagePlan_.physicalCount);
     bool decoded = false;
     switch (type.kind())
     {
         case proto::Type_Kind_BOOLEAN:
         {
             std::unique_ptr<bool[]> decodedValues(
-                    new bool[pageRequest_.rowCount]);
+                    new bool[pagePlan_.physicalCount]);
             decoded = format::PlainScalarDecoder::decodeBoolean(
                     bytes, littleEndian, pageRequest_.bitOffset,
-                    pageRequest_.rowCount, decodedValues.get(),
-                    pageRequest_.rowCount, error_);
+                    pagePlan_.physicalCount, decodedValues.get(),
+                    pagePlan_.physicalCount, error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = decodedValues[index] ? "true" : "false";
+                    physicalValues[index] =
+                            decodedValues[index] ? "true" : "false";
                 }
             }
             break;
         }
         case proto::Type_Kind_BYTE:
         {
-            std::vector<std::int8_t> decodedValues(pageRequest_.rowCount);
+            std::vector<std::int8_t> decodedValues(pagePlan_.physicalCount);
             decoded = format::PlainScalarDecoder::decodeByte(
                     bytes, 0, decodedValues.size(), decodedValues.data(),
                     decodedValues.size(), error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = quoteInteger(decodedValues[index]);
+                    physicalValues[index] =
+                            quoteInteger(decodedValues[index]);
                 }
             }
             break;
@@ -616,15 +701,17 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
         case proto::Type_Kind_DATE:
         case proto::Type_Kind_TIME:
         {
-            std::vector<std::int32_t> decodedValues(pageRequest_.rowCount);
+            std::vector<std::int32_t> decodedValues(pagePlan_.physicalCount);
             decoded = format::PlainScalarDecoder::decodeInt32(
                     bytes, littleEndian, 0, decodedValues.size(),
                     decodedValues.data(), decodedValues.size(), error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = quoteInteger(decodedValues[index]);
+                    physicalValues[index] =
+                            quoteInteger(decodedValues[index]);
                 }
             }
             break;
@@ -632,60 +719,67 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
         case proto::Type_Kind_LONG:
         case proto::Type_Kind_TIMESTAMP:
         {
-            std::vector<std::int64_t> decodedValues(pageRequest_.rowCount);
+            std::vector<std::int64_t> decodedValues(pagePlan_.physicalCount);
             decoded = format::PlainScalarDecoder::decodeInt64(
                     bytes, littleEndian, 0, decodedValues.size(),
                     decodedValues.data(), decodedValues.size(), error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = quoteInteger(decodedValues[index]);
+                    physicalValues[index] =
+                            quoteInteger(decodedValues[index]);
                 }
             }
             break;
         }
         case proto::Type_Kind_FLOAT:
         {
-            std::vector<float> decodedValues(pageRequest_.rowCount);
+            std::vector<float> decodedValues(pagePlan_.physicalCount);
             decoded = format::PlainScalarDecoder::decodeFloat(
                     bytes, littleEndian, 0, decodedValues.size(),
                     decodedValues.data(), decodedValues.size(), error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = formatFloating(decodedValues[index]);
+                    physicalValues[index] =
+                            formatFloating(decodedValues[index]);
                 }
             }
             break;
         }
         case proto::Type_Kind_DOUBLE:
         {
-            std::vector<double> decodedValues(pageRequest_.rowCount);
+            std::vector<double> decodedValues(pagePlan_.physicalCount);
             decoded = format::PlainScalarDecoder::decodeDouble(
                     bytes, littleEndian, 0, decodedValues.size(),
                     decodedValues.data(), decodedValues.size(), error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = formatFloating(decodedValues[index]);
+                    physicalValues[index] =
+                            formatFloating(decodedValues[index]);
                 }
             }
             break;
         }
         case proto::Type_Kind_DECIMAL:
         {
-            std::vector<std::int64_t> decodedValues(pageRequest_.rowCount);
+            std::vector<std::int64_t> decodedValues(pagePlan_.physicalCount);
             decoded = format::PlainScalarDecoder::decodeInt64(
                     bytes, littleEndian, 0, decodedValues.size(),
                     decodedValues.data(), decodedValues.size(), error_);
             if (decoded)
             {
-                for (std::size_t index = 0; index < values.size(); ++index)
+                for (std::size_t index = 0;
+                     index < physicalValues.size(); ++index)
                 {
-                    values[index] = formatDecimal(
+                    physicalValues[index] = formatDecimal(
                             decodedValues[index], type.scale());
                 }
             }
@@ -709,6 +803,32 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
     {
         state_ = State::FAILED;
         return false;
+    }
+    const bool nullsPadding =
+            pageChunk_.has_nullspadding() && pageChunk_.nullspadding();
+    std::vector<std::string> values(pageRequest_.rowCount);
+    std::size_t physicalIndex = 0;
+    for (std::size_t index = 0; index < values.size(); ++index)
+    {
+        if (pageValidity_[index])
+        {
+            values[index] = physicalValues[physicalIndex];
+        }
+        else
+        {
+            values[index] = "null";
+        }
+        if (nullsPadding || pageValidity_[index])
+        {
+            ++physicalIndex;
+        }
+    }
+    if (physicalIndex != physicalValues.size())
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                "plain scalar physical value count is inconsistent");
     }
     buildPageResult(values);
     state_ = State::PAGE_READY;

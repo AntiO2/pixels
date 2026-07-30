@@ -67,6 +67,7 @@ pixels_inspector_status currentStatus(const InspectionSession &session)
         case InspectionSession::State::AWAITING_TAIL_POINTER:
         case InspectionSession::State::AWAITING_FILE_TAIL:
         case InspectionSession::State::AWAITING_ROW_GROUP_FOOTER:
+        case InspectionSession::State::AWAITING_NULL_BITMAP:
         case InspectionSession::State::AWAITING_COLUMN_CHUNK:
             return PIXELS_INSPECTOR_RANGE_READY;
         case InspectionSession::State::METADATA_READY:

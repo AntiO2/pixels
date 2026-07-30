@@ -15,10 +15,12 @@
 #include "format/ByteSpan.h"
 #include "format/ByteReader.h"
 #include "format/FormatError.h"
+#include "format/PlainPixelPlanner.h"
 #include "pixels.pb.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -37,10 +39,11 @@ public:
         AWAITING_FILE_TAIL = 2,
         METADATA_READY = 3,
         AWAITING_ROW_GROUP_FOOTER = 4,
-        AWAITING_COLUMN_CHUNK = 5,
-        PAGE_READY = 6,
-        CANCELLED = 7,
-        FAILED = 8
+        AWAITING_NULL_BITMAP = 5,
+        AWAITING_COLUMN_CHUNK = 6,
+        PAGE_READY = 7,
+        CANCELLED = 8,
+        FAILED = 9
     };
 
     explicit InspectionSession(std::uint64_t fileSize);
@@ -91,8 +94,10 @@ private:
     [[nodiscard]] bool consumeTailPointer(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeFileTail(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeRowGroupFooter(const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeNullBitmap(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeColumnChunk(const format::ByteSpan &bytes);
     [[nodiscard]] bool validatePageRequest();
+    [[nodiscard]] bool requestPlainValues();
     [[nodiscard]] bool beginPageRequest(
             std::uint32_t rowGroup, std::uint32_t column,
             std::uint64_t rowOffset, std::uint32_t rowCount,
@@ -112,6 +117,8 @@ private:
     proto::RowGroupFooter rowGroupFooter_;
     PageRequest pageRequest_;
     proto::ColumnChunkIndex pageChunk_;
+    format::PlainPixelPlan pagePlan_;
+    std::unique_ptr<bool[]> pageValidity_;
     std::string result_;
     format::FormatError error_;
 };
