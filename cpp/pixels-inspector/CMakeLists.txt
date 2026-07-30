@@ -190,6 +190,15 @@ if(EMSCRIPTEN)
     add_executable(pixels-inspector-wasm tools/wasm_entry.cpp)
     target_link_libraries(pixels-inspector-wasm PRIVATE pixels-inspector)
     set_target_properties(pixels-inspector-wasm PROPERTIES SUFFIX ".cjs")
+    foreach(target
+            libprotobuf-lite
+            pixels-inspector-proto
+            pixels-format
+            pixels-inspector
+            pixels-inspector-wasm)
+        target_compile_options(${target} PRIVATE
+            "SHELL:-ffile-prefix-map=${PIXELS_SOURCE_ROOT}=third_party/pixels")
+    endforeach()
     target_link_options(pixels-inspector-wasm PRIVATE
         "SHELL:--no-entry"
         "SHELL:-sFILESYSTEM=0"
