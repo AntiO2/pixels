@@ -27,6 +27,7 @@ cmake -S cpp/pixels-inspector -B <native-build> \
   -DPIXELS_INSPECTOR_ENABLE_SANITIZERS=ON
 cmake --build <native-build> --target pixels-inspector-tests
 ctest --test-dir <native-build> --output-on-failure
+<native-build>/pixels-inspector-tests --write-corpus <corpus-dir>
 ```
 
 This builds the host `protoc` and protobuf-lite runtime from the repository's
@@ -45,12 +46,13 @@ emcmake cmake -S cpp/pixels-inspector -B <wasm-build> \
 cmake --build <wasm-build> --target pixels-inspector-wasm
 node cpp/pixels-inspector/tools/run_wasm_worker_conformance.cjs \
   <wasm-build>/pixels-inspector-wasm.cjs \
-  cpp/tests/data/example.pxl
+  cpp/tests/data/example.pxl \
+  <corpus-dir>
 ```
 
 The conformance runner validates the ABI, exact metadata/page output,
-cancellation, mismatched ranges, legacy LONG plus generic DATE output, bounded
-linear memory, and the Emscripten import allowlist.
+cancellation, mismatched ranges, all 20 logical kinds through the generic page
+operation, bounded linear memory, and the Emscripten import allowlist.
 
 The generic page operation supports bounded pages across pixels, padded and
 compacted null layouts, integer RLE, dictionary and plain variable-width

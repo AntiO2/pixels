@@ -7,7 +7,7 @@ const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 
 const EXPECTED_METADATA =
-  '{"abi":1,"version":1,"magic":"PIXELS","rows":10,' +
+  '{"abi":2,"version":1,"magic":"PIXELS","rows":10,' +
   '"pixelStride":10000,"schemaCount":4,"rowGroupCount":1,' +
   '"firstColumn":{"name":"id","kind":4}}';
 
@@ -28,8 +28,16 @@ function requireCondition(condition, message) {
 async function main() {
   const modulePath = path.resolve(process.argv[2] ?? "");
   const fixturePath = path.resolve(process.argv[3] ?? "");
+  const corpusPath = process.argv[4] === undefined ||
+    process.argv[4] === ""
+    ? ""
+    : path.resolve(process.argv[4]);
   requireCondition(fs.existsSync(modulePath), "WASM JavaScript module is missing");
   requireCondition(fs.existsSync(fixturePath), "canonical fixture is missing");
+  requireCondition(
+    corpusPath === "" || fs.existsSync(path.join(corpusPath, "manifest.json")),
+    "conformance corpus manifest is missing",
+  );
 
   const createPixelsInspector = require(modulePath);
   const startedAt = performance.now();
@@ -39,7 +47,7 @@ async function main() {
     },
   });
   const initializedAt = performance.now();
-  const file = fs.readFileSync(fixturePath);
+  let file = fs.readFileSync(fixturePath);
   requireCondition(file.length === 790, "canonical fixture length changed");
   const wasmPath = modulePath.replace(/\.(?:c?js)$/, ".wasm");
   const wasmBytes = fs.readFileSync(wasmPath);
@@ -85,8 +93,46 @@ async function main() {
   let handle = 0;
   let rangeCopies = 0;
   try {
-    requireCondition(module._pixels_inspector_abi_version() === 1,
+    requireCondition(module._pixels_inspector_abi_version() === 2,
       "unexpected inspector ABI");
+    requireCondition(
+      module._pixels_inspector_capabilities_size(scratch) === 0,
+      "capability size is unavailable",
+    );
+    const capabilitySize = Number(
+      new DataView(module.HEAPU8.buffer, scratch, 8)
+        .getBigUint64(0, true),
+    );
+    const capabilityPointer = module._malloc(capabilitySize);
+    let capabilities;
+    try {
+      requireCondition(
+        module._pixels_inspector_copy_capabilities(
+          capabilityPointer,
+          BigInt(capabilitySize),
+        ) === 0,
+        "unable to copy capabilities",
+      );
+      capabilities = JSON.parse(
+        new TextDecoder().decode(
+          module.HEAPU8.slice(
+            capabilityPointer,
+            capabilityPointer + capabilitySize,
+          ),
+        ),
+      );
+    } finally {
+      module._free(capabilityPointer);
+    }
+    requireCondition(
+      capabilities.abi === 2 &&
+        capabilities.page === "generic-v1" &&
+        capabilities.types.length === 20 &&
+        capabilities.types.every(
+          (type, index) => type.kind === index && typeof type.name === "string",
+        ),
+      "Core capability inventory is incomplete",
+    );
     requireCondition(
       module._pixels_inspector_create(BigInt(file.length), handlePointer) === 0,
       "unable to create session",
@@ -176,7 +222,7 @@ async function main() {
 
     const pageStartedAt = performance.now();
     requireCondition(
-      module._pixels_inspector_begin_plain_long_page(
+      module._pixels_inspector_begin_page(
         handle,
         0,
         0,
@@ -221,6 +267,74 @@ async function main() {
       "generic DATE values did not produce a page");
     requireCondition(readResult() === EXPECTED_DATE_PAGE,
       "WASM generic DATE page differs from the native golden");
+
+    let corpusCases = 0;
+    if (corpusPath !== "") {
+      const corpus = JSON.parse(
+        fs.readFileSync(path.join(corpusPath, "manifest.json"), "utf8"),
+      );
+      requireCondition(corpus.abi === 2 && corpus.cases.length === 20,
+        "conformance corpus inventory is incomplete");
+      const expectedNames = capabilities.types.map((type) => type.name);
+      requireCondition(
+        JSON.stringify(corpus.cases.map((test) => test.name).sort()) ===
+          JSON.stringify([...expectedNames].sort()),
+        "corpus kinds differ from Core capabilities",
+      );
+      for (const test of corpus.cases) {
+        requireCondition(module._pixels_inspector_destroy(handle) === 0,
+          `unable to reset session for ${test.name}`);
+        handle = 0;
+        file = fs.readFileSync(path.join(corpusPath, test.file));
+        requireCondition(
+          module._pixels_inspector_create(
+            BigInt(file.length),
+            handlePointer,
+          ) === 0,
+          `unable to create ${test.name} session`,
+        );
+        handle = new DataView(
+          module.HEAPU8.buffer,
+          handlePointer,
+          4,
+        ).getUint32(0, true);
+        requireCondition(
+          module._pixels_inspector_begin_metadata(handle) === 1,
+          `${test.name} metadata did not start`,
+        );
+        requireCondition(supplyRange(nextRange()) === 1,
+          `${test.name} tail pointer was rejected`);
+        requireCondition(supplyRange(nextRange()) === 2,
+          `${test.name} FileTail was rejected`);
+        requireCondition(
+          module._pixels_inspector_begin_page(
+            handle,
+            0,
+            test.column,
+            BigInt(test.offset),
+            test.count,
+          ) === 1,
+          `${test.name} page did not start`,
+        );
+        let status = 1;
+        let suppliedRanges = 0;
+        while (status === 1) {
+          status = supplyRange(nextRange());
+          suppliedRanges += 1;
+          requireCondition(suppliedRanges < 64,
+            `${test.name} page did not converge`);
+        }
+        requireCondition(status === 2,
+          `${test.name} page ended with status ${status}`);
+        requireCondition(
+          JSON.stringify(JSON.parse(readResult())) ===
+            JSON.stringify(test.expected),
+          `${test.name} WASM page differs from the native golden`,
+        );
+        corpusCases += 1;
+      }
+      file = fs.readFileSync(fixturePath);
+    }
 
     requireCondition(
       module._pixels_inspector_create(BigInt(file.length), scratch) === 0,
@@ -292,7 +406,9 @@ async function main() {
     );
 
     const metrics = {
-      abi: 1,
+      abi: 2,
+      capabilities,
+      corpusCases,
       wasmBytes: fs.statSync(wasmPath).size,
       initializationMs: Number((initializedAt - startedAt).toFixed(3)),
       pageMs: Number((pageCompletedAt - pageStartedAt).toFixed(3)),

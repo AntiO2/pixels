@@ -11,6 +11,7 @@
 
 #include "InspectionSession.h"
 
+#include "pixels_inspector.h"
 #include "format/PixelsFormatReader.h"
 #include "format/PlainLongDecoder.h"
 #include "format/PlainScalarDecoder.h"
@@ -42,6 +43,8 @@ const std::uint64_t MAX_PAGE_SCALARS = 1048576;
 const std::uint32_t MAX_DICTIONARY_ENTRIES = 1048576;
 const std::uint64_t MAX_DICTIONARY_BYTES = 67108864;
 const std::uint32_t MAX_NESTED_ELEMENTS = 65536;
+const std::uint64_t MAX_VALUE_BYTES = 16777216;
+const std::uint64_t MAX_PAGE_OUTPUT_BYTES = 67108864;
 
 bool checkedMultiply(std::uint64_t left, std::uint64_t right,
                      std::uint64_t &result) noexcept
@@ -1316,6 +1319,13 @@ bool InspectionSession::finishVariableValues(
     {
         const format::VariableValueRange &range =
                 variableRanges_[index];
+        if (range.length > MAX_VALUE_BYTES)
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "plain variable value exceeds the bounded value limit");
+        }
         if (range.offset < pageRequest_.variableContentBase)
         {
             state_ = State::FAILED;
@@ -1711,6 +1721,13 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
             }
             const format::VariableValueRange &range =
                     dictionaryRanges_[static_cast<std::size_t>(id)];
+            if (range.length > MAX_VALUE_BYTES)
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::OUT_OF_BOUNDS,
+                        "dictionary value exceeds the bounded value limit");
+            }
             if ((type.kind() == proto::Type_Kind_VARCHAR
                  || type.kind() == proto::Type_Kind_CHAR)
                 && range.length > type.maximumlength())
@@ -1777,6 +1794,13 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
         {
             const format::VariableValueRange &range =
                     pixelRanges[pagePlan_.physicalOffset + index];
+            if (range.length > MAX_VALUE_BYTES)
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::OUT_OF_BOUNDS,
+                        "binary value exceeds the bounded value limit");
+            }
             format::ByteSpan value;
             if (range.offset
                 > std::numeric_limits<std::size_t>::max()
@@ -2662,7 +2686,10 @@ bool InspectionSession::finishNestedPage()
         }
     }
 
-    buildPageResult(pageValues_);
+    if (!buildPageResult(pageValues_))
+    {
+        return false;
+    }
     state_ = State::PAGE_READY;
     return true;
 }
@@ -2709,7 +2736,10 @@ bool InspectionSession::advancePixel()
         {
             return beginNestedChildren();
         }
-        buildPageResult(pageValues_);
+        if (!buildPageResult(pageValues_))
+        {
+            return false;
+        }
         state_ = State::PAGE_READY;
         return true;
     }
@@ -2828,7 +2858,7 @@ void InspectionSession::buildMetadataResult()
     const proto::Type &firstType = footer.types(0);
 
     std::ostringstream output;
-    output << "{\"abi\":1"
+    output << "{\"abi\":" << PIXELS_INSPECTOR_ABI_VERSION
            << ",\"version\":" << postScript.version()
            << ",\"magic\":\"" << escapeJson(postScript.magic()) << "\""
            << ",\"rows\":" << postScript.numberofrows()
@@ -2841,9 +2871,22 @@ void InspectionSession::buildMetadataResult()
     result_ = output.str();
 }
 
-void InspectionSession::buildPageResult(
+bool InspectionSession::buildPageResult(
         const std::vector<std::string> &values)
 {
+    std::uint64_t outputBytes = 128;
+    for (const std::string &value : values)
+    {
+        if (!format::checkedAdd(
+                    outputBytes, value.size() + 1U, outputBytes)
+            || outputBytes > MAX_PAGE_OUTPUT_BYTES)
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "page result exceeds the bounded output limit");
+        }
+    }
     std::ostringstream output;
     output << "{\"rowGroup\":" << pageRequest_.rowGroup
            << ",\"column\":" << pageRequest_.column
@@ -2860,6 +2903,15 @@ void InspectionSession::buildPageResult(
     }
     output << "]}";
     result_ = output.str();
+    if (result_.size() > MAX_PAGE_OUTPUT_BYTES)
+    {
+        result_.clear();
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "page result exceeds the bounded output limit");
+    }
+    return true;
 }
 
 } // namespace inspector

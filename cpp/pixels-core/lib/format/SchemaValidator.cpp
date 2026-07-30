@@ -25,6 +25,8 @@ namespace format
 namespace
 {
 
+const std::uint32_t MAX_VARIABLE_LENGTH = 16777216;
+
 bool validateShape(
         const proto::Type &type, FormatError &error)
 {
@@ -67,7 +69,8 @@ bool validateShape(
         case proto::Type_Kind_VARCHAR:
         case proto::Type_Kind_CHAR:
             if (children != 0 || !type.has_maximumlength()
-                || type.maximumlength() == 0)
+                || type.maximumlength() == 0
+                || type.maximumlength() > MAX_VARIABLE_LENGTH)
             {
                 return fail(error, ErrorCode::MALFORMED_PROTOBUF,
                             "bounded variable schema length is invalid");

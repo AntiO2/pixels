@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 namespace
@@ -23,6 +24,34 @@ using pixels::inspector::InspectionSession;
 std::unordered_map<pixels_inspector_handle,
                    std::unique_ptr<InspectionSession>> sessions;
 pixels_inspector_handle nextHandle = 1;
+
+const std::string CAPABILITIES =
+        std::string("{\"abi\":")
+        + std::to_string(PIXELS_INSPECTOR_ABI_VERSION)
+        + ",\"page\":\"generic-v1\","
+        "\"types\":["
+        "{\"kind\":0,\"name\":\"BOOLEAN\"},"
+        "{\"kind\":1,\"name\":\"BYTE\"},"
+        "{\"kind\":2,\"name\":\"SHORT\"},"
+        "{\"kind\":3,\"name\":\"INT\"},"
+        "{\"kind\":4,\"name\":\"LONG\"},"
+        "{\"kind\":5,\"name\":\"FLOAT\"},"
+        "{\"kind\":6,\"name\":\"DOUBLE\"},"
+        "{\"kind\":7,\"name\":\"STRING\"},"
+        "{\"kind\":8,\"name\":\"BINARY\"},"
+        "{\"kind\":9,\"name\":\"TIMESTAMP\"},"
+        "{\"kind\":10,\"name\":\"ARRAY\"},"
+        "{\"kind\":11,\"name\":\"MAP\"},"
+        "{\"kind\":12,\"name\":\"STRUCT\"},"
+        "{\"kind\":13,\"name\":\"VARBINARY\"},"
+        "{\"kind\":14,\"name\":\"DECIMAL\"},"
+        "{\"kind\":15,\"name\":\"DATE\"},"
+        "{\"kind\":16,\"name\":\"VARCHAR\"},"
+        "{\"kind\":17,\"name\":\"CHAR\"},"
+        "{\"kind\":18,\"name\":\"TIME\"},"
+        "{\"kind\":19,\"name\":\"VECTOR\"}],"
+        "\"encodings\":[\"NONE\",\"RUNLENGTH\",\"DICTIONARY\"],"
+        "\"nested\":\"portable-v1\"}";
 
 InspectionSession *findSession(pixels_inspector_handle handle)
 {
@@ -118,6 +147,23 @@ extern "C"
 std::uint32_t pixels_inspector_abi_version()
 {
     return PIXELS_INSPECTOR_ABI_VERSION;
+}
+
+pixels_inspector_status pixels_inspector_capabilities_size(
+        std::uint64_t *size)
+{
+    if (size == nullptr)
+    {
+        return PIXELS_INSPECTOR_INVALID_ARGUMENT;
+    }
+    *size = CAPABILITIES.size();
+    return PIXELS_INSPECTOR_OK;
+}
+
+pixels_inspector_status pixels_inspector_copy_capabilities(
+        std::uint8_t *destination, std::uint64_t destinationSize)
+{
+    return copyString(CAPABILITIES, destination, destinationSize);
 }
 
 pixels_inspector_status pixels_inspector_create(

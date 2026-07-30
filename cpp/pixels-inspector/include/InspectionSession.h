@@ -170,7 +170,8 @@ private:
 
     void setPendingRange(const format::FileRange &range, State state);
     void buildMetadataResult();
-    void buildPageResult(const std::vector<std::string> &values);
+    [[nodiscard]] bool buildPageResult(
+            const std::vector<std::string> &values);
 
     std::uint64_t fileSize_;
     State state_ = State::IDLE;

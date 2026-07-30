@@ -8,11 +8,14 @@ const { Worker } = require("node:worker_threads");
 const harnessPath = path.join(__dirname, "run_wasm_conformance.cjs");
 const modulePath = path.resolve(process.argv[2] ?? "");
 const fixturePath = path.resolve(process.argv[3] ?? "");
+const corpusPath = process.argv[4] === undefined
+  ? ""
+  : path.resolve(process.argv[4]);
 
 function runWorker() {
   return new Promise((resolve, reject) => {
     const worker = new Worker(harnessPath, {
-      argv: [modulePath, fixturePath],
+      argv: [modulePath, fixturePath, corpusPath],
       stdout: true,
       stderr: true,
     });

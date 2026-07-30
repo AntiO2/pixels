@@ -14,7 +14,7 @@ extern "C"
 {
 #endif
 
-#define PIXELS_INSPECTOR_ABI_VERSION 1U
+#define PIXELS_INSPECTOR_ABI_VERSION 2U
 
 typedef uint32_t pixels_inspector_handle;
 
@@ -38,6 +38,12 @@ typedef enum pixels_inspector_status
 } pixels_inspector_status;
 
 uint32_t pixels_inspector_abi_version(void);
+
+pixels_inspector_status pixels_inspector_capabilities_size(
+        uint64_t *size);
+
+pixels_inspector_status pixels_inspector_copy_capabilities(
+        uint8_t *destination, uint64_t destination_size);
 
 pixels_inspector_status pixels_inspector_create(
         uint64_t file_size, pixels_inspector_handle *handle);

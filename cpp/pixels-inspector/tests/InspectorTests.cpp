@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <fstream>
 #include <iostream>
@@ -30,9 +31,34 @@ namespace
 {
 
 const std::string EXPECTED_METADATA =
-        "{\"abi\":1,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
+        "{\"abi\":2,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
         "\"pixelStride\":10000,\"schemaCount\":4,\"rowGroupCount\":1,"
         "\"firstColumn\":{\"name\":\"id\",\"kind\":4}}";
+
+const std::string EXPECTED_CAPABILITIES =
+        "{\"abi\":2,\"page\":\"generic-v1\",\"types\":["
+        "{\"kind\":0,\"name\":\"BOOLEAN\"},"
+        "{\"kind\":1,\"name\":\"BYTE\"},"
+        "{\"kind\":2,\"name\":\"SHORT\"},"
+        "{\"kind\":3,\"name\":\"INT\"},"
+        "{\"kind\":4,\"name\":\"LONG\"},"
+        "{\"kind\":5,\"name\":\"FLOAT\"},"
+        "{\"kind\":6,\"name\":\"DOUBLE\"},"
+        "{\"kind\":7,\"name\":\"STRING\"},"
+        "{\"kind\":8,\"name\":\"BINARY\"},"
+        "{\"kind\":9,\"name\":\"TIMESTAMP\"},"
+        "{\"kind\":10,\"name\":\"ARRAY\"},"
+        "{\"kind\":11,\"name\":\"MAP\"},"
+        "{\"kind\":12,\"name\":\"STRUCT\"},"
+        "{\"kind\":13,\"name\":\"VARBINARY\"},"
+        "{\"kind\":14,\"name\":\"DECIMAL\"},"
+        "{\"kind\":15,\"name\":\"DATE\"},"
+        "{\"kind\":16,\"name\":\"VARCHAR\"},"
+        "{\"kind\":17,\"name\":\"CHAR\"},"
+        "{\"kind\":18,\"name\":\"TIME\"},"
+        "{\"kind\":19,\"name\":\"VECTOR\"}],"
+        "\"encodings\":[\"NONE\",\"RUNLENGTH\",\"DICTIONARY\"],"
+        "\"nested\":\"portable-v1\"}";
 
 const std::string EXPECTED_PAGE =
         "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":10,"
@@ -187,6 +213,32 @@ void appendLittleUint32(
     }
 }
 
+void appendUint32(
+        std::vector<std::uint8_t> &bytes, std::uint32_t value,
+        bool littleEndian)
+{
+    for (std::uint32_t index = 0; index < 4; ++index)
+    {
+        const std::uint32_t byte =
+                littleEndian ? index : 3U - index;
+        bytes.push_back(static_cast<std::uint8_t>(
+                value >> (byte * 8U)));
+    }
+}
+
+void appendUint64(
+        std::vector<std::uint8_t> &bytes, std::uint64_t value,
+        bool littleEndian)
+{
+    for (std::uint32_t index = 0; index < 8; ++index)
+    {
+        const std::uint32_t byte =
+                littleEndian ? index : 7U - index;
+        bytes.push_back(static_cast<std::uint8_t>(
+                value >> (byte * 8U)));
+    }
+}
+
 void appendBigDouble(
         std::vector<std::uint8_t> &bytes, double value)
 {
@@ -275,6 +327,180 @@ void appendDirectRleUint32(
     std::vector<std::uint64_t> encoded(
             values.begin(), values.end());
     appendDirectRleValues(bytes, encoded);
+}
+
+std::vector<std::uint8_t> makeFixedScalarFixture(
+        pixels::proto::Type_Kind kind, bool littleEndian)
+{
+    const std::vector<std::uint8_t> canonical = readFixture();
+    pixels::proto::RowGroupFooter rowGroupFooter;
+    require(rowGroupFooter.ParseFromArray(
+                    canonical.data() + 352, 154),
+            "unable to parse scalar fixture RowGroupFooter");
+    pixels::proto::FileTail fileTail;
+    require(fileTail.ParseFromArray(
+                    canonical.data() + 506, 276),
+            "unable to parse scalar fixture FileTail");
+
+    std::vector<std::uint8_t> columnData;
+    switch (kind)
+    {
+        case pixels::proto::Type_Kind_BOOLEAN:
+            columnData.push_back(littleEndian ? 0x0D : 0xB0);
+            break;
+        case pixels::proto::Type_Kind_BYTE:
+            columnData = {0x80, 0xFF, 0x00, 0x7F};
+            break;
+        case pixels::proto::Type_Kind_SHORT:
+            for (const std::int32_t value :
+                 std::vector<std::int32_t>{-32768, -1, 0, 32767})
+            {
+                appendUint32(
+                        columnData,
+                        static_cast<std::uint32_t>(value),
+                        littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_INT:
+            for (const std::int32_t value :
+                 std::vector<std::int32_t>{
+                         std::numeric_limits<std::int32_t>::min(),
+                         -1, 0,
+                         std::numeric_limits<std::int32_t>::max()})
+            {
+                appendUint32(
+                        columnData,
+                        static_cast<std::uint32_t>(value),
+                        littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_DATE:
+            for (const std::int32_t value :
+                 std::vector<std::int32_t>{-1, 0, 1, 20000})
+            {
+                appendUint32(
+                        columnData,
+                        static_cast<std::uint32_t>(value),
+                        littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_TIME:
+            for (const std::int32_t value :
+                 std::vector<std::int32_t>{0, 1, 86399999, -1})
+            {
+                appendUint32(
+                        columnData,
+                        static_cast<std::uint32_t>(value),
+                        littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_LONG:
+        case pixels::proto::Type_Kind_TIMESTAMP:
+            for (const std::int64_t value :
+                 std::vector<std::int64_t>{
+                         std::numeric_limits<std::int64_t>::min(),
+                         -1, 0,
+                         std::numeric_limits<std::int64_t>::max()})
+            {
+                appendUint64(
+                        columnData,
+                        static_cast<std::uint64_t>(value),
+                        littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_FLOAT:
+            for (const float value :
+                 std::vector<float>{
+                         1.5F, -2.25F,
+                         std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::infinity()})
+            {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                appendUint32(columnData, bits, littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_DOUBLE:
+            for (const double value :
+                 std::vector<double>{
+                         1.5, -2.25,
+                         std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity()})
+            {
+                std::uint64_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                appendUint64(columnData, bits, littleEndian);
+            }
+            break;
+        case pixels::proto::Type_Kind_STRING:
+        case pixels::proto::Type_Kind_BINARY:
+        case pixels::proto::Type_Kind_ARRAY:
+        case pixels::proto::Type_Kind_MAP:
+        case pixels::proto::Type_Kind_STRUCT:
+        case pixels::proto::Type_Kind_VARBINARY:
+        case pixels::proto::Type_Kind_DECIMAL:
+        case pixels::proto::Type_Kind_VARCHAR:
+        case pixels::proto::Type_Kind_CHAR:
+        case pixels::proto::Type_Kind_VECTOR:
+            require(false, "kind is not a fixed scalar fixture");
+            break;
+    }
+
+    pixels::proto::ColumnChunkIndex *chunk =
+            rowGroupFooter.mutable_rowgroupindexentry()
+                    ->mutable_columnchunkindexentries(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_chunklength(columnData.size());
+    chunk->set_isnulloffset(columnData.size());
+    chunk->clear_pixelpositions();
+    chunk->add_pixelpositions(0);
+    chunk->clear_pixelstatistics();
+    pixels::proto::ColumnStatistic *statistic =
+            chunk->add_pixelstatistics()->mutable_statistic();
+    statistic->set_numberofvalues(4);
+    statistic->set_hasnull(false);
+    chunk->set_littleendian(littleEndian);
+    chunk->set_nullspadding(false);
+    rowGroupFooter.mutable_rowgroupencoding()
+            ->mutable_columnchunkencodings(0)
+            ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+
+    pixels::proto::Type *type =
+            fileTail.mutable_footer()->mutable_types(0);
+    type->set_kind(kind);
+    type->set_name("value");
+    type->clear_maximumlength();
+    type->clear_precision();
+    type->clear_scale();
+    type->clear_dimension();
+    pixels::proto::RowGroupInformation *rowGroup =
+            fileTail.mutable_footer()->mutable_rowgroupinfos(0);
+    rowGroup->set_footeroffset(352);
+    rowGroup->set_numberofrows(4);
+    fileTail.mutable_postscript()->set_pixelstride(4);
+    fileTail.mutable_postscript()->set_numberofrows(4);
+
+    std::string serializedFooter;
+    require(rowGroupFooter.SerializeToString(&serializedFooter),
+            "unable to serialize scalar fixture RowGroupFooter");
+    rowGroup->set_footerlength(serializedFooter.size());
+    std::string serializedTail;
+    require(fileTail.SerializeToString(&serializedTail),
+            "unable to serialize scalar fixture FileTail");
+
+    std::vector<std::uint8_t> file(canonical.begin(),
+                                   canonical.begin() + 352);
+    std::copy(columnData.begin(), columnData.end(), file.begin());
+    file.insert(file.end(), serializedFooter.begin(),
+                serializedFooter.end());
+    const std::uint64_t tailOffset = file.size();
+    file.insert(file.end(), serializedTail.begin(), serializedTail.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
+    return file;
 }
 
 std::vector<std::uint8_t> makeMultiPixelLongFixture(
@@ -392,7 +618,9 @@ std::vector<std::uint8_t> makeMultiPixelLongFixture(
     return file;
 }
 
-std::vector<std::uint8_t> makeMultiPixelVarcharFixture()
+std::vector<std::uint8_t> makeMultiPixelVarcharFixture(
+        pixels::proto::Type_Kind kind =
+                pixels::proto::Type_Kind_VARCHAR)
 {
     const std::vector<std::uint8_t> canonical = readFixture();
     pixels::proto::RowGroupFooter rowGroupFooter;
@@ -441,9 +669,17 @@ std::vector<std::uint8_t> makeMultiPixelVarcharFixture()
 
     pixels::proto::Type *type =
             fileTail.mutable_footer()->mutable_types(0);
-    type->set_kind(pixels::proto::Type_Kind_VARCHAR);
+    type->set_kind(kind);
     type->set_name("name");
-    type->set_maximumlength(16);
+    if (kind == pixels::proto::Type_Kind_VARCHAR
+        || kind == pixels::proto::Type_Kind_CHAR)
+    {
+        type->set_maximumlength(16);
+    }
+    else
+    {
+        type->clear_maximumlength();
+    }
     pixels::proto::RowGroupInformation *rowGroup =
             fileTail.mutable_footer()->mutable_rowgroupinfos(0);
     rowGroup->set_footeroffset(352);
@@ -474,7 +710,9 @@ std::vector<std::uint8_t> makeMultiPixelVarcharFixture()
     return file;
 }
 
-std::vector<std::uint8_t> makeBinaryFixture()
+std::vector<std::uint8_t> makeBinaryFixture(
+        pixels::proto::Type_Kind kind =
+                pixels::proto::Type_Kind_VARBINARY)
 {
     const std::vector<std::uint8_t> canonical = readFixture();
     pixels::proto::RowGroupFooter rowGroupFooter;
@@ -519,7 +757,7 @@ std::vector<std::uint8_t> makeBinaryFixture()
 
     pixels::proto::Type *type =
             fileTail.mutable_footer()->mutable_types(0);
-    type->set_kind(pixels::proto::Type_Kind_VARBINARY);
+    type->set_kind(kind);
     type->set_name("payload");
     type->set_maximumlength(7);
     pixels::proto::RowGroupInformation *rowGroup =
@@ -1117,6 +1355,31 @@ void driveMetadataFlexible(
             "FileTail did not produce metadata");
 }
 
+std::string decodePage(
+        const std::vector<std::uint8_t> &file,
+        std::uint32_t column, std::uint64_t offset,
+        std::uint32_t count)
+{
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    require(pixels_inspector_begin_page(
+                    session.handle(), 0, column, offset, count)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "generic fixture page did not request its footer");
+    pixels_inspector_status status = PIXELS_INSPECTOR_RANGE_READY;
+    std::size_t suppliedRanges = 0;
+    while (status == PIXELS_INSPECTOR_RANGE_READY)
+    {
+        status = supply(session, nextRange(session), file);
+        ++suppliedRanges;
+        require(suppliedRanges < 64,
+                "generic fixture page did not converge");
+    }
+    require(status == PIXELS_INSPECTOR_RESULT_READY,
+            "generic fixture ranges did not produce a page");
+    return readResult(session);
+}
+
 void testCanonicalFixture()
 {
     const std::vector<std::uint8_t> file = readFixture();
@@ -1144,6 +1407,108 @@ void testCanonicalFixture()
             "column chunk did not produce a page");
     require(readResult(session) == EXPECTED_PAGE,
             "canonical page differs from the golden");
+}
+
+void testFixedScalarTypePages()
+{
+    struct Case
+    {
+        pixels::proto::Type_Kind kind;
+        const char *values;
+    };
+    const Case cases[] = {
+            {pixels::proto::Type_Kind_BOOLEAN,
+             "[true,false,true,true]"},
+            {pixels::proto::Type_Kind_BYTE,
+             "[\"-128\",\"-1\",\"0\",\"127\"]"},
+            {pixels::proto::Type_Kind_SHORT,
+             "[\"-32768\",\"-1\",\"0\",\"32767\"]"},
+            {pixels::proto::Type_Kind_INT,
+             "[\"-2147483648\",\"-1\",\"0\",\"2147483647\"]"},
+            {pixels::proto::Type_Kind_LONG,
+             "[\"-9223372036854775808\",\"-1\",\"0\","
+             "\"9223372036854775807\"]"},
+            {pixels::proto::Type_Kind_FLOAT,
+             "[1.5,-2.25,\"NaN\",\"Infinity\"]"},
+            {pixels::proto::Type_Kind_DOUBLE,
+             "[1.5,-2.25,\"NaN\",\"Infinity\"]"},
+            {pixels::proto::Type_Kind_TIMESTAMP,
+             "[\"-9223372036854775808\",\"-1\",\"0\","
+             "\"9223372036854775807\"]"},
+            {pixels::proto::Type_Kind_DATE,
+             "[\"-1\",\"0\",\"1\",\"20000\"]"},
+            {pixels::proto::Type_Kind_TIME,
+             "[\"0\",\"1\",\"86399999\",\"-1\"]"}};
+    for (const Case &test : cases)
+    {
+        for (const bool littleEndian : {false, true})
+        {
+            const std::vector<std::uint8_t> file =
+                    makeFixedScalarFixture(
+                            test.kind, littleEndian);
+            const std::string expected =
+                    "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                    "\"count\":4,\"values\":"
+                    + std::string(test.values) + "}";
+            require(decodePage(file, 0, 0, 4) == expected,
+                    "fixed scalar page differs from the golden");
+        }
+    }
+}
+
+void testRemainingVariableTypePages()
+{
+    const std::string stringExpected =
+            "{\"rowGroup\":0,\"column\":0,\"offset\":4,\"count\":6,"
+            "\"values\":[\"d\",\"ee\",null,\"f\",null,\"gg\"]}";
+    require(decodePage(
+                    makeMultiPixelVarcharFixture(
+                            pixels::proto::Type_Kind_STRING),
+                    0, 4, 6)
+            == stringExpected,
+            "STRING page differs from the golden");
+    require(decodePage(
+                    makeMultiPixelVarcharFixture(
+                            pixels::proto::Type_Kind_CHAR),
+                    0, 4, 6)
+            == stringExpected,
+            "CHAR page differs from the golden");
+
+    require(decodePage(
+                    makeBinaryFixture(
+                            pixels::proto::Type_Kind_BINARY),
+                    0, 0, 4)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":4,"
+               "\"values\":[\"AP8=\",null,\"\",\"AQ==\"]}",
+            "BINARY page differs from the golden");
+}
+
+void testCapabilities()
+{
+    std::uint64_t size = 0;
+    require(pixels_inspector_capabilities_size(&size)
+            == PIXELS_INSPECTOR_OK,
+            "capability size is unavailable");
+    require(size == EXPECTED_CAPABILITIES.size(),
+            "capability size differs from the golden");
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    require(pixels_inspector_copy_capabilities(
+                    bytes.data(), bytes.size())
+            == PIXELS_INSPECTOR_OK,
+            "unable to copy capabilities");
+    require(std::string(bytes.begin(), bytes.end())
+            == EXPECTED_CAPABILITIES,
+            "capabilities differ from the golden");
+    require(pixels_inspector_capabilities_size(nullptr)
+            == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+            "null capability size pointer was accepted");
+    require(pixels_inspector_copy_capabilities(nullptr, size)
+            == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+            "null capability destination was accepted");
+    require(pixels_inspector_copy_capabilities(
+                    bytes.data(), size - 1U)
+            == PIXELS_INSPECTOR_BUFFER_TOO_SMALL,
+            "short capability buffer was accepted");
 }
 
 void testBoundedPageRange()
@@ -1789,7 +2154,7 @@ void testNestedPage()
     Session session(file.size());
     driveMetadataFlexible(session, file);
     require(readResult(session)
-            == "{\"abi\":1,\"version\":1,\"magic\":\"PIXELS\","
+            == "{\"abi\":2,\"version\":1,\"magic\":\"PIXELS\","
                "\"rows\":3,\"pixelStride\":10,\"schemaCount\":7,"
                "\"rowGroupCount\":1,"
                "\"firstColumn\":{\"name\":\"root\",\"kind\":12}}",
@@ -1916,6 +2281,18 @@ void testSchemaValidation()
                         footer, error)
                 && error.code == pixels::format::ErrorCode::OUT_OF_BOUNDS,
                 "schema above the nesting-depth limit was accepted");
+    }
+    {
+        pixels::proto::Footer footer;
+        pixels::proto::Type *value = footer.add_types();
+        value->set_kind(pixels::proto::Type_Kind_VARBINARY);
+        value->set_name("oversized");
+        value->set_maximumlength(16777217);
+        require(!pixels::format::SchemaValidator::validate(
+                        footer, error)
+                && error.code
+                   == pixels::format::ErrorCode::MALFORMED_PROTOBUF,
+                "schema above the variable-value limit was accepted");
     }
 }
 
@@ -2613,19 +2990,186 @@ void testInvalidPageRequests()
     }
 }
 
+void writeBytes(
+        const std::filesystem::path &path,
+        const std::vector<std::uint8_t> &bytes)
+{
+    std::ofstream output(path, std::ios::binary);
+    require(output.good(), "unable to create conformance fixture");
+    if (!bytes.empty())
+    {
+        output.write(
+                reinterpret_cast<const char *>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+    }
+    require(output.good(), "unable to write conformance fixture");
+}
+
+void writeConformanceCorpus(const std::filesystem::path &directory)
+{
+    std::filesystem::create_directories(directory);
+    std::string manifest = "{\"abi\":2,\"cases\":[";
+    bool first = true;
+    const auto addCase =
+            [&](const std::string &name, const std::string &fileName,
+                std::uint32_t column, std::uint64_t offset,
+                std::uint32_t count, const std::string &expected)
+    {
+        if (!first)
+        {
+            manifest += ",";
+        }
+        first = false;
+        manifest += "{\"name\":\"" + name
+                    + "\",\"file\":\"" + fileName
+                    + "\",\"column\":" + std::to_string(column)
+                    + ",\"offset\":" + std::to_string(offset)
+                    + ",\"count\":" + std::to_string(count)
+                    + ",\"expected\":" + expected + "}";
+    };
+
+    struct FixedCase
+    {
+        pixels::proto::Type_Kind kind;
+        const char *name;
+        const char *values;
+    };
+    const FixedCase fixedCases[] = {
+            {pixels::proto::Type_Kind_BOOLEAN, "BOOLEAN",
+             "[true,false,true,true]"},
+            {pixels::proto::Type_Kind_BYTE, "BYTE",
+             "[\"-128\",\"-1\",\"0\",\"127\"]"},
+            {pixels::proto::Type_Kind_SHORT, "SHORT",
+             "[\"-32768\",\"-1\",\"0\",\"32767\"]"},
+            {pixels::proto::Type_Kind_INT, "INT",
+             "[\"-2147483648\",\"-1\",\"0\",\"2147483647\"]"},
+            {pixels::proto::Type_Kind_LONG, "LONG",
+             "[\"-9223372036854775808\",\"-1\",\"0\","
+             "\"9223372036854775807\"]"},
+            {pixels::proto::Type_Kind_FLOAT, "FLOAT",
+             "[1.5,-2.25,\"NaN\",\"Infinity\"]"},
+            {pixels::proto::Type_Kind_DOUBLE, "DOUBLE",
+             "[1.5,-2.25,\"NaN\",\"Infinity\"]"},
+            {pixels::proto::Type_Kind_TIMESTAMP, "TIMESTAMP",
+             "[\"-9223372036854775808\",\"-1\",\"0\","
+             "\"9223372036854775807\"]"},
+            {pixels::proto::Type_Kind_DATE, "DATE",
+             "[\"-1\",\"0\",\"1\",\"20000\"]"},
+            {pixels::proto::Type_Kind_TIME, "TIME",
+             "[\"0\",\"1\",\"86399999\",\"-1\"]"}};
+    for (const FixedCase &test : fixedCases)
+    {
+        const std::string fileName =
+                std::string(test.name) + ".pxl";
+        writeBytes(
+                directory / fileName,
+                makeFixedScalarFixture(test.kind, true));
+        addCase(
+                test.name, fileName, 0, 0, 4,
+                "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                "\"count\":4,\"values\":"
+                + std::string(test.values) + "}");
+    }
+
+    const std::string variableExpected =
+            "{\"rowGroup\":0,\"column\":0,\"offset\":4,\"count\":6,"
+            "\"values\":[\"d\",\"ee\",null,\"f\",null,\"gg\"]}";
+    for (const std::pair<pixels::proto::Type_Kind, const char *> &test :
+         std::vector<
+                 std::pair<pixels::proto::Type_Kind, const char *>>{
+                 {pixels::proto::Type_Kind_STRING, "STRING"},
+                 {pixels::proto::Type_Kind_VARCHAR, "VARCHAR"},
+                 {pixels::proto::Type_Kind_CHAR, "CHAR"}})
+    {
+        const std::string fileName =
+                std::string(test.second) + ".pxl";
+        writeBytes(
+                directory / fileName,
+                makeMultiPixelVarcharFixture(test.first));
+        addCase(
+                test.second, fileName, 0, 4, 6,
+                variableExpected);
+    }
+
+    const std::string binaryExpected =
+            "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":4,"
+            "\"values\":[\"AP8=\",null,\"\",\"AQ==\"]}";
+    for (const std::pair<pixels::proto::Type_Kind, const char *> &test :
+         std::vector<
+                 std::pair<pixels::proto::Type_Kind, const char *>>{
+                 {pixels::proto::Type_Kind_BINARY, "BINARY"},
+                 {pixels::proto::Type_Kind_VARBINARY, "VARBINARY"}})
+    {
+        const std::string fileName =
+                std::string(test.second) + ".pxl";
+        writeBytes(
+                directory / fileName,
+                makeBinaryFixture(test.first));
+        addCase(
+                test.second, fileName, 0, 0, 4,
+                binaryExpected);
+    }
+
+    writeBytes(directory / "DECIMAL.pxl",
+               makeLongDecimalFixture());
+    addCase(
+            "DECIMAL", "DECIMAL.pxl", 0, 0, 2,
+            "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":2,"
+            "\"values\":[\"12.3456\",\"-0.0001\"]}");
+    writeBytes(directory / "VECTOR.pxl", makeVectorFixture());
+    addCase(
+            "VECTOR", "VECTOR.pxl", 0, 1, 2,
+            "{\"rowGroup\":0,\"column\":0,\"offset\":1,\"count\":2,"
+            "\"values\":[[3,4],[\"NaN\",\"Infinity\"]]}");
+
+    writeBytes(directory / "NESTED.pxl", makeNestedFixture());
+    addCase(
+            "ARRAY", "NESTED.pxl", 1, 0, 3,
+            "{\"rowGroup\":0,\"column\":1,\"offset\":0,\"count\":3,"
+            "\"values\":[[\"10\",\"11\"],[\"12\"],[\"13\",\"14\"]]}");
+    addCase(
+            "MAP", "NESTED.pxl", 3, 0, 3,
+            "{\"rowGroup\":0,\"column\":3,\"offset\":0,\"count\":3,"
+            "\"values\":[[[\"1\",\"a\"]],"
+            "[[\"2\",\"bb\"],[\"3\",\"c\"]],[]]}");
+    addCase(
+            "STRUCT", "NESTED.pxl", 0, 0, 3,
+            "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":3,"
+            "\"values\":[{\"tags\":[\"10\",\"11\"],"
+            "\"attrs\":[[\"1\",\"a\"]],\"label\":\"x\"},null,"
+            "{\"tags\":[\"13\",\"14\"],\"attrs\":[],"
+            "\"label\":\"z\"}]}");
+
+    manifest += "]}\n";
+    std::ofstream output(directory / "manifest.json");
+    require(output.good(), "unable to create corpus manifest");
+    output << manifest;
+    require(output.good(), "unable to write corpus manifest");
+}
+
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
     try
     {
+        if (argc == 3
+            && std::string(argv[1]) == "--write-corpus")
+        {
+            writeConformanceCorpus(argv[2]);
+            std::cout << "pixels-inspector conformance corpus: PASS\n";
+            return EXIT_SUCCESS;
+        }
         require(pixels_inspector_abi_version()
                 == PIXELS_INSPECTOR_ABI_VERSION,
                 "unexpected inspector ABI version");
         testPlainScalarDecoder();
         testPlainPixelPlanner();
         testPlainLongDecoder();
+        testCapabilities();
         testCanonicalFixture();
+        testFixedScalarTypePages();
+        testRemainingVariableTypePages();
         testBoundedPageRange();
         testGenericPlainScalarPages();
         testMultiPixelPlainPages();
