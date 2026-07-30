@@ -1386,15 +1386,11 @@ std::vector<std::uint8_t> makeTpchLineitemFixture()
             pixels::proto::Type_Kind_CHAR,
             pixels::proto::Type_Kind_CHAR,
             pixels::proto::Type_Kind_VARCHAR};
-    const std::vector<std::vector<std::string>> strings = {
-            {"N", "R"}, {"O", "F"}, {"DELIVER", "TAKE"},
-            {"AIR", "SHIP"}, {"first line", "second line"}};
-
     pixels::proto::FileTail fileTail;
     pixels::proto::PostScript *postScript =
             fileTail.mutable_postscript();
     postScript->set_version(1);
-    postScript->set_numberofrows(2);
+    postScript->set_numberofrows(4);
     postScript->set_pixelstride(2);
     postScript->set_compression(
             pixels::proto::NONE);
@@ -1406,10 +1402,36 @@ std::vector<std::uint8_t> makeTpchLineitemFixture()
     postScript->set_magic("PIXELS");
 
     pixels::proto::Footer *footer = fileTail.mutable_footer();
-    pixels::proto::RowGroupFooter rowGroupFooter;
-    pixels::proto::RowGroupStatistic *rowStatistics =
-            footer->add_rowgroupstats();
-    std::vector<std::uint8_t> data;
+    for (std::size_t column = 0; column < 16; ++column)
+    {
+        pixels::proto::Type *type = footer->add_types();
+        type->set_kind(kinds[column]);
+        type->set_name(names[column]);
+        if (kinds[column] == pixels::proto::Type_Kind_DECIMAL)
+        {
+            type->set_precision(15);
+            type->set_scale(2);
+        }
+        else if (kinds[column] == pixels::proto::Type_Kind_CHAR)
+        {
+            const std::uint32_t maximumLengths[] = {
+                    1, 1, 25, 10};
+            const std::size_t variableIndex =
+                    column == 8 ? 0
+                    : column == 9 ? 1
+                    : column == 13 ? 2 : 3;
+            type->set_maximumlength(
+                    maximumLengths[variableIndex]);
+        }
+        else if (kinds[column] == pixels::proto::Type_Kind_VARCHAR)
+        {
+            type->set_maximumlength(44);
+        }
+        pixels::proto::ColumnStatistic *fileStatistic =
+                footer->add_columnstats();
+        fileStatistic->set_numberofvalues(4);
+        fileStatistic->set_hasnull(false);
+    }
 
     const auto appendVariable =
             [](std::vector<std::uint8_t> &target,
@@ -1432,122 +1454,135 @@ std::vector<std::uint8_t> makeTpchLineitemFixture()
         appendLittleUint32(target, startsOffset);
     };
 
-    std::size_t variableIndex = 0;
-    for (std::size_t column = 0; column < 16; ++column)
+    std::vector<std::uint8_t> body;
+    const auto appendRowGroup =
+            [&](std::uint32_t rowGroupIndex)
     {
-        pixels::proto::Type *type = footer->add_types();
-        type->set_kind(kinds[column]);
-        type->set_name(names[column]);
-        if (kinds[column] == pixels::proto::Type_Kind_DECIMAL)
+        const std::vector<std::vector<std::string>> strings =
+                rowGroupIndex == 0
+                ? std::vector<std::vector<std::string>>{
+                        {"N", "R"}, {"O", "F"},
+                        {"DELIVER", "TAKE"}, {"AIR", "SHIP"},
+                        {"first line", "second line"}}
+                : std::vector<std::vector<std::string>>{
+                        {"A", "N"}, {"F", "O"},
+                        {"COLLECT", "DELIVER"}, {"RAIL", "AIR"},
+                        {"third line", "fourth line"}};
+        pixels::proto::RowGroupFooter rowGroupFooter;
+        pixels::proto::RowGroupStatistic *rowStatistics =
+                footer->add_rowgroupstats();
+        const std::uint64_t dataStart = body.size();
+        std::size_t variableIndex = 0;
+        for (std::size_t column = 0; column < 16; ++column)
         {
-            type->set_precision(15);
-            type->set_scale(2);
-        }
-        else if (kinds[column] == pixels::proto::Type_Kind_CHAR)
-        {
-            const std::uint32_t lengths[] = {1, 1, 25, 10};
-            type->set_maximumlength(lengths[variableIndex]);
-        }
-        else if (kinds[column] == pixels::proto::Type_Kind_VARCHAR)
-        {
-            type->set_maximumlength(44);
+            std::vector<std::uint8_t> chunkBytes;
+            const std::uint32_t rowBase = rowGroupIndex * 2U;
+            switch (kinds[column])
+            {
+                case pixels::proto::Type_Kind_LONG:
+                    appendLittleInt64(
+                            chunkBytes,
+                            static_cast<std::int64_t>(
+                                    (column + 1U) * 10U
+                                    + rowBase + 1U));
+                    appendLittleInt64(
+                            chunkBytes,
+                            static_cast<std::int64_t>(
+                                    (column + 1U) * 10U
+                                    + rowBase + 2U));
+                    break;
+                case pixels::proto::Type_Kind_INT:
+                    appendLittleUint32(
+                            chunkBytes, rowBase + 1U);
+                    appendLittleUint32(
+                            chunkBytes, rowBase + 2U);
+                    break;
+                case pixels::proto::Type_Kind_DECIMAL:
+                    appendLittleInt64(
+                            chunkBytes,
+                            static_cast<std::int64_t>(
+                                    (column + 1U) * 100U
+                                    + rowBase * 25U + 25U));
+                    appendLittleInt64(
+                            chunkBytes,
+                            static_cast<std::int64_t>(
+                                    (column + 1U) * 100U
+                                    + rowBase * 25U + 50U));
+                    break;
+                case pixels::proto::Type_Kind_DATE:
+                    appendLittleUint32(
+                            chunkBytes, 9496U + rowBase);
+                    appendLittleUint32(
+                            chunkBytes, 9497U + rowBase);
+                    break;
+                case pixels::proto::Type_Kind_CHAR:
+                case pixels::proto::Type_Kind_VARCHAR:
+                    appendVariable(
+                            chunkBytes, strings[variableIndex]);
+                    ++variableIndex;
+                    break;
+                default:
+                    require(false, "unexpected TPC-H lineitem kind");
+            }
+
+            pixels::proto::ColumnChunkIndex *chunk =
+                    rowGroupFooter.mutable_rowgroupindexentry()
+                            ->add_columnchunkindexentries();
+            chunk->set_chunkoffset(body.size());
+            chunk->set_chunklength(chunkBytes.size());
+            if (kinds[column] == pixels::proto::Type_Kind_CHAR
+                || kinds[column] == pixels::proto::Type_Kind_VARCHAR)
+            {
+                chunk->set_isnulloffset(
+                        strings[variableIndex - 1U][0].size()
+                        + strings[variableIndex - 1U][1].size());
+            }
+            else
+            {
+                chunk->set_isnulloffset(chunkBytes.size());
+            }
+            chunk->add_pixelpositions(0);
+            pixels::proto::ColumnStatistic *pixelStatistic =
+                    chunk->add_pixelstatistics()->mutable_statistic();
+            pixelStatistic->set_numberofvalues(2);
+            pixelStatistic->set_hasnull(false);
+            chunk->set_littleendian(true);
+            chunk->set_nullspadding(false);
+            rowGroupFooter.mutable_rowgroupencoding()
+                    ->add_columnchunkencodings()
+                    ->set_kind(
+                            pixels::proto::ColumnEncoding_Kind_NONE);
+            body.insert(
+                    body.end(), chunkBytes.begin(), chunkBytes.end());
+
+            pixels::proto::ColumnStatistic *rowStatistic =
+                    rowStatistics->add_columnchunkstats();
+            rowStatistic->set_numberofvalues(2);
+            rowStatistic->set_hasnull(false);
         }
 
-        std::vector<std::uint8_t> chunkBytes;
-        switch (kinds[column])
-        {
-            case pixels::proto::Type_Kind_LONG:
-                appendLittleInt64(
-                        chunkBytes,
-                        static_cast<std::int64_t>(
-                                (column + 1U) * 10U + 1U));
-                appendLittleInt64(
-                        chunkBytes,
-                        static_cast<std::int64_t>(
-                                (column + 1U) * 10U + 2U));
-                break;
-            case pixels::proto::Type_Kind_INT:
-                appendLittleUint32(chunkBytes, 1);
-                appendLittleUint32(chunkBytes, 2);
-                break;
-            case pixels::proto::Type_Kind_DECIMAL:
-                appendLittleInt64(
-                        chunkBytes,
-                        static_cast<std::int64_t>(
-                                (column + 1U) * 100U + 25U));
-                appendLittleInt64(
-                        chunkBytes,
-                        static_cast<std::int64_t>(
-                                (column + 1U) * 100U + 50U));
-                break;
-            case pixels::proto::Type_Kind_DATE:
-                appendLittleUint32(chunkBytes, 9496);
-                appendLittleUint32(chunkBytes, 9497);
-                break;
-            case pixels::proto::Type_Kind_CHAR:
-            case pixels::proto::Type_Kind_VARCHAR:
-                appendVariable(chunkBytes, strings[variableIndex]);
-                ++variableIndex;
-                break;
-            default:
-                require(false, "unexpected TPC-H lineitem kind");
-        }
+        const std::uint64_t footerOffset = body.size();
+        std::string serializedFooter;
+        require(rowGroupFooter.SerializeToString(&serializedFooter),
+                "unable to serialize TPC-H lineitem RowGroupFooter");
+        body.insert(body.end(), serializedFooter.begin(),
+                    serializedFooter.end());
+        pixels::proto::RowGroupInformation *rowGroup =
+                footer->add_rowgroupinfos();
+        rowGroup->set_footeroffset(footerOffset);
+        rowGroup->set_footerlength(serializedFooter.size());
+        rowGroup->set_datalength(footerOffset - dataStart);
+        rowGroup->set_numberofrows(2);
+    };
 
-        pixels::proto::ColumnChunkIndex *chunk =
-                rowGroupFooter.mutable_rowgroupindexentry()
-                        ->add_columnchunkindexentries();
-        chunk->set_chunkoffset(data.size());
-        chunk->set_chunklength(chunkBytes.size());
-        if (kinds[column] == pixels::proto::Type_Kind_CHAR
-            || kinds[column] == pixels::proto::Type_Kind_VARCHAR)
-        {
-            chunk->set_isnulloffset(
-                    strings[variableIndex - 1U][0].size()
-                    + strings[variableIndex - 1U][1].size());
-        }
-        else
-        {
-            chunk->set_isnulloffset(chunkBytes.size());
-        }
-        chunk->add_pixelpositions(0);
-        pixels::proto::ColumnStatistic *pixelStatistic =
-                chunk->add_pixelstatistics()->mutable_statistic();
-        pixelStatistic->set_numberofvalues(2);
-        pixelStatistic->set_hasnull(false);
-        chunk->set_littleendian(true);
-        chunk->set_nullspadding(false);
-        rowGroupFooter.mutable_rowgroupencoding()
-                ->add_columnchunkencodings()
-                ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
-        data.insert(data.end(), chunkBytes.begin(), chunkBytes.end());
-
-        pixels::proto::ColumnStatistic *fileStatistic =
-                footer->add_columnstats();
-        fileStatistic->set_numberofvalues(2);
-        fileStatistic->set_hasnull(false);
-        pixels::proto::ColumnStatistic *rowStatistic =
-                rowStatistics->add_columnchunkstats();
-        rowStatistic->CopyFrom(*fileStatistic);
-    }
-
-    std::string serializedFooter;
-    require(rowGroupFooter.SerializeToString(&serializedFooter),
-            "unable to serialize TPC-H lineitem RowGroupFooter");
-    pixels::proto::RowGroupInformation *rowGroup =
-            footer->add_rowgroupinfos();
-    rowGroup->set_footeroffset(data.size());
-    rowGroup->set_footerlength(serializedFooter.size());
-    rowGroup->set_datalength(data.size());
-    rowGroup->set_numberofrows(2);
-    postScript->set_contentlength(
-            data.size() + serializedFooter.size());
+    appendRowGroup(0);
+    appendRowGroup(1);
+    postScript->set_contentlength(body.size());
 
     std::string serializedTail;
     require(fileTail.SerializeToString(&serializedTail),
             "unable to serialize TPC-H lineitem FileTail");
-    std::vector<std::uint8_t> file = data;
-    file.insert(file.end(), serializedFooter.begin(),
-                serializedFooter.end());
+    std::vector<std::uint8_t> file = body;
     const std::uint64_t tailOffset = file.size();
     file.insert(file.end(), serializedTail.begin(), serializedTail.end());
     for (int byte = 7; byte >= 0; --byte)
@@ -1623,12 +1658,12 @@ void driveMetadataFlexible(
 std::string decodePage(
         const std::vector<std::uint8_t> &file,
         std::uint32_t column, std::uint64_t offset,
-        std::uint32_t count)
+        std::uint32_t count, std::uint32_t rowGroup = 0)
 {
     Session session(file.size());
     driveMetadataFlexible(session, file);
     require(pixels_inspector_begin_page(
-                    session.handle(), 0, column, offset, count)
+                    session.handle(), rowGroup, column, offset, count)
             == PIXELS_INSPECTOR_RANGE_READY,
             "generic fixture page did not request its footer");
     pixels_inspector_status status = PIXELS_INSPECTOR_RANGE_READY;
@@ -2497,7 +2532,7 @@ void testTpchLineitemFixture()
     driveMetadataFlexible(session, file);
     const std::string metadata = readResult(session);
     require(metadata.find(
-                    "\"schemaCount\":16,\"rowGroupCount\":1")
+                    "\"schemaCount\":16,\"rowGroupCount\":2")
             != std::string::npos,
             "TPC-H lineitem metadata has the wrong shape");
     require(metadata.find(
@@ -2508,14 +2543,15 @@ void testTpchLineitemFixture()
                != std::string::npos,
             "TPC-H lineitem schema inventory differs");
 
-    require(pixels_inspector_begin_row_group(session.handle(), 0)
+    require(pixels_inspector_begin_row_group(session.handle(), 1)
             == PIXELS_INSPECTOR_RANGE_READY,
             "TPC-H lineitem layout did not request its footer");
     require(supply(session, nextRange(session), file)
             == PIXELS_INSPECTOR_RESULT_READY,
             "TPC-H lineitem footer did not produce layout");
     const std::string layout = readResult(session);
-    require(layout.find("\"column\":15") != std::string::npos,
+    require(layout.find("\"rowGroup\":1") != std::string::npos
+            && layout.find("\"column\":15") != std::string::npos,
             "TPC-H lineitem layout omits its final column");
 
     require(decodePage(file, 0, 0, 2)
@@ -2527,6 +2563,15 @@ void testTpchLineitemFixture()
                "\"count\":2,\"values\":[\"first line\","
                "\"second line\"]}",
             "TPC-H lineitem VARCHAR preview differs");
+    require(decodePage(file, 0, 0, 2, 1)
+            == "{\"rowGroup\":1,\"column\":0,\"offset\":0,"
+               "\"count\":2,\"values\":[\"13\",\"14\"]}",
+            "TPC-H lineitem second row-group LONG preview differs");
+    require(decodePage(file, 15, 0, 2, 1)
+            == "{\"rowGroup\":1,\"column\":15,\"offset\":0,"
+               "\"count\":2,\"values\":[\"third line\","
+               "\"fourth line\"]}",
+            "TPC-H lineitem second row-group VARCHAR preview differs");
 }
 
 void testNestedCancellation()
