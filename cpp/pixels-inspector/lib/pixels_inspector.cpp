@@ -30,6 +30,10 @@ const std::string CAPABILITIES =
         + std::to_string(PIXELS_INSPECTOR_ABI_VERSION)
         + ",\"page\":\"generic-v1\","
         "\"rowGroup\":\"layout-v1\","
+        "\"rows\":\"rows-v1\","
+        "\"filter\":\"filter-v1\","
+        "\"maxRows\":500,"
+        "\"defaultRows\":100,"
         "\"types\":["
         "{\"kind\":0,\"name\":\"BOOLEAN\"},"
         "{\"kind\":1,\"name\":\"BYTE\"},"
@@ -52,6 +56,9 @@ const std::string CAPABILITIES =
         "{\"kind\":18,\"name\":\"TIME\"},"
         "{\"kind\":19,\"name\":\"VECTOR\"}],"
         "\"encodings\":[\"NONE\",\"RUNLENGTH\",\"DICTIONARY\"],"
+        "\"compression\":{\"metadata\":[\"NONE\",\"ZLIB\",\"SNAPPY\","
+        "\"LZO\",\"LZ4\",\"ZSTD\"],\"payload\":\"inactive\","
+        "\"reason\":\"postscript-v1-unused\"},"
         "\"nested\":\"portable-v1\"}";
 
 InspectionSession *findSession(pixels_inspector_handle handle)
@@ -107,6 +114,7 @@ pixels_inspector_status currentStatus(const InspectionSession &session)
         case InspectionSession::State::AWAITING_DICTIONARY_STARTS:
         case InspectionSession::State::AWAITING_DICTIONARY_CONTENT:
         case InspectionSession::State::AWAITING_NESTED_CHILD:
+        case InspectionSession::State::AWAITING_OPERATION_CHILD:
             return PIXELS_INSPECTOR_RANGE_READY;
         case InspectionSession::State::METADATA_READY:
         case InspectionSession::State::PAGE_READY:
@@ -292,6 +300,103 @@ pixels_inspector_status pixels_inspector_begin_page(
         }
         if (!session->beginPage(
                     rowGroup, column, rowOffset, rowCount))
+        {
+            return currentStatus(*session);
+        }
+        return currentStatus(*session);
+    }
+    catch (...)
+    {
+        return PIXELS_INSPECTOR_INTERNAL_ERROR;
+    }
+}
+
+pixels_inspector_status pixels_inspector_begin_rows(
+        pixels_inspector_handle handle, std::uint32_t rowGroup,
+        const std::uint32_t *columns, std::uint32_t columnCount,
+        std::uint64_t rowOffset, std::uint32_t rowCount)
+{
+    if (columnCount > PIXELS_INSPECTOR_MAX_PROJECTION_COLUMNS)
+    {
+        return PIXELS_INSPECTOR_OUT_OF_BOUNDS;
+    }
+    if (columnCount > 0 && columns == nullptr)
+    {
+        return PIXELS_INSPECTOR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        InspectionSession *session = findSession(handle);
+        if (session == nullptr)
+        {
+            return PIXELS_INSPECTOR_INVALID_HANDLE;
+        }
+        std::vector<std::uint32_t> projection;
+        if (columnCount > 0)
+        {
+            projection.assign(columns, columns + columnCount);
+        }
+        if (!session->beginRows(
+                    rowGroup, projection, rowOffset, rowCount))
+        {
+            return currentStatus(*session);
+        }
+        return currentStatus(*session);
+    }
+    catch (...)
+    {
+        return PIXELS_INSPECTOR_INTERNAL_ERROR;
+    }
+}
+
+pixels_inspector_status pixels_inspector_begin_filter(
+        pixels_inspector_handle handle, std::uint32_t predicateColumn,
+        pixels_inspector_filter_operator filterOperator,
+        const std::uint8_t *literal, std::uint32_t literalSize,
+        const std::uint32_t *columns, std::uint32_t columnCount,
+        const std::uint8_t *cursor, std::uint32_t cursorSize,
+        std::uint32_t limit)
+{
+    if (columnCount > PIXELS_INSPECTOR_MAX_PROJECTION_COLUMNS
+        || literalSize > PIXELS_INSPECTOR_MAX_FILTER_LITERAL_BYTES
+        || cursorSize > PIXELS_INSPECTOR_MAX_FILTER_CURSOR_BYTES)
+    {
+        return PIXELS_INSPECTOR_OUT_OF_BOUNDS;
+    }
+    if ((literalSize > 0 && literal == nullptr)
+        || (columnCount > 0 && columns == nullptr)
+        || (cursorSize > 0 && cursor == nullptr))
+    {
+        return PIXELS_INSPECTOR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        InspectionSession *session = findSession(handle);
+        if (session == nullptr)
+        {
+            return PIXELS_INSPECTOR_INVALID_HANDLE;
+        }
+        std::vector<std::uint32_t> projection;
+        if (columnCount > 0)
+        {
+            projection.assign(columns, columns + columnCount);
+        }
+        std::string literalText;
+        if (literalSize > 0)
+        {
+            literalText.assign(
+                    reinterpret_cast<const char *>(literal), literalSize);
+        }
+        std::string cursorText;
+        if (cursorSize > 0)
+        {
+            cursorText.assign(
+                    reinterpret_cast<const char *>(cursor), cursorSize);
+        }
+        if (!session->beginFilter(
+                    predicateColumn,
+                    static_cast<std::uint32_t>(filterOperator),
+                    literalText, projection, cursorText, limit))
         {
             return currentStatus(*session);
         }

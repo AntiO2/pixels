@@ -31,7 +31,7 @@ namespace
 {
 
 const std::string EXPECTED_METADATA =
-        "{\"abi\":2,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
+        "{\"abi\":3,\"version\":1,\"magic\":\"PIXELS\",\"rows\":10,"
         "\"pixelStride\":10000,\"schemaCount\":4,\"rowGroupCount\":1,"
         "\"firstColumn\":{\"name\":\"id\",\"kind\":4},"
         "\"postscript\":{\"contentLength\":\"352\",\"compression\":0,"
@@ -72,8 +72,10 @@ const std::string EXPECTED_METADATA =
         "\"sum\":\"66057\"}}]]}";
 
 const std::string EXPECTED_CAPABILITIES =
-        "{\"abi\":2,\"page\":\"generic-v1\","
-        "\"rowGroup\":\"layout-v1\",\"types\":["
+        "{\"abi\":3,\"page\":\"generic-v1\","
+        "\"rowGroup\":\"layout-v1\",\"rows\":\"rows-v1\","
+        "\"filter\":\"filter-v1\",\"maxRows\":500,"
+        "\"defaultRows\":100,\"types\":["
         "{\"kind\":0,\"name\":\"BOOLEAN\"},"
         "{\"kind\":1,\"name\":\"BYTE\"},"
         "{\"kind\":2,\"name\":\"SHORT\"},"
@@ -95,6 +97,9 @@ const std::string EXPECTED_CAPABILITIES =
         "{\"kind\":18,\"name\":\"TIME\"},"
         "{\"kind\":19,\"name\":\"VECTOR\"}],"
         "\"encodings\":[\"NONE\",\"RUNLENGTH\",\"DICTIONARY\"],"
+        "\"compression\":{\"metadata\":[\"NONE\",\"ZLIB\",\"SNAPPY\","
+        "\"LZO\",\"LZ4\",\"ZSTD\"],\"payload\":\"inactive\","
+        "\"reason\":\"postscript-v1-unused\"},"
         "\"nested\":\"portable-v1\"}";
 
 const std::string EXPECTED_PAGE =
@@ -244,6 +249,40 @@ void mutateFileTail(
             "unable to parse fixture FileTail for mutation");
     mutation(tail);
     replaceSerializedRange(file, range, tail);
+}
+
+void rewriteFileTail(
+        std::vector<std::uint8_t> &file,
+        const std::function<void(pixels::proto::FileTail &)> &mutation)
+{
+    require(file.size() >= 8, "fixture has no tail pointer");
+    std::uint64_t tailOffset = 0;
+    for (std::size_t byte = file.size() - 8;
+         byte < file.size(); ++byte)
+    {
+        tailOffset = (tailOffset << 8U) | file[byte];
+    }
+    require(tailOffset <= file.size() - 8,
+            "fixture tail pointer is out of bounds");
+    pixels::proto::FileTail tail;
+    require(tail.ParseFromArray(
+                    file.data() + static_cast<std::size_t>(tailOffset),
+                    static_cast<int>(
+                            file.size() - 8U
+                            - static_cast<std::size_t>(tailOffset))),
+            "unable to parse fixture FileTail for rewrite");
+    mutation(tail);
+    std::string serialized;
+    require(tail.SerializeToString(&serialized),
+            "unable to serialize rewritten FileTail");
+    file.resize(static_cast<std::size_t>(tailOffset));
+    file.insert(file.end(), serialized.begin(), serialized.end());
+    for (int byte = 7; byte >= 0; --byte)
+    {
+        file.push_back(static_cast<std::uint8_t>(
+                tailOffset
+                >> (static_cast<std::uint32_t>(byte) * 8U)));
+    }
 }
 
 void mutateRowGroupFooter(
@@ -568,6 +607,34 @@ std::vector<std::uint8_t> makeFixedScalarFixture(
         file.push_back(static_cast<std::uint8_t>(
                 tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
     }
+    return file;
+}
+
+std::vector<std::uint8_t> makeShortDecimalFixture(
+        std::uint32_t precision, std::uint32_t scale,
+        bool littleEndian, const std::vector<std::int64_t> &values)
+{
+    require(values.size() == 4,
+            "short DECIMAL fixture requires four values");
+    std::vector<std::uint8_t> file =
+            makeFixedScalarFixture(
+                    pixels::proto::Type_Kind_LONG, littleEndian);
+    std::vector<std::uint8_t> bytes;
+    for (std::int64_t value : values)
+    {
+        appendUint64(
+                bytes, static_cast<std::uint64_t>(value),
+                littleEndian);
+    }
+    std::copy(bytes.begin(), bytes.end(), file.begin());
+    rewriteFileTail(
+            file, [precision, scale](pixels::proto::FileTail &tail) {
+                pixels::proto::Type *type =
+                        tail.mutable_footer()->mutable_types(0);
+                type->set_kind(pixels::proto::Type_Kind_DECIMAL);
+                type->set_precision(precision);
+                type->set_scale(scale);
+            });
     return file;
 }
 
@@ -1062,7 +1129,9 @@ std::vector<std::uint8_t> makeDictionaryFixture(bool cascadeRle)
     return file;
 }
 
-std::vector<std::uint8_t> makeLongDecimalFixture()
+std::vector<std::uint8_t> makeLongDecimalFixture(
+        std::uint32_t precision = 38, std::uint32_t scale = 4,
+        bool littleEndian = true)
 {
     const std::vector<std::uint8_t> canonical = readFixture();
     pixels::proto::RowGroupFooter rowGroupFooter;
@@ -1075,14 +1144,18 @@ std::vector<std::uint8_t> makeLongDecimalFixture()
             "unable to parse long DECIMAL fixture FileTail");
 
     std::vector<std::uint8_t> columnData;
-    appendLittleInt64(columnData, 0);
-    appendLittleInt64(columnData, 123456);
-    appendLittleInt64(columnData, -1);
-    appendLittleInt64(columnData, -1);
+    appendUint64(columnData, 0, littleEndian);
+    appendUint64(columnData, 123456, littleEndian);
+    appendUint64(
+            columnData, std::numeric_limits<std::uint64_t>::max(),
+            littleEndian);
+    appendUint64(
+            columnData, std::numeric_limits<std::uint64_t>::max(),
+            littleEndian);
     for (std::uint32_t row = 2; row < 10; ++row)
     {
-        appendLittleInt64(columnData, 0);
-        appendLittleInt64(columnData, 0);
+        appendUint64(columnData, 0, littleEndian);
+        appendUint64(columnData, 0, littleEndian);
     }
     pixels::proto::ColumnChunkIndex *chunk =
             rowGroupFooter.mutable_rowgroupindexentry()
@@ -1099,7 +1172,7 @@ std::vector<std::uint8_t> makeLongDecimalFixture()
             chunk->add_pixelstatistics()->mutable_statistic();
     statistic->set_numberofvalues(10);
     statistic->set_hasnull(false);
-    chunk->set_littleendian(true);
+    chunk->set_littleendian(littleEndian);
     chunk->set_nullspadding(false);
     rowGroupFooter.mutable_rowgroupencoding()
             ->mutable_columnchunkencodings(0)
@@ -1109,8 +1182,8 @@ std::vector<std::uint8_t> makeLongDecimalFixture()
             fileTail.mutable_footer()->mutable_types(0);
     type->set_kind(pixels::proto::Type_Kind_DECIMAL);
     type->set_name("amount");
-    type->set_precision(38);
-    type->set_scale(4);
+    type->set_precision(precision);
+    type->set_scale(scale);
     pixels::proto::RowGroupInformation *rowGroup =
             fileTail.mutable_footer()->mutable_rowgroupinfos(0);
     rowGroup->set_footeroffset(352);
@@ -1677,6 +1750,23 @@ std::string decodePage(
     }
     require(status == PIXELS_INSPECTOR_RESULT_READY,
             "generic fixture ranges did not produce a page");
+    return readResult(session);
+}
+
+std::string driveOperation(
+        Session &session, const std::vector<std::uint8_t> &file,
+        pixels_inspector_status status)
+{
+    std::size_t suppliedRanges = 0;
+    while (status == PIXELS_INSPECTOR_RANGE_READY)
+    {
+        status = supply(session, nextRange(session), file);
+        ++suppliedRanges;
+        require(suppliedRanges < 4096,
+                "composite operation did not converge");
+    }
+    require(status == PIXELS_INSPECTOR_RESULT_READY,
+            "composite operation did not produce a result");
     return readResult(session);
 }
 
@@ -2574,6 +2664,624 @@ void testTpchLineitemFixture()
             "TPC-H lineitem second row-group VARCHAR preview differs");
 }
 
+void testRowProjection()
+{
+    const std::vector<std::uint8_t> file = readFixture();
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    const std::uint32_t columns[] = {0, 1, 3};
+    const std::string result = driveOperation(
+            session, file,
+            pixels_inspector_begin_rows(
+                    session.handle(), 0, columns, 3, 2, 3));
+    require(result.find(
+                    "{\"operation\":\"rows-v1\",\"rowGroup\":0,"
+                    "\"offset\":\"2\",\"count\":3")
+            == 0,
+            "row projection header differs");
+    require(result.find(
+                    "\"columns\":[{\"id\":0,\"name\":\"id\",\"kind\":4},"
+                    "{\"id\":1,\"name\":\"name\",\"kind\":16},"
+                    "{\"id\":3,\"name\":\"score\",\"kind\":14}]")
+            != std::string::npos,
+            "row projection descriptors differ");
+    for (std::uint32_t row = 2; row < 5; ++row)
+    {
+        const std::string identity =
+                "{\"rowGroup\":0,\"localRow\":\""
+                + std::to_string(row)
+                + "\",\"absoluteRow\":\""
+                + std::to_string(row) + "\",\"values\":[";
+        require(result.find(identity) != std::string::npos,
+                "row projection lost stable row identity");
+    }
+
+    {
+        Session invalid(file.size());
+        driveMetadataFlexible(invalid, file);
+        const std::uint32_t duplicate[] = {0, 0};
+        require(pixels_inspector_begin_rows(
+                        invalid.handle(), 0, duplicate, 2, 0, 1)
+                == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+                "duplicate row projection was accepted");
+    }
+    {
+        Session invalid(file.size());
+        driveMetadataFlexible(invalid, file);
+        require(pixels_inspector_begin_rows(
+                        invalid.handle(), 0, columns, 3, 0, 501)
+                == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+                "row projection above 500 rows was accepted");
+    }
+    {
+        const std::vector<std::uint8_t> nested = makeNestedFixture();
+        Session invalid(nested.size());
+        driveMetadataFlexible(invalid, nested);
+        const std::uint32_t child[] = {2};
+        require(pixels_inspector_begin_rows(
+                        invalid.handle(), 0, child, 1, 0, 1)
+                == PIXELS_INSPECTOR_OUT_OF_BOUNDS,
+                "nested child was accepted as a root projection");
+    }
+}
+
+void testWholeFileFilter()
+{
+    const std::vector<std::uint8_t> file = readFixture();
+    const std::uint32_t columns[] = {0};
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::string literal = "8";
+        const std::string result = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GE,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 100));
+        require(result
+                == "{\"operation\":\"filter-v1\",\"columns\":["
+                   "{\"id\":0,\"name\":\"id\",\"kind\":4}],\"rows\":["
+                   "{\"rowGroup\":0,\"localRow\":\"8\","
+                   "\"absoluteRow\":\"8\",\"values\":[\"8\"]},"
+                   "{\"rowGroup\":0,\"localRow\":\"9\","
+                   "\"absoluteRow\":\"9\",\"values\":[\"9\"]}],"
+                   "\"progress\":{\"scannedRowGroups\":1,"
+                   "\"prunedRowGroups\":0,\"scannedRows\":\"10\","
+                   "\"prunedRows\":\"0\"},\"matched\":2,"
+                   "\"completed\":true,\"truncated\":false,"
+                   "\"cursor\":null}",
+                "whole-file filter result differs from the golden");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::string literal = "0";
+        const std::string first = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GE,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 1));
+        require(first.find("\"matched\":1,\"completed\":false,"
+                           "\"truncated\":true,\"cursor\":\"v1:0:1\"}")
+                != std::string::npos,
+                "filter did not return a bounded continuation");
+
+        const std::string cursor = "v1:0:1";
+        const std::string second = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GE,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        reinterpret_cast<const std::uint8_t *>(
+                                cursor.data()),
+                        cursor.size(), 1));
+        require(second.find("\"localRow\":\"1\"")
+                != std::string::npos
+                && second.find("\"cursor\":\"v1:0:2\"")
+                   != std::string::npos,
+                "filter continuation did not resume exactly");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::string literal = "20";
+        const std::string result = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_EQ,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 0));
+        require(result.find(
+                    "\"scannedRowGroups\":0,\"prunedRowGroups\":1,"
+                    "\"scannedRows\":\"0\",\"prunedRows\":\"10\"")
+                != std::string::npos,
+                "filter did not conservatively prune impossible statistics");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::uint32_t stringColumns[] = {0, 1};
+        const std::string literal = "Alice";
+        const std::string result = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 1,
+                        PIXELS_INSPECTOR_FILTER_CONTAINS,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), stringColumns, 2,
+                        nullptr, 0, 100));
+        require(result.find("\"matched\":1")
+                != std::string::npos
+                && result.find("\"values\":[\"4\",\"Alice\"]")
+                   != std::string::npos,
+                "case-sensitive contains filter differs");
+    }
+    {
+        std::vector<std::uint8_t> nullable =
+                makeByteRleFixture();
+        rewriteFileTail(
+                nullable, [](pixels::proto::FileTail &tail) {
+                    tail.mutable_footer()
+                            ->mutable_rowgroupstats(0)
+                            ->mutable_columnchunkstats(0)
+                            ->set_hasnull(true);
+                });
+        Session session(nullable.size());
+        driveMetadataFlexible(session, nullable);
+        const std::string result = driveOperation(
+                session, nullable,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_IS_NULL,
+                        nullptr, 0, columns, 1,
+                        nullptr, 0, 100));
+        require(result.find("\"localRow\":\"1\"")
+                != std::string::npos,
+                "is-null filter did not match the null row");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::string literal = "01";
+        require(pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_EQ,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 100)
+                == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+                "non-canonical integer literal was accepted");
+    }
+    {
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::string literal = "0";
+        const std::string cursor = "v1:00:1";
+        require(pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_EQ,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        reinterpret_cast<const std::uint8_t *>(
+                                cursor.data()),
+                        cursor.size(), 100)
+                == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+                "non-canonical filter cursor was accepted");
+    }
+    require(pixels_inspector_begin_rows(
+                    0, 0, columns, 1, 0, 1)
+            == PIXELS_INSPECTOR_INVALID_HANDLE,
+            "unknown rows-v1 handle was accepted");
+    require(pixels_inspector_begin_rows(
+                    0, 0, nullptr, 1, 0, 1)
+            == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+            "null rows-v1 projection pointer was accepted");
+    require(pixels_inspector_begin_filter(
+                    0, 0, PIXELS_INSPECTOR_FILTER_EQ,
+                    nullptr, 1, columns, 1,
+                    nullptr, 0, 100)
+            == PIXELS_INSPECTOR_INVALID_ARGUMENT,
+            "null filter literal pointer was accepted");
+
+    {
+        const std::vector<std::uint8_t> lineitem =
+                makeTpchLineitemFixture();
+        Session session(lineitem.size());
+        driveMetadataFlexible(session, lineitem);
+        const std::uint32_t projection[] = {0, 15};
+        const std::string literal = "13";
+        const std::string result = driveOperation(
+                session, lineitem,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GE,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), projection, 2,
+                        nullptr, 0, 100));
+        require(result.find(
+                    "{\"rowGroup\":1,\"localRow\":\"0\","
+                    "\"absoluteRow\":\"2\",\"values\":[\"13\","
+                    "\"third line\"]}")
+                != std::string::npos
+                && result.find(
+                    "{\"rowGroup\":1,\"localRow\":\"1\","
+                    "\"absoluteRow\":\"3\",\"values\":[\"14\","
+                    "\"fourth line\"]}")
+                   != std::string::npos,
+                "whole-file filter lost cross-row-group ordering");
+    }
+}
+
+void testCompatibilityMetadata()
+{
+    const pixels::proto::CompressionKind compressions[] = {
+            pixels::proto::NONE, pixels::proto::ZLIB,
+            pixels::proto::SNAPPY, pixels::proto::LZO,
+            pixels::proto::LZ4, pixels::proto::ZSTD};
+    for (const pixels::proto::CompressionKind compression :
+         compressions)
+    {
+        std::vector<std::uint8_t> file = readFixture();
+        rewriteFileTail(
+                file, [compression](pixels::proto::FileTail &tail) {
+                    tail.mutable_postscript()->set_compression(
+                            compression);
+                });
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::string marker =
+                "\"compression\":"
+                + std::to_string(static_cast<int>(compression));
+        require(readResult(session).find(marker)
+                != std::string::npos,
+                "compression enum metadata was not preserved");
+        require(decodePage(file, 0, 0, 2)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                   "\"count\":2,\"values\":[\"0\",\"1\"]}",
+                "inactive compression metadata changed payload decoding");
+    }
+
+    const std::vector<std::string> timezones = {
+            "", "UTC", "America/Shanghai",
+            "Pacific Standard Time", "not/a-zone"};
+    for (const std::string &timezone : timezones)
+    {
+        std::vector<std::uint8_t> file = readFixture();
+        rewriteFileTail(
+                file, [&timezone](pixels::proto::FileTail &tail) {
+                    tail.mutable_postscript()->set_writertimezone(
+                            timezone);
+                });
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(readResult(session).find(
+                    "\"writerTimezone\":\""
+                    + timezone + "\"")
+                != std::string::npos,
+                "writer timezone provenance was not preserved");
+        require(decodePage(file, 0, 0, 1).find(
+                    "\"values\":[\"0\"]")
+                != std::string::npos,
+                "writer timezone changed stored scalar values");
+    }
+}
+
+void testDecimalAndTimestampBoundaries()
+{
+    struct DecimalCase
+    {
+        std::uint32_t precision;
+        std::uint32_t scale;
+        const char *expected;
+    };
+    const DecimalCase shortCases[] = {
+            {1, 0, "[\"9\",\"-9\",\"0\",\"1\"]"},
+            {18, 18,
+             "[\"0.000000000000000001\","
+             "\"-0.000000000000000001\","
+             "\"0.000000000000000000\","
+             "\"0.999999999999999999\"]"}};
+    for (const bool littleEndian : {false, true})
+    {
+        for (const DecimalCase &test : shortCases)
+        {
+            const std::vector<std::int64_t> values =
+                    test.precision == 1
+                    ? std::vector<std::int64_t>{9, -9, 0, 1}
+                    : std::vector<std::int64_t>{
+                            1, -1, 0, 999999999999999999LL};
+            const std::string result = decodePage(
+                    makeShortDecimalFixture(
+                            test.precision, test.scale,
+                            littleEndian, values),
+                    0, 0, 4);
+            require(result.find(test.expected) != std::string::npos,
+                    "short DECIMAL boundary differs");
+        }
+        for (const DecimalCase &test :
+             std::vector<DecimalCase>{
+                     {19, 0, "[\"123456\",\"-1\"]"},
+                     {38, 4, "[\"12.3456\",\"-0.0001\"]"}})
+        {
+            const std::string result = decodePage(
+                    makeLongDecimalFixture(
+                            test.precision, test.scale,
+                            littleEndian),
+                    0, 0, 2);
+            require(result.find(test.expected) != std::string::npos,
+                    "long DECIMAL boundary differs");
+        }
+    }
+
+    for (std::uint32_t precision = 0; precision <= 6; ++precision)
+    {
+        for (const bool littleEndian : {false, true})
+        {
+            std::vector<std::uint8_t> file =
+                    makeFixedScalarFixture(
+                            pixels::proto::Type_Kind_TIMESTAMP,
+                            littleEndian);
+            rewriteFileTail(
+                    file, [precision](pixels::proto::FileTail &tail) {
+                        tail.mutable_footer()
+                                ->mutable_types(0)
+                                ->set_precision(precision);
+                    });
+            Session session(file.size());
+            driveMetadataFlexible(session, file);
+            require(readResult(session).find(
+                        "\"precision\":"
+                        + std::to_string(precision))
+                    != std::string::npos,
+                    "TIMESTAMP precision metadata was not preserved");
+            require(decodePage(file, 0, 0, 4).find(
+                        "\"values\":[\"-9223372036854775808\","
+                        "\"-1\",\"0\",\"9223372036854775807\"]")
+                    != std::string::npos,
+                    "TIMESTAMP precision changed stored microseconds");
+        }
+    }
+
+    std::vector<std::uint8_t> rle =
+            makeMultiPixelLongFixture(
+                    false, {0, 0, 0},
+                    std::function<void(
+                            pixels::proto::RowGroupFooter &)>(), true);
+    rewriteFileTail(
+            rle, [](pixels::proto::FileTail &tail) {
+                pixels::proto::Type *type =
+                        tail.mutable_footer()->mutable_types(0);
+                type->set_kind(
+                        pixels::proto::Type_Kind_TIMESTAMP);
+                type->set_precision(6);
+            });
+    require(decodePage(rle, 0, 2, 5).find(
+                "\"values\":[\"2\",\"3\",\"4\",\"5\",\"6\"]")
+            != std::string::npos,
+            "RUNLENGTH TIMESTAMP page differs");
+}
+
+void testSupportedEncodingMatrix()
+{
+    const pixels::proto::Type_Kind rleKinds[] = {
+            pixels::proto::Type_Kind_SHORT,
+            pixels::proto::Type_Kind_INT,
+            pixels::proto::Type_Kind_LONG,
+            pixels::proto::Type_Kind_DATE,
+            pixels::proto::Type_Kind_TIME,
+            pixels::proto::Type_Kind_TIMESTAMP};
+    for (const pixels::proto::Type_Kind kind : rleKinds)
+    {
+        std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        false, {0, 0, 0},
+                        std::function<void(
+                                pixels::proto::RowGroupFooter &)>(), true);
+        rewriteFileTail(
+                file, [kind](pixels::proto::FileTail &tail) {
+                    pixels::proto::Type *type =
+                            tail.mutable_footer()->mutable_types(0);
+                    type->set_kind(kind);
+                    if (kind == pixels::proto::Type_Kind_TIMESTAMP)
+                    {
+                        type->set_precision(6);
+                    }
+                });
+        require(decodePage(file, 0, 0, 10).find(
+                    "\"values\":[\"0\",\"1\",\"2\",\"3\",\"4\","
+                    "\"5\",\"6\",\"7\",\"8\",\"9\"]")
+                != std::string::npos,
+                "supported RUNLENGTH type differs");
+    }
+
+    const pixels::proto::Type_Kind dictionaryKinds[] = {
+            pixels::proto::Type_Kind_STRING,
+            pixels::proto::Type_Kind_VARCHAR,
+            pixels::proto::Type_Kind_CHAR};
+    for (const bool cascadeRle : {false, true})
+    {
+        for (const pixels::proto::Type_Kind kind : dictionaryKinds)
+        {
+            std::vector<std::uint8_t> file =
+                    makeDictionaryFixture(cascadeRle);
+            rewriteFileTail(
+                    file, [kind](pixels::proto::FileTail &tail) {
+                        tail.mutable_footer()
+                                ->mutable_types(0)
+                                ->set_kind(kind);
+                    });
+            require(decodePage(file, 0, 0, 4).find(
+                        "\"values\":[\"cat\",null,\"dog\",\"cat\"]")
+                    != std::string::npos,
+                    "supported DICTIONARY type differs");
+        }
+    }
+
+    {
+        std::vector<std::uint8_t> file =
+                makeFixedScalarFixture(
+                        pixels::proto::Type_Kind_DOUBLE, true);
+        rewriteFileTail(
+                file, [](pixels::proto::FileTail &tail) {
+                    tail.mutable_footer()
+                            ->mutable_types(0)
+                            ->set_kind(
+                                    pixels::proto::Type_Kind_DOUBLE);
+                });
+        // A declared but invalid type/encoding pair must fail explicitly.
+        std::uint64_t tailOffset = 0;
+        for (std::size_t byte = file.size() - 8;
+             byte < file.size(); ++byte)
+        {
+            tailOffset = (tailOffset << 8U) | file[byte];
+        }
+        pixels::proto::FileTail tail;
+        require(tail.ParseFromArray(
+                        file.data() + tailOffset,
+                        static_cast<int>(
+                                file.size() - tailOffset - 8U)),
+                "unable to parse invalid-pair FileTail");
+        const pixels::proto::RowGroupInformation &information =
+                tail.footer().rowgroupinfos(0);
+        pixels::proto::RowGroupFooter footer;
+        require(footer.ParseFromArray(
+                        file.data() + information.footeroffset(),
+                        information.footerlength()),
+                "unable to parse invalid-pair footer");
+        footer.mutable_rowgroupencoding()
+                ->mutable_columnchunkencodings(0)
+                ->set_kind(
+                        pixels::proto::ColumnEncoding_Kind_RUNLENGTH);
+        std::string serialized;
+        require(footer.SerializeToString(&serialized)
+                && serialized.size() == information.footerlength(),
+                "invalid-pair footer changed size");
+        std::copy(serialized.begin(), serialized.end(),
+                  file.begin() + information.footeroffset());
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 0, 0, 1)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "invalid type/encoding pair did not request footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_UNSUPPORTED_ENCODING,
+                "invalid type/encoding pair was not rejected explicitly");
+    }
+}
+
+void testDecimalAndTimestampOperations()
+{
+    {
+        const std::vector<std::uint8_t> file =
+                makeShortDecimalFixture(
+                        18, 18, true,
+                        {1, -1, 0, 999999999999999999LL});
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::uint32_t columns[] = {0};
+        const std::string rows = driveOperation(
+                session, file,
+                pixels_inspector_begin_rows(
+                        session.handle(), 0, columns, 1, 0, 4));
+        require(rows.find(
+                    "\"values\":[\"0.000000000000000001\"]")
+                != std::string::npos
+                && rows.find(
+                    "\"values\":[\"0.999999999999999999\"]")
+                   != std::string::npos,
+                "DECIMAL row projection lost exact scale");
+        const std::string literal = "0";
+        const std::string filtered = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GE,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 100));
+        require(filtered.find("\"matched\":3")
+                != std::string::npos,
+                "DECIMAL typed comparison differs");
+    }
+    {
+        std::vector<std::uint8_t> file =
+                makeFixedScalarFixture(
+                        pixels::proto::Type_Kind_TIMESTAMP, true);
+        rewriteFileTail(
+                file, [](pixels::proto::FileTail &tail) {
+                    tail.mutable_footer()
+                            ->mutable_types(0)
+                            ->set_precision(6);
+                    tail.mutable_postscript()->set_writertimezone(
+                            "America/Shanghai");
+                });
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::uint32_t columns[] = {0};
+        const std::string literal = "0";
+        const std::string filtered = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_LT,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 100));
+        require(filtered.find("\"matched\":2")
+                != std::string::npos
+                && filtered.find(
+                    "\"values\":[\"-9223372036854775808\"]")
+                   != std::string::npos,
+                "TIMESTAMP typed comparison changed exact microseconds");
+    }
+    {
+        const std::vector<std::uint8_t> file =
+                makeFixedScalarFixture(
+                        pixels::proto::Type_Kind_DOUBLE, true);
+        Session session(file.size());
+        driveMetadataFlexible(session, file);
+        const std::uint32_t columns[] = {0};
+        const std::string literal = "0";
+        const std::string filtered = driveOperation(
+                session, file,
+                pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GT,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 100));
+        require(filtered.find("\"matched\":2")
+                != std::string::npos
+                && filtered.find("\"values\":[1.5]")
+                   != std::string::npos
+                && filtered.find("\"values\":[\"Infinity\"]")
+                   != std::string::npos,
+                "floating predicate special-value semantics differ");
+    }
+}
+
 void testNestedCancellation()
 {
     const std::vector<std::uint8_t> file = makeNestedFixture();
@@ -3329,6 +4037,36 @@ void testCancellationStates()
                 == PIXELS_INSPECTOR_CANCELLED,
                 "second-pixel value wait was not cancellable");
     }
+    {
+        Session session(file.size());
+        driveMetadata(session, file);
+        const std::uint32_t columns[] = {0, 1};
+        require(pixels_inspector_begin_rows(
+                        session.handle(), 0, columns, 2, 0, 2)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "row projection did not request its first child");
+        require(pixels_inspector_cancel(session.handle())
+                == PIXELS_INSPECTOR_CANCELLED,
+                "row projection was not cancellable");
+    }
+    {
+        Session session(file.size());
+        driveMetadata(session, file);
+        const std::uint32_t columns[] = {0};
+        const std::string literal = "0";
+        require(pixels_inspector_begin_filter(
+                        session.handle(), 0,
+                        PIXELS_INSPECTOR_FILTER_GE,
+                        reinterpret_cast<const std::uint8_t *>(
+                                literal.data()),
+                        literal.size(), columns, 1,
+                        nullptr, 0, 100)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "filter did not request its predicate page");
+        require(pixels_inspector_cancel(session.handle())
+                == PIXELS_INSPECTOR_CANCELLED,
+                "filter was not cancellable");
+    }
 }
 
 void testInvalidPageRequests()
@@ -3398,7 +4136,7 @@ void writeBytes(
 void writeConformanceCorpus(const std::filesystem::path &directory)
 {
     std::filesystem::create_directories(directory);
-    std::string manifest = "{\"abi\":2,\"cases\":[";
+    std::string manifest = "{\"abi\":3,\"cases\":[";
     bool first = true;
     const auto addCase =
             [&](const std::string &name, const std::string &fileName,
@@ -3530,6 +4268,218 @@ void writeConformanceCorpus(const std::filesystem::path &directory)
             "{\"tags\":[\"13\",\"14\"],\"attrs\":[],"
             "\"label\":\"z\"}]}");
 
+    manifest += "],\"compatibility\":[";
+    first = true;
+
+    writeBytes(directory / "RLE-BYTE.pxl", makeByteRleFixture());
+    addCase(
+            "RLE-BYTE", "RLE-BYTE.pxl", 0, 0, 5,
+            "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":5,"
+            "\"values\":[\"1\",null,\"1\",\"1\",\"-2\"]}");
+    const std::pair<pixels::proto::Type_Kind, const char *> rleCases[] = {
+            {pixels::proto::Type_Kind_SHORT, "SHORT"},
+            {pixels::proto::Type_Kind_INT, "INT"},
+            {pixels::proto::Type_Kind_LONG, "LONG"},
+            {pixels::proto::Type_Kind_DATE, "DATE"},
+            {pixels::proto::Type_Kind_TIME, "TIME"},
+            {pixels::proto::Type_Kind_TIMESTAMP, "TIMESTAMP"}};
+    for (const auto &test : rleCases)
+    {
+        std::vector<std::uint8_t> file =
+                makeMultiPixelLongFixture(
+                        false, {0, 0, 0},
+                        std::function<void(
+                                pixels::proto::RowGroupFooter &)>(), true);
+        rewriteFileTail(
+                file, [&test](pixels::proto::FileTail &tail) {
+                    pixels::proto::Type *type =
+                            tail.mutable_footer()->mutable_types(0);
+                    type->set_kind(test.first);
+                    if (test.first
+                        == pixels::proto::Type_Kind_TIMESTAMP)
+                    {
+                        type->set_precision(6);
+                    }
+                });
+        const std::string name =
+                "RLE-" + std::string(test.second);
+        const std::string fileName = name + ".pxl";
+        writeBytes(directory / fileName, file);
+        addCase(
+                name, fileName, 0, 0, 10,
+                "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                "\"count\":10,\"values\":[\"0\",\"1\",\"2\",\"3\","
+                "\"4\",\"5\",\"6\",\"7\",\"8\",\"9\"]}");
+    }
+
+    const std::pair<pixels::proto::Type_Kind, const char *>
+            dictionaryCases[] = {
+                    {pixels::proto::Type_Kind_STRING, "STRING"},
+                    {pixels::proto::Type_Kind_VARCHAR, "VARCHAR"},
+                    {pixels::proto::Type_Kind_CHAR, "CHAR"}};
+    for (const bool cascade : {false, true})
+    {
+        for (const auto &test : dictionaryCases)
+        {
+            std::vector<std::uint8_t> file =
+                    makeDictionaryFixture(cascade);
+            rewriteFileTail(
+                    file, [&test](pixels::proto::FileTail &tail) {
+                        tail.mutable_footer()
+                                ->mutable_types(0)
+                                ->set_kind(test.first);
+                    });
+            const std::string name =
+                    "DICTIONARY-"
+                    + std::string(test.second)
+                    + (cascade ? "-RLE" : "-PLAIN");
+            const std::string fileName = name + ".pxl";
+            writeBytes(directory / fileName, file);
+            addCase(
+                    name, fileName, 0, 0, 4,
+                    "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                    "\"count\":4,\"values\":[\"cat\",null,"
+                    "\"dog\",\"cat\"]}");
+        }
+    }
+
+    for (const bool littleEndian : {false, true})
+    {
+        const std::string endian =
+                littleEndian ? "LE" : "BE";
+        struct ShortDecimalCase
+        {
+            std::uint32_t precision;
+            std::uint32_t scale;
+            std::vector<std::int64_t> values;
+            const char *expected;
+        };
+        const ShortDecimalCase shortDecimals[] = {
+                {1, 0, {9, -9, 0, 1},
+                 "[\"9\",\"-9\",\"0\",\"1\"]"},
+                {18, 18, {1, -1, 0, 999999999999999999LL},
+                 "[\"0.000000000000000001\","
+                 "\"-0.000000000000000001\","
+                 "\"0.000000000000000000\","
+                 "\"0.999999999999999999\"]"}};
+        for (const ShortDecimalCase &test : shortDecimals)
+        {
+            const std::string name =
+                    "DECIMAL-" + std::to_string(test.precision)
+                    + "-" + endian;
+            const std::string fileName = name + ".pxl";
+            writeBytes(
+                    directory / fileName,
+                    makeShortDecimalFixture(
+                            test.precision, test.scale,
+                            littleEndian, test.values));
+            addCase(
+                    name, fileName, 0, 0, 4,
+                    "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                    "\"count\":4,\"values\":"
+                    + std::string(test.expected) + "}");
+        }
+        const std::pair<std::uint32_t, std::uint32_t>
+                longDecimals[] = {{19, 0}, {38, 4}};
+        for (const auto &test : longDecimals)
+        {
+            const std::string name =
+                    "DECIMAL-" + std::to_string(test.first)
+                    + "-" + endian;
+            const std::string fileName = name + ".pxl";
+            writeBytes(
+                    directory / fileName,
+                    makeLongDecimalFixture(
+                            test.first, test.second,
+                            littleEndian));
+            const std::string values =
+                    test.first == 19
+                    ? "[\"123456\",\"-1\"]"
+                    : "[\"12.3456\",\"-0.0001\"]";
+            addCase(
+                    name, fileName, 0, 0, 2,
+                    "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                    "\"count\":2,\"values\":" + values + "}");
+        }
+
+        for (std::uint32_t precision = 0;
+             precision <= 6; ++precision)
+        {
+            std::vector<std::uint8_t> file =
+                    makeFixedScalarFixture(
+                            pixels::proto::Type_Kind_TIMESTAMP,
+                            littleEndian);
+            rewriteFileTail(
+                    file, [precision](pixels::proto::FileTail &tail) {
+                        tail.mutable_footer()
+                                ->mutable_types(0)
+                                ->set_precision(precision);
+                    });
+            const std::string name =
+                    "TIMESTAMP-" + std::to_string(precision)
+                    + "-" + endian;
+            const std::string fileName = name + ".pxl";
+            writeBytes(directory / fileName, file);
+            addCase(
+                    name, fileName, 0, 0, 4,
+                    "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                    "\"count\":4,\"values\":["
+                    "\"-9223372036854775808\",\"-1\",\"0\","
+                    "\"9223372036854775807\"]}");
+        }
+    }
+
+    const std::pair<const char *, const char *> timezoneCases[] = {
+            {"empty", ""}, {"UTC", "UTC"},
+            {"IANA", "America/Shanghai"},
+            {"Windows", "Pacific Standard Time"},
+            {"unknown", "not/a-zone"}};
+    for (const auto &test : timezoneCases)
+    {
+        std::vector<std::uint8_t> file =
+                makeFixedScalarFixture(
+                        pixels::proto::Type_Kind_TIMESTAMP, true);
+        rewriteFileTail(
+                file, [&test](pixels::proto::FileTail &tail) {
+                    tail.mutable_postscript()->set_writertimezone(
+                            test.second);
+                });
+        const std::string name =
+                "TIMEZONE-" + std::string(test.first);
+        const std::string fileName = name + ".pxl";
+        writeBytes(directory / fileName, file);
+        addCase(
+                name, fileName, 0, 1, 2,
+                "{\"rowGroup\":0,\"column\":0,\"offset\":1,"
+                "\"count\":2,\"values\":[\"-1\",\"0\"]}");
+    }
+
+    const std::pair<pixels::proto::CompressionKind, const char *>
+            compressionCases[] = {
+                    {pixels::proto::NONE, "NONE"},
+                    {pixels::proto::ZLIB, "ZLIB"},
+                    {pixels::proto::SNAPPY, "SNAPPY"},
+                    {pixels::proto::LZO, "LZO"},
+                    {pixels::proto::LZ4, "LZ4"},
+                    {pixels::proto::ZSTD, "ZSTD"}};
+    for (const auto &test : compressionCases)
+    {
+        std::vector<std::uint8_t> file = readFixture();
+        rewriteFileTail(
+                file, [&test](pixels::proto::FileTail &tail) {
+                    tail.mutable_postscript()->set_compression(
+                            test.first);
+                });
+        const std::string name =
+                "COMPRESSION-" + std::string(test.second);
+        const std::string fileName = name + ".pxl";
+        writeBytes(directory / fileName, file);
+        addCase(
+                name, fileName, 0, 0, 2,
+                "{\"rowGroup\":0,\"column\":0,\"offset\":0,"
+                "\"count\":2,\"values\":[\"0\",\"1\"]}");
+    }
+
     manifest += "]}\n";
     std::ofstream output(directory / "manifest.json");
     require(output.good(), "unable to create corpus manifest");
@@ -3607,6 +4557,12 @@ int main(int argc, char **argv)
         testLongDecimalPage();
         testByteRlePage();
         testTpchLineitemFixture();
+        testRowProjection();
+        testWholeFileFilter();
+        testCompatibilityMetadata();
+        testDecimalAndTimestampBoundaries();
+        testSupportedEncodingMatrix();
+        testDecimalAndTimestampOperations();
         testNestedPage();
         testNestedCancellation();
         testMalformedNestedRange();

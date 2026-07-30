@@ -52,7 +52,8 @@ public:
         AWAITING_DICTIONARY_TRAILER = 14,
         AWAITING_DICTIONARY_STARTS = 15,
         AWAITING_DICTIONARY_CONTENT = 16,
-        AWAITING_NESTED_CHILD = 17
+        AWAITING_NESTED_CHILD = 17,
+        AWAITING_OPERATION_CHILD = 18
     };
 
     explicit InspectionSession(std::uint64_t fileSize);
@@ -66,6 +67,17 @@ public:
     [[nodiscard]] bool beginPage(
             std::uint32_t rowGroup, std::uint32_t column,
             std::uint64_t rowOffset, std::uint32_t rowCount);
+
+    [[nodiscard]] bool beginRows(
+            std::uint32_t rowGroup,
+            const std::vector<std::uint32_t> &columns,
+            std::uint64_t rowOffset, std::uint32_t rowCount);
+
+    [[nodiscard]] bool beginFilter(
+            std::uint32_t predicateColumn, std::uint32_t filterOperator,
+            const std::string &literal,
+            const std::vector<std::uint32_t> &columns,
+            const std::string &cursor, std::uint32_t limit);
 
     [[nodiscard]] bool beginRowGroup(std::uint32_t rowGroup);
 
@@ -109,6 +121,33 @@ private:
         std::uint64_t variableContentBase = 0;
     };
 
+    enum class Operation : std::uint32_t
+    {
+        NONE = 0,
+        ROWS = 1,
+        FILTER = 2
+    };
+
+    struct FilterRequest
+    {
+        std::uint32_t predicateColumn = 0;
+        std::uint32_t filterOperator = 0;
+        std::string literal;
+        std::uint32_t rowGroup = 0;
+        std::uint64_t rowOffset = 0;
+        std::uint32_t limit = 100;
+        std::uint64_t scannedRows = 0;
+        std::uint64_t prunedRows = 0;
+        std::uint32_t scannedRowGroups = 0;
+        std::uint32_t prunedRowGroups = 0;
+        std::uint32_t countedRowGroup =
+                static_cast<std::uint32_t>(-1);
+        bool predicateReady = false;
+        std::uint32_t batchCount = 0;
+        std::vector<std::string> predicateValues;
+        std::vector<std::uint32_t> matchingRows;
+    };
+
     [[nodiscard]] bool consumeTailPointer(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeFileTail(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeRowGroupFooter(const format::ByteSpan &bytes);
@@ -130,6 +169,29 @@ private:
             const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeNestedChild(
             const format::ByteSpan &bytes);
+    [[nodiscard]] bool consumeOperationChild(
+            const format::ByteSpan &bytes);
+    [[nodiscard]] bool startOperationPage(
+            std::uint32_t rowGroup, std::uint32_t column,
+            std::uint64_t rowOffset, std::uint32_t rowCount);
+    [[nodiscard]] bool continueRows();
+    [[nodiscard]] bool continueFilter();
+    [[nodiscard]] bool finishRows();
+    [[nodiscard]] bool finishFilter(bool completed);
+    [[nodiscard]] bool validateProjection(
+            const std::vector<std::uint32_t> &columns);
+    [[nodiscard]] bool isRootColumn(std::uint32_t column) const;
+    [[nodiscard]] bool filterValueMatches(
+            const proto::Type &type, const std::string &value,
+            bool &matches);
+    [[nodiscard]] bool rowGroupCanBePruned(
+            std::uint32_t rowGroup, bool &pruned) const;
+    [[nodiscard]] bool parseFilterCursor(
+            const std::string &cursor,
+            std::uint32_t &rowGroup, std::uint64_t &rowOffset) const;
+    [[nodiscard]] std::uint64_t absoluteRow(
+            std::uint32_t rowGroup, std::uint64_t localRow) const;
+    void resetOperation();
     [[nodiscard]] bool validatePageRequest();
     [[nodiscard]] bool preparePageLayout();
     [[nodiscard]] bool requestCurrentPixel();
@@ -196,6 +258,18 @@ private:
     std::size_t nestedChildIndex_ = 0;
     std::uint64_t nestedChildBase_ = 0;
     std::uint32_t nestedChildCount_ = 0;
+    Operation operation_ = Operation::NONE;
+    std::unique_ptr<InspectionSession> operationChild_;
+    std::vector<std::uint32_t> operationColumns_;
+    std::vector<std::vector<std::string>> operationColumnValues_;
+    std::size_t operationColumnIndex_ = 0;
+    std::uint32_t operationRowGroup_ = 0;
+    std::uint64_t operationRowOffset_ = 0;
+    std::uint32_t operationRowCount_ = 0;
+    FilterRequest filterRequest_;
+    std::vector<std::uint32_t> filterResultRowGroups_;
+    std::vector<std::uint64_t> filterResultLocalRows_;
+    std::vector<std::vector<std::string>> filterResultRows_;
     bool rowGroupRequest_ = false;
     std::uint32_t requestedRowGroup_ = 0;
     std::unique_ptr<bool[]> pageValidity_;

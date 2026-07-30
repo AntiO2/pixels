@@ -51,9 +51,10 @@ node cpp/pixels-inspector/tools/run_wasm_worker_conformance.cjs \
 ```
 
 The conformance runner validates the ABI, exact metadata, row-group layout,
-and page output, cancellation, mismatched ranges, all 20 logical kinds through
-the generic page operation, bounded linear memory, and the Emscripten import
-allowlist.
+generic pages, `rows-v1`, `filter-v1`, cancellation, mismatched ranges, all 20
+logical kinds, the declared encoding compatibility matrix, DECIMAL precision
+boundaries, TIMESTAMP precision and writer-timezone provenance, bounded linear
+memory, and the Emscripten import allowlist.
 
 The generic page operation supports bounded pages across pixels, padded and
 compacted null layouts, integer RLE, dictionary and plain variable-width
@@ -61,10 +62,21 @@ strings, binary values, VECTOR, and the portable nested-column contract in
 `NESTED_LAYOUT.md`. Unsupported encodings return an explicit error instead of
 falling back to guessed bytes.
 
+`rows-v1` accepts an ordered unique projection of root columns and at most 500
+rows. `filter-v1` accepts one typed root-scalar predicate, returns at most 500
+matching rows (100 when the ABI limit argument is zero), and uses a Core-owned
+continuation. Missing or ambiguous statistics always fall back to scanning.
+
+Pixels V1 declares `NONE`, `ZLIB`, `SNAPPY`, `LZO`, `LZ4`, and `ZSTD` in
+PostScript, but the format marks the compression fields as currently unused.
+ABI v3 therefore preserves all six recognized metadata values and advertises
+compression payload capability as `inactive`; it does not route chunk bytes
+through a guessed decompressor.
+
 ## Range protocol
 
 1. create a session with the immutable file size;
-2. begin metadata, a row-group layout request, or a bounded page request;
+2. begin metadata, row-group layout, page, row projection, or filter;
 3. call `next_range`;
 4. asynchronously read that exact range in the host;
 5. call `supply_range`;

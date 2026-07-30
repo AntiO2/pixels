@@ -14,7 +14,12 @@ extern "C"
 {
 #endif
 
-#define PIXELS_INSPECTOR_ABI_VERSION 2U
+#define PIXELS_INSPECTOR_ABI_VERSION 3U
+#define PIXELS_INSPECTOR_MAX_OPERATION_ROWS 500U
+#define PIXELS_INSPECTOR_DEFAULT_FILTER_ROWS 100U
+#define PIXELS_INSPECTOR_MAX_PROJECTION_COLUMNS 128U
+#define PIXELS_INSPECTOR_MAX_FILTER_LITERAL_BYTES 4096U
+#define PIXELS_INSPECTOR_MAX_FILTER_CURSOR_BYTES 64U
 
 typedef uint32_t pixels_inspector_handle;
 
@@ -36,6 +41,19 @@ typedef enum pixels_inspector_status
     PIXELS_INSPECTOR_INVALID_HANDLE = 110,
     PIXELS_INSPECTOR_INTERNAL_ERROR = 111
 } pixels_inspector_status;
+
+typedef enum pixels_inspector_filter_operator
+{
+    PIXELS_INSPECTOR_FILTER_EQ = 0,
+    PIXELS_INSPECTOR_FILTER_NE = 1,
+    PIXELS_INSPECTOR_FILTER_LT = 2,
+    PIXELS_INSPECTOR_FILTER_LE = 3,
+    PIXELS_INSPECTOR_FILTER_GT = 4,
+    PIXELS_INSPECTOR_FILTER_GE = 5,
+    PIXELS_INSPECTOR_FILTER_IS_NULL = 6,
+    PIXELS_INSPECTOR_FILTER_IS_NOT_NULL = 7,
+    PIXELS_INSPECTOR_FILTER_CONTAINS = 8
+} pixels_inspector_filter_operator;
 
 uint32_t pixels_inspector_abi_version(void);
 
@@ -64,6 +82,18 @@ pixels_inspector_status pixels_inspector_begin_plain_long_page(
 pixels_inspector_status pixels_inspector_begin_page(
         pixels_inspector_handle handle, uint32_t row_group, uint32_t column,
         uint64_t row_offset, uint32_t row_count);
+
+pixels_inspector_status pixels_inspector_begin_rows(
+        pixels_inspector_handle handle, uint32_t row_group,
+        const uint32_t *columns, uint32_t column_count,
+        uint64_t row_offset, uint32_t row_count);
+
+pixels_inspector_status pixels_inspector_begin_filter(
+        pixels_inspector_handle handle, uint32_t predicate_column,
+        pixels_inspector_filter_operator filter_operator,
+        const uint8_t *literal, uint32_t literal_size,
+        const uint32_t *columns, uint32_t column_count,
+        const uint8_t *cursor, uint32_t cursor_size, uint32_t limit);
 
 pixels_inspector_status pixels_inspector_next_range(
         pixels_inspector_handle handle, uint64_t *offset, uint64_t *length);

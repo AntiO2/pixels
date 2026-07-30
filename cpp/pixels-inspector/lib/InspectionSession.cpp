@@ -21,11 +21,15 @@
 #include "format/VariableLengthDecoder.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <memory>
+#include <set>
 #include <sstream>
 
 namespace pixels
@@ -45,6 +49,14 @@ const std::uint64_t MAX_DICTIONARY_BYTES = 67108864;
 const std::uint32_t MAX_NESTED_ELEMENTS = 65536;
 const std::uint64_t MAX_VALUE_BYTES = 16777216;
 const std::uint64_t MAX_RESULT_OUTPUT_BYTES = 67108864;
+const std::uint32_t MAX_OPERATION_ROWS =
+        PIXELS_INSPECTOR_MAX_OPERATION_ROWS;
+const std::uint32_t DEFAULT_FILTER_ROWS =
+        PIXELS_INSPECTOR_DEFAULT_FILTER_ROWS;
+const std::uint32_t MAX_PROJECTION_COLUMNS =
+        PIXELS_INSPECTOR_MAX_PROJECTION_COLUMNS;
+const std::uint32_t MAX_FILTER_LITERAL_BYTES =
+        PIXELS_INSPECTOR_MAX_FILTER_LITERAL_BYTES;
 
 bool checkedMultiply(std::uint64_t left, std::uint64_t right,
                      std::uint64_t &result) noexcept
@@ -299,6 +311,361 @@ std::string encodeBase64(const format::ByteSpan &bytes)
 std::string quoteInteger(std::int64_t value)
 {
     return "\"" + std::to_string(value) + "\"";
+}
+
+bool parseJsonString(const std::string &token, std::string &value)
+{
+    if (token.size() < 2 || token.front() != '"' || token.back() != '"')
+    {
+        return false;
+    }
+    value.clear();
+    for (std::size_t index = 1; index + 1 < token.size(); ++index)
+    {
+        const unsigned char character =
+                static_cast<unsigned char>(token[index]);
+        if (character != '\\')
+        {
+            if (character < 0x20U)
+            {
+                return false;
+            }
+            value.push_back(static_cast<char>(character));
+            continue;
+        }
+        if (++index + 1 >= token.size())
+        {
+            return false;
+        }
+        switch (token[index])
+        {
+            case '"':
+            case '\\':
+            case '/':
+                value.push_back(token[index]);
+                break;
+            case 'b':
+                value.push_back('\b');
+                break;
+            case 'f':
+                value.push_back('\f');
+                break;
+            case 'n':
+                value.push_back('\n');
+                break;
+            case 'r':
+                value.push_back('\r');
+                break;
+            case 't':
+                value.push_back('\t');
+                break;
+            case 'u':
+            {
+                if (index + 4 >= token.size() - 1)
+                {
+                    return false;
+                }
+                std::uint32_t codePoint = 0;
+                for (std::size_t digit = 0; digit < 4; ++digit)
+                {
+                    const char hex = token[++index];
+                    codePoint <<= 4U;
+                    if (hex >= '0' && hex <= '9')
+                    {
+                        codePoint |= static_cast<std::uint32_t>(hex - '0');
+                    }
+                    else if (hex >= 'a' && hex <= 'f')
+                    {
+                        codePoint |= static_cast<std::uint32_t>(
+                                hex - 'a' + 10);
+                    }
+                    else if (hex >= 'A' && hex <= 'F')
+                    {
+                        codePoint |= static_cast<std::uint32_t>(
+                                hex - 'A' + 10);
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+                if (codePoint <= 0x7FU)
+                {
+                    value.push_back(static_cast<char>(codePoint));
+                }
+                else if (codePoint <= 0x7FFU)
+                {
+                    value.push_back(static_cast<char>(
+                            0xC0U | (codePoint >> 6U)));
+                    value.push_back(static_cast<char>(
+                            0x80U | (codePoint & 0x3FU)));
+                }
+                else if (codePoint < 0xD800U || codePoint > 0xDFFFU)
+                {
+                    value.push_back(static_cast<char>(
+                            0xE0U | (codePoint >> 12U)));
+                    value.push_back(static_cast<char>(
+                            0x80U | ((codePoint >> 6U) & 0x3FU)));
+                    value.push_back(static_cast<char>(
+                            0x80U | (codePoint & 0x3FU)));
+                }
+                else
+                {
+                    return false;
+                }
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+bool normalizeSignedInteger(
+        const std::string &input, std::string &digits, bool &negative)
+{
+    if (input.empty())
+    {
+        return false;
+    }
+    std::size_t index = 0;
+    negative = input[0] == '-';
+    if (negative)
+    {
+        index = 1;
+    }
+    if (index == input.size())
+    {
+        return false;
+    }
+    if (input[index] == '0' && index + 1U < input.size())
+    {
+        return false;
+    }
+    for (std::size_t digit = index; digit < input.size(); ++digit)
+    {
+        if (input[digit] < '0' || input[digit] > '9')
+        {
+            return false;
+        }
+    }
+    while (index + 1 < input.size() && input[index] == '0')
+    {
+        ++index;
+    }
+    digits = input.substr(index);
+    if (digits == "0")
+    {
+        if (negative)
+        {
+            return false;
+        }
+        negative = false;
+    }
+    return true;
+}
+
+bool normalizeDecimal(
+        const std::string &input, std::uint32_t precision,
+        std::uint32_t scale, std::string &digits, bool &negative)
+{
+    if (input.empty())
+    {
+        return false;
+    }
+    std::size_t index = input[0] == '-' ? 1U : 0U;
+    negative = index == 1U;
+    if (index == input.size())
+    {
+        return false;
+    }
+    const std::size_t dot = input.find('.', index);
+    if (dot != std::string::npos
+        && input.find('.', dot + 1U) != std::string::npos)
+    {
+        return false;
+    }
+    const std::size_t integerEnd =
+            dot == std::string::npos ? input.size() : dot;
+    if (integerEnd == index)
+    {
+        return false;
+    }
+    for (std::size_t digit = index; digit < integerEnd; ++digit)
+    {
+        if (input[digit] < '0' || input[digit] > '9')
+        {
+            return false;
+        }
+    }
+    const std::size_t fractionStart =
+            dot == std::string::npos ? input.size() : dot + 1U;
+    const std::size_t fractionLength = input.size() - fractionStart;
+    if (fractionLength > scale
+        || (dot != std::string::npos && fractionLength == 0))
+    {
+        return false;
+    }
+    for (std::size_t digit = fractionStart;
+         digit < input.size(); ++digit)
+    {
+        if (input[digit] < '0' || input[digit] > '9')
+        {
+            return false;
+        }
+    }
+    digits = input.substr(index, integerEnd - index);
+    digits.append(input, fractionStart, fractionLength);
+    digits.append(scale - fractionLength, '0');
+    std::size_t first = 0;
+    while (first + 1U < digits.size() && digits[first] == '0')
+    {
+        ++first;
+    }
+    digits.erase(0, first);
+    if (digits.size() > precision)
+    {
+        return false;
+    }
+    if (digits == "0")
+    {
+        negative = false;
+    }
+    return true;
+}
+
+int compareSignedMagnitude(
+        const std::string &leftDigits, bool leftNegative,
+        const std::string &rightDigits, bool rightNegative)
+{
+    if (leftNegative != rightNegative)
+    {
+        return leftNegative ? -1 : 1;
+    }
+    int magnitude = 0;
+    if (leftDigits.size() != rightDigits.size())
+    {
+        magnitude = leftDigits.size() < rightDigits.size() ? -1 : 1;
+    }
+    else if (leftDigits != rightDigits)
+    {
+        magnitude = leftDigits < rightDigits ? -1 : 1;
+    }
+    return leftNegative ? -magnitude : magnitude;
+}
+
+bool applyComparison(std::uint32_t filterOperator, int comparison)
+{
+    switch (filterOperator)
+    {
+        case PIXELS_INSPECTOR_FILTER_EQ:
+            return comparison == 0;
+        case PIXELS_INSPECTOR_FILTER_NE:
+            return comparison != 0;
+        case PIXELS_INSPECTOR_FILTER_LT:
+            return comparison < 0;
+        case PIXELS_INSPECTOR_FILTER_LE:
+            return comparison <= 0;
+        case PIXELS_INSPECTOR_FILTER_GT:
+            return comparison > 0;
+        case PIXELS_INSPECTOR_FILTER_GE:
+            return comparison >= 0;
+        default:
+            return false;
+    }
+}
+
+bool compareTypedLiteral(
+        const proto::Type &type, const std::string &valueToken,
+        const std::string &literal, int &comparison)
+{
+    comparison = 0;
+    const bool stringLike =
+            type.kind() == proto::Type_Kind_STRING
+            || type.kind() == proto::Type_Kind_VARCHAR
+            || type.kind() == proto::Type_Kind_CHAR;
+    if (stringLike)
+    {
+        std::string value;
+        if (!parseJsonString(valueToken, value))
+        {
+            return false;
+        }
+        comparison = value < literal ? -1 : (value > literal ? 1 : 0);
+        return true;
+    }
+    if (type.kind() == proto::Type_Kind_BOOLEAN)
+    {
+        if ((literal != "true" && literal != "false")
+            || (valueToken != "true" && valueToken != "false"))
+        {
+            return false;
+        }
+        comparison = valueToken == literal
+                     ? 0 : (valueToken == "false" ? -1 : 1);
+        return true;
+    }
+    if (type.kind() == proto::Type_Kind_FLOAT
+        || type.kind() == proto::Type_Kind_DOUBLE)
+    {
+        std::istringstream leftInput(valueToken);
+        leftInput.imbue(std::locale::classic());
+        leftInput >> std::noskipws;
+        double left = 0;
+        if (!(leftInput >> left) || !leftInput.eof()
+            || !std::isfinite(left))
+        {
+            return false;
+        }
+        std::istringstream rightInput(literal);
+        rightInput.imbue(std::locale::classic());
+        rightInput >> std::noskipws;
+        double right = 0;
+        if (!(rightInput >> right) || !rightInput.eof()
+            || !std::isfinite(right))
+        {
+            return false;
+        }
+        comparison = left < right ? -1 : (left > right ? 1 : 0);
+        return true;
+    }
+
+    std::string valueText;
+    if (!parseJsonString(valueToken, valueText))
+    {
+        return false;
+    }
+    std::string leftDigits;
+    std::string rightDigits;
+    bool leftNegative = false;
+    bool rightNegative = false;
+    if (type.kind() == proto::Type_Kind_DECIMAL)
+    {
+        if (!type.has_precision() || !type.has_scale()
+            || !normalizeDecimal(
+                    valueText, type.precision(), type.scale(),
+                    leftDigits, leftNegative)
+            || !normalizeDecimal(
+                    literal, type.precision(), type.scale(),
+                    rightDigits, rightNegative))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        if (!normalizeSignedInteger(
+                    valueText, leftDigits, leftNegative)
+            || !normalizeSignedInteger(
+                    literal, rightDigits, rightNegative))
+        {
+            return false;
+        }
+    }
+    comparison = compareSignedMagnitude(
+            leftDigits, leftNegative, rightDigits, rightNegative);
+    return true;
 }
 
 std::string formatDecimal(std::int64_t value, std::uint32_t scale)
@@ -648,6 +1015,377 @@ bool InspectionSession::beginPage(
             rowGroup, column, rowOffset, rowCount, false);
 }
 
+bool InspectionSession::isRootColumn(std::uint32_t column) const
+{
+    const proto::Footer &footer = fileTail_.footer();
+    if (column >= static_cast<std::uint32_t>(footer.types_size()))
+    {
+        return false;
+    }
+    for (int parent = 0; parent < footer.types_size(); ++parent)
+    {
+        const proto::Type &type = footer.types(parent);
+        for (int child = 0; child < type.subtypes_size(); ++child)
+        {
+            if (type.subtypes(child) == column)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool InspectionSession::validateProjection(
+        const std::vector<std::uint32_t> &columns)
+{
+    if (columns.empty())
+    {
+        return format::fail(
+                error_, format::ErrorCode::INVALID_ARGUMENT,
+                "projection must contain at least one column");
+    }
+    if (columns.size() > MAX_PROJECTION_COLUMNS)
+    {
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "projection exceeds the bounded column limit");
+    }
+    std::set<std::uint32_t> unique;
+    for (std::uint32_t column : columns)
+    {
+        if (!isRootColumn(column))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::OUT_OF_BOUNDS,
+                    "projection contains a non-root or missing column");
+        }
+        if (!unique.insert(column).second)
+        {
+            return format::fail(
+                    error_, format::ErrorCode::INVALID_ARGUMENT,
+                    "projection columns must be unique");
+        }
+    }
+    return true;
+}
+
+void InspectionSession::resetOperation()
+{
+    operationChild_.reset();
+    operationColumns_.clear();
+    operationColumnValues_.clear();
+    operationColumnIndex_ = 0;
+    operationRowGroup_ = 0;
+    operationRowOffset_ = 0;
+    operationRowCount_ = 0;
+    filterRequest_ = FilterRequest{};
+    filterResultRowGroups_.clear();
+    filterResultLocalRows_.clear();
+    filterResultRows_.clear();
+}
+
+bool InspectionSession::beginRows(
+        std::uint32_t rowGroup,
+        const std::vector<std::uint32_t> &columns,
+        std::uint64_t rowOffset, std::uint32_t rowCount)
+{
+    if (state_ != State::METADATA_READY
+        && state_ != State::PAGE_READY)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_STATE,
+                "row projection requires ready metadata");
+    }
+    if (rowCount == 0)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "row projection count must be positive");
+    }
+    if (rowCount > MAX_OPERATION_ROWS)
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "row projection count exceeds 500 rows");
+    }
+    if (rowGroup >= static_cast<std::uint32_t>(
+                            fileTail_.footer().rowgroupinfos_size()))
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "row-group index is out of bounds");
+    }
+    error_.clear();
+    if (!validateProjection(columns))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    const proto::RowGroupInformation &information =
+            fileTail_.footer().rowgroupinfos(static_cast<int>(rowGroup));
+    std::uint64_t end = 0;
+    if (!information.has_numberofrows()
+        || !format::checkedAdd(rowOffset, rowCount, end)
+        || end > information.numberofrows())
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "row projection exceeds the row group");
+    }
+
+    resetOperation();
+    operation_ = Operation::ROWS;
+    operationColumns_ = columns;
+    operationRowGroup_ = rowGroup;
+    operationRowOffset_ = rowOffset;
+    operationRowCount_ = rowCount;
+    result_.clear();
+    error_.clear();
+    return continueRows();
+}
+
+bool InspectionSession::parseFilterCursor(
+        const std::string &cursor, std::uint32_t &rowGroup,
+        std::uint64_t &rowOffset) const
+{
+    rowGroup = 0;
+    rowOffset = 0;
+    if (cursor.empty())
+    {
+        return true;
+    }
+    if (cursor.size() > PIXELS_INSPECTOR_MAX_FILTER_CURSOR_BYTES)
+    {
+        return false;
+    }
+    if (cursor.compare(0, 3, "v1:") != 0)
+    {
+        return false;
+    }
+    const std::size_t separator = cursor.find(':', 3);
+    if (separator == std::string::npos
+        || separator == 3 || separator + 1 == cursor.size())
+    {
+        return false;
+    }
+    const std::string groupText = cursor.substr(3, separator - 3);
+    const std::string rowText = cursor.substr(separator + 1);
+    if ((groupText.size() > 1 && groupText[0] == '0')
+        || (rowText.size() > 1 && rowText[0] == '0'))
+    {
+        return false;
+    }
+    std::string digits;
+    bool negative = false;
+    if (!normalizeSignedInteger(groupText, digits, negative)
+        || negative || digits != groupText)
+    {
+        return false;
+    }
+    if (!normalizeSignedInteger(rowText, digits, negative)
+        || negative || digits != rowText)
+    {
+        return false;
+    }
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long group =
+            std::strtoull(groupText.c_str(), &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0'
+        || group > std::numeric_limits<std::uint32_t>::max())
+    {
+        return false;
+    }
+    errno = 0;
+    const unsigned long long row =
+            std::strtoull(rowText.c_str(), &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0')
+    {
+        return false;
+    }
+    rowGroup = static_cast<std::uint32_t>(group);
+    rowOffset = static_cast<std::uint64_t>(row);
+    return true;
+}
+
+bool InspectionSession::beginFilter(
+        std::uint32_t predicateColumn, std::uint32_t filterOperator,
+        const std::string &literal,
+        const std::vector<std::uint32_t> &columns,
+        const std::string &cursor, std::uint32_t limit)
+{
+    if (state_ != State::METADATA_READY
+        && state_ != State::PAGE_READY)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_STATE,
+                "filter requires ready metadata");
+    }
+    if (filterOperator > PIXELS_INSPECTOR_FILTER_CONTAINS)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "filter operator is invalid");
+    }
+    if (literal.size() > MAX_FILTER_LITERAL_BYTES)
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "filter literal exceeds the bounded byte limit");
+    }
+    const bool nullOperator =
+            filterOperator == PIXELS_INSPECTOR_FILTER_IS_NULL
+            || filterOperator == PIXELS_INSPECTOR_FILTER_IS_NOT_NULL;
+    if (nullOperator && !literal.empty())
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "filter literal presence does not match the operator");
+    }
+    if (limit == 0)
+    {
+        limit = DEFAULT_FILTER_ROWS;
+    }
+    if (limit > MAX_OPERATION_ROWS)
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "filter result limit exceeds 500 rows");
+    }
+
+    error_.clear();
+    if (!validateProjection(columns))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    if (!isRootColumn(predicateColumn))
+    {
+        return transitionFailure(
+                format::ErrorCode::OUT_OF_BOUNDS,
+                "predicate must select a root column");
+    }
+    const proto::Type &type =
+            fileTail_.footer().types(static_cast<int>(predicateColumn));
+    const bool stringLike =
+            type.kind() == proto::Type_Kind_STRING
+            || type.kind() == proto::Type_Kind_VARCHAR
+            || type.kind() == proto::Type_Kind_CHAR;
+    const bool comparable =
+            stringLike
+            || type.kind() == proto::Type_Kind_BOOLEAN
+            || type.kind() == proto::Type_Kind_BYTE
+            || type.kind() == proto::Type_Kind_SHORT
+            || type.kind() == proto::Type_Kind_INT
+            || type.kind() == proto::Type_Kind_LONG
+            || type.kind() == proto::Type_Kind_FLOAT
+            || type.kind() == proto::Type_Kind_DOUBLE
+            || type.kind() == proto::Type_Kind_TIMESTAMP
+            || type.kind() == proto::Type_Kind_DECIMAL
+            || type.kind() == proto::Type_Kind_DATE
+            || type.kind() == proto::Type_Kind_TIME;
+    if (!comparable)
+    {
+        return transitionFailure(
+                format::ErrorCode::UNSUPPORTED_TYPE,
+                "predicate column type is not filterable");
+    }
+    if (filterOperator == PIXELS_INSPECTOR_FILTER_CONTAINS
+        && !stringLike)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "contains requires a string-like predicate column");
+    }
+    if (type.kind() == proto::Type_Kind_BOOLEAN
+        && !nullOperator
+        && filterOperator != PIXELS_INSPECTOR_FILTER_EQ
+        && filterOperator != PIXELS_INSPECTOR_FILTER_NE)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "BOOLEAN supports only equality and null operators");
+    }
+    if (!nullOperator)
+    {
+        if (stringLike)
+        {
+            if (!format::VariableLengthDecoder::isValidUtf8(
+                        format::ByteSpan(
+                                reinterpret_cast<const std::uint8_t *>(
+                                        literal.data()),
+                                literal.size())))
+            {
+                return transitionFailure(
+                        format::ErrorCode::INVALID_ARGUMENT,
+                        "string filter literal is not valid UTF-8");
+            }
+        }
+        else
+        {
+            const std::string zero =
+                    type.kind() == proto::Type_Kind_BOOLEAN
+                    ? "false"
+                    : type.kind() == proto::Type_Kind_FLOAT
+                      || type.kind() == proto::Type_Kind_DOUBLE
+                    ? "0" : "\"0\"";
+            int comparison = 0;
+            if (!compareTypedLiteral(
+                        type, zero, literal, comparison))
+            {
+                return transitionFailure(
+                        format::ErrorCode::INVALID_ARGUMENT,
+                        "filter literal is not canonical for its column type");
+            }
+        }
+    }
+
+    std::uint32_t rowGroup = 0;
+    std::uint64_t rowOffset = 0;
+    if (!parseFilterCursor(cursor, rowGroup, rowOffset)
+        || rowGroup > static_cast<std::uint32_t>(
+                              fileTail_.footer().rowgroupinfos_size()))
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "filter cursor is malformed or outside the file");
+    }
+    if (rowGroup < static_cast<std::uint32_t>(
+                           fileTail_.footer().rowgroupinfos_size()))
+    {
+        const proto::RowGroupInformation &information =
+                fileTail_.footer().rowgroupinfos(
+                        static_cast<int>(rowGroup));
+        if (!information.has_numberofrows()
+            || rowOffset > information.numberofrows())
+        {
+            return transitionFailure(
+                    format::ErrorCode::INVALID_ARGUMENT,
+                    "filter cursor row is outside its row group");
+        }
+    }
+    else if (rowOffset != 0)
+    {
+        return transitionFailure(
+                format::ErrorCode::INVALID_ARGUMENT,
+                "completed filter cursor must have row zero");
+    }
+
+    resetOperation();
+    operation_ = Operation::FILTER;
+    operationColumns_ = columns;
+    filterRequest_.predicateColumn = predicateColumn;
+    filterRequest_.filterOperator = filterOperator;
+    filterRequest_.literal = literal;
+    filterRequest_.rowGroup = rowGroup;
+    filterRequest_.rowOffset = rowOffset;
+    filterRequest_.limit = limit;
+    result_.clear();
+    error_.clear();
+    return continueFilter();
+}
+
 bool InspectionSession::beginRowGroup(std::uint32_t rowGroup)
 {
     if (state_ != State::METADATA_READY
@@ -810,6 +1548,8 @@ bool InspectionSession::supplyRange(
             return consumeDictionaryContent(bytes);
         case State::AWAITING_NESTED_CHILD:
             return consumeNestedChild(bytes);
+        case State::AWAITING_OPERATION_CHILD:
+            return consumeOperationChild(bytes);
         case State::IDLE:
         case State::METADATA_READY:
         case State::PAGE_READY:
@@ -840,10 +1580,16 @@ bool InspectionSession::cancel()
         case State::AWAITING_DICTIONARY_STARTS:
         case State::AWAITING_DICTIONARY_CONTENT:
         case State::AWAITING_NESTED_CHILD:
+        case State::AWAITING_OPERATION_CHILD:
             if (state_ == State::AWAITING_NESTED_CHILD
                 && nestedChild_)
             {
                 (void) nestedChild_->cancel();
+            }
+            if (state_ == State::AWAITING_OPERATION_CHILD
+                && operationChild_)
+            {
+                (void) operationChild_->cancel();
             }
             state_ = State::CANCELLED;
             hasPendingRange_ = false;
@@ -1862,8 +2608,11 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
     if (type.kind() == proto::Type_Kind_ARRAY
         || type.kind() == proto::Type_Kind_MAP)
     {
-        if (pagePlan_.physicalCount
-            > std::numeric_limits<std::size_t>::max() / 2U)
+        std::uint64_t scalarCount64 = 0;
+        if (!checkedMultiply(
+                    pagePlan_.physicalCount, 2U, scalarCount64)
+            || scalarCount64
+               > std::numeric_limits<std::size_t>::max())
         {
             state_ = State::FAILED;
             return format::fail(
@@ -1871,7 +2620,7 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
                     "nested collection range count overflows");
         }
         const std::size_t scalarCount =
-                pagePlan_.physicalCount * 2U;
+                static_cast<std::size_t>(scalarCount64);
         std::vector<std::int64_t> decodedRanges(scalarCount);
         if (!format::PlainScalarDecoder::decodeInt64(
                     bytes, littleEndian, 0, scalarCount,
@@ -2816,6 +3565,696 @@ bool InspectionSession::consumeNestedChild(
     nestedChild_.reset();
     ++nestedChildIndex_;
     return startNestedChild();
+}
+
+bool InspectionSession::startOperationPage(
+        std::uint32_t rowGroup, std::uint32_t column,
+        std::uint64_t rowOffset, std::uint32_t rowCount)
+{
+    const proto::RowGroupInformation &information =
+            fileTail_.footer().rowgroupinfos(static_cast<int>(rowGroup));
+    operationChild_.reset(new InspectionSession(fileSize_));
+    operationChild_->initializeNestedChild(
+            fileTail_, rowGroup, information.numberofrows());
+    if (!operationChild_->beginPage(
+                rowGroup, column, rowOffset, rowCount))
+    {
+        error_ = operationChild_->error();
+        state_ = State::FAILED;
+        return false;
+    }
+    format::FileRange range;
+    if (!operationChild_->nextRange(range))
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "operation child did not request row-group metadata");
+    }
+    setPendingRange(range, State::AWAITING_OPERATION_CHILD);
+    return true;
+}
+
+bool InspectionSession::consumeOperationChild(
+        const format::ByteSpan &bytes)
+{
+    if (!operationChild_
+        || !operationChild_->supplyRange(pendingRange_, bytes))
+    {
+        if (operationChild_)
+        {
+            error_ = operationChild_->error();
+        }
+        else
+        {
+            (void) format::fail(
+                    error_, format::ErrorCode::INVALID_STATE,
+                    "operation child session is missing");
+        }
+        state_ = State::FAILED;
+        return false;
+    }
+    format::FileRange range;
+    if (operationChild_->nextRange(range))
+    {
+        setPendingRange(range, State::AWAITING_OPERATION_CHILD);
+        return true;
+    }
+    if (operationChild_->state() != State::PAGE_READY)
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "operation child stopped before producing a page");
+    }
+
+    const std::vector<std::string> values =
+            operationChild_->pageValues_;
+    operationChild_.reset();
+    if (operation_ == Operation::ROWS)
+    {
+        operationColumnValues_.push_back(values);
+        ++operationColumnIndex_;
+        return continueRows();
+    }
+    if (operation_ != Operation::FILTER)
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "operation child completed without an active operation");
+    }
+
+    if (!filterRequest_.predicateReady)
+    {
+        filterRequest_.predicateValues = values;
+        filterRequest_.matchingRows.clear();
+        filterRequest_.scannedRows += filterRequest_.batchCount;
+        for (std::uint32_t index = 0;
+             index < filterRequest_.batchCount; ++index)
+        {
+            bool matches = false;
+            if (!filterValueMatches(
+                        fileTail_.footer().types(
+                                static_cast<int>(
+                                        filterRequest_.predicateColumn)),
+                        values[index], matches))
+            {
+                state_ = State::FAILED;
+                return false;
+            }
+            if (matches)
+            {
+                filterRequest_.matchingRows.push_back(index);
+            }
+        }
+        filterRequest_.predicateReady = true;
+        operationColumnValues_.assign(
+                operationColumns_.size(), std::vector<std::string>());
+        operationColumnIndex_ = 0;
+        return continueFilter();
+    }
+
+    if (operationColumnIndex_ >= operationColumnValues_.size())
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "filter projection child index is inconsistent");
+    }
+    operationColumnValues_[operationColumnIndex_] = values;
+    ++operationColumnIndex_;
+    return continueFilter();
+}
+
+bool InspectionSession::continueRows()
+{
+    if (operationColumnIndex_ < operationColumns_.size())
+    {
+        return startOperationPage(
+                operationRowGroup_,
+                operationColumns_[operationColumnIndex_],
+                operationRowOffset_, operationRowCount_);
+    }
+    return finishRows();
+}
+
+std::uint64_t InspectionSession::absoluteRow(
+        std::uint32_t rowGroup, std::uint64_t localRow) const
+{
+    std::uint64_t absolute = localRow;
+    for (std::uint32_t group = 0; group < rowGroup; ++group)
+    {
+        const proto::RowGroupInformation &information =
+                fileTail_.footer().rowgroupinfos(
+                        static_cast<int>(group));
+        if (!format::checkedAdd(
+                    absolute, information.numberofrows(), absolute))
+        {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+    }
+    return absolute;
+}
+
+bool InspectionSession::finishRows()
+{
+    if (operationColumnValues_.size() != operationColumns_.size())
+    {
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::INVALID_STATE,
+                "row projection column count is inconsistent");
+    }
+    std::ostringstream output;
+    output << "{\"operation\":\"rows-v1\",\"rowGroup\":"
+           << operationRowGroup_
+           << ",\"offset\":\"" << operationRowOffset_
+           << "\",\"count\":" << operationRowCount_
+           << ",\"columns\":[";
+    for (std::size_t column = 0;
+         column < operationColumns_.size(); ++column)
+    {
+        if (column != 0)
+        {
+            output << ",";
+        }
+        const std::uint32_t id = operationColumns_[column];
+        const proto::Type &type =
+                fileTail_.footer().types(static_cast<int>(id));
+        output << "{\"id\":" << id
+               << ",\"name\":\"" << escapeJson(type.name())
+               << "\",\"kind\":" << static_cast<int>(type.kind())
+               << "}";
+    }
+    output << "],\"rows\":[";
+    for (std::uint32_t row = 0; row < operationRowCount_; ++row)
+    {
+        if (row != 0)
+        {
+            output << ",";
+        }
+        const std::uint64_t local = operationRowOffset_ + row;
+        output << "{\"rowGroup\":" << operationRowGroup_
+               << ",\"localRow\":\"" << local
+               << "\",\"absoluteRow\":\""
+               << absoluteRow(operationRowGroup_, local)
+               << "\",\"values\":[";
+        for (std::size_t column = 0;
+             column < operationColumnValues_.size(); ++column)
+        {
+            if (column != 0)
+            {
+                output << ",";
+            }
+            if (operationColumnValues_[column].size()
+                != operationRowCount_)
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::INVALID_STATE,
+                        "row projection is not rectangular");
+            }
+            output << operationColumnValues_[column][row];
+        }
+        output << "]}";
+    }
+    output << "]}";
+    result_ = output.str();
+    if (result_.size() > MAX_RESULT_OUTPUT_BYTES)
+    {
+        result_.clear();
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "row projection exceeds the bounded output limit");
+    }
+    operation_ = Operation::NONE;
+    resetOperation();
+    state_ = State::PAGE_READY;
+    return true;
+}
+
+bool InspectionSession::filterValueMatches(
+        const proto::Type &type, const std::string &value,
+        bool &matches)
+{
+    matches = false;
+    if (value == "null")
+    {
+        matches =
+                filterRequest_.filterOperator
+                == PIXELS_INSPECTOR_FILTER_IS_NULL;
+        return true;
+    }
+    if (filterRequest_.filterOperator
+        == PIXELS_INSPECTOR_FILTER_IS_NULL)
+    {
+        return true;
+    }
+    if (filterRequest_.filterOperator
+        == PIXELS_INSPECTOR_FILTER_IS_NOT_NULL)
+    {
+        matches = true;
+        return true;
+    }
+    if (filterRequest_.filterOperator
+        == PIXELS_INSPECTOR_FILTER_CONTAINS)
+    {
+        std::string text;
+        if (!parseJsonString(value, text))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "decoded string predicate value is invalid JSON");
+        }
+        matches = text.find(filterRequest_.literal)
+                  != std::string::npos;
+        return true;
+    }
+
+    if ((type.kind() == proto::Type_Kind_FLOAT
+         || type.kind() == proto::Type_Kind_DOUBLE)
+        && !value.empty() && value.front() == '"')
+    {
+        std::string special;
+        if (!parseJsonString(value, special)
+            || (special != "NaN"
+                && special != "Infinity"
+                && special != "-Infinity"))
+        {
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "decoded floating predicate value is invalid");
+        }
+        if (special == "NaN")
+        {
+            matches =
+                    filterRequest_.filterOperator
+                    == PIXELS_INSPECTOR_FILTER_NE;
+            return true;
+        }
+        const int comparison =
+                special == "-Infinity" ? -1 : 1;
+        matches = applyComparison(
+                filterRequest_.filterOperator, comparison);
+        return true;
+    }
+
+    int comparison = 0;
+    if (!compareTypedLiteral(
+                type, value, filterRequest_.literal, comparison))
+    {
+        return format::fail(
+                error_, format::ErrorCode::INVALID_ARGUMENT,
+                "filter literal is not canonical for its column type");
+    }
+    matches = applyComparison(
+            filterRequest_.filterOperator, comparison);
+    return true;
+}
+
+bool InspectionSession::rowGroupCanBePruned(
+        std::uint32_t rowGroup, bool &pruned) const
+{
+    pruned = false;
+    const proto::Footer &footer = fileTail_.footer();
+    if (rowGroup >= static_cast<std::uint32_t>(
+                           footer.rowgroupstats_size()))
+    {
+        return true;
+    }
+    const proto::RowGroupStatistic &group =
+            footer.rowgroupstats(static_cast<int>(rowGroup));
+    if (filterRequest_.predicateColumn
+        >= static_cast<std::uint32_t>(
+                group.columnchunkstats_size()))
+    {
+        return true;
+    }
+    const proto::ColumnStatistic &statistic =
+            group.columnchunkstats(
+                    static_cast<int>(filterRequest_.predicateColumn));
+    if (filterRequest_.filterOperator
+        == PIXELS_INSPECTOR_FILTER_IS_NULL)
+    {
+        pruned = statistic.has_hasnull() && !statistic.hasnull();
+        return true;
+    }
+    if (filterRequest_.filterOperator
+        == PIXELS_INSPECTOR_FILTER_IS_NOT_NULL)
+    {
+        pruned = statistic.has_numberofvalues()
+                 && statistic.numberofvalues() == 0;
+        return true;
+    }
+    if (filterRequest_.filterOperator
+        == PIXELS_INSPECTOR_FILTER_CONTAINS)
+    {
+        return true;
+    }
+
+    const proto::Type &type =
+            footer.types(static_cast<int>(
+                    filterRequest_.predicateColumn));
+    std::string minimum;
+    std::string maximum;
+    if (type.kind() == proto::Type_Kind_STRING
+        || type.kind() == proto::Type_Kind_VARCHAR
+        || type.kind() == proto::Type_Kind_CHAR)
+    {
+        if (!statistic.has_stringstatistics()
+            || !statistic.stringstatistics().has_minimum()
+            || !statistic.stringstatistics().has_maximum())
+        {
+            return true;
+        }
+        minimum = "\"" + escapeJson(
+                statistic.stringstatistics().minimum()) + "\"";
+        maximum = "\"" + escapeJson(
+                statistic.stringstatistics().maximum()) + "\"";
+    }
+    else if (type.kind() == proto::Type_Kind_BYTE
+             || type.kind() == proto::Type_Kind_SHORT
+             || type.kind() == proto::Type_Kind_INT
+             || type.kind() == proto::Type_Kind_LONG)
+    {
+        if (!statistic.has_intstatistics()
+            || !statistic.intstatistics().has_minimum()
+            || !statistic.intstatistics().has_maximum())
+        {
+            return true;
+        }
+        minimum = quoteInteger(statistic.intstatistics().minimum());
+        maximum = quoteInteger(statistic.intstatistics().maximum());
+    }
+    else if (type.kind() == proto::Type_Kind_DATE)
+    {
+        if (!statistic.has_datestatistics()
+            || !statistic.datestatistics().has_minimum()
+            || !statistic.datestatistics().has_maximum())
+        {
+            return true;
+        }
+        minimum = quoteInteger(statistic.datestatistics().minimum());
+        maximum = quoteInteger(statistic.datestatistics().maximum());
+    }
+    else if (type.kind() == proto::Type_Kind_TIME)
+    {
+        if (!statistic.has_timestatistics()
+            || !statistic.timestatistics().has_minimum()
+            || !statistic.timestatistics().has_maximum())
+        {
+            return true;
+        }
+        minimum = quoteInteger(statistic.timestatistics().minimum());
+        maximum = quoteInteger(statistic.timestatistics().maximum());
+    }
+    else if (type.kind() == proto::Type_Kind_FLOAT
+             || type.kind() == proto::Type_Kind_DOUBLE)
+    {
+        if (!statistic.has_doublestatistics()
+            || !statistic.doublestatistics().has_minimum()
+            || !statistic.doublestatistics().has_maximum()
+            || !std::isfinite(statistic.doublestatistics().minimum())
+            || !std::isfinite(statistic.doublestatistics().maximum()))
+        {
+            return true;
+        }
+        std::ostringstream minStream;
+        std::ostringstream maxStream;
+        minStream << std::setprecision(17)
+                  << statistic.doublestatistics().minimum();
+        maxStream << std::setprecision(17)
+                  << statistic.doublestatistics().maximum();
+        minimum = minStream.str();
+        maximum = maxStream.str();
+    }
+    else
+    {
+        // TIMESTAMP statistics are milliseconds while values are
+        // microseconds, and long DECIMAL statistics use split 128-bit
+        // words. Ambiguous statistics must scan to avoid false negatives.
+        return true;
+    }
+
+    int minComparison = 0;
+    int maxComparison = 0;
+    if (!compareTypedLiteral(
+                type, minimum, filterRequest_.literal, minComparison)
+        || !compareTypedLiteral(
+                type, maximum, filterRequest_.literal, maxComparison))
+    {
+        return true;
+    }
+    switch (filterRequest_.filterOperator)
+    {
+        case PIXELS_INSPECTOR_FILTER_EQ:
+            pruned = minComparison > 0 || maxComparison < 0;
+            break;
+        case PIXELS_INSPECTOR_FILTER_NE:
+            pruned = minComparison == 0 && maxComparison == 0;
+            break;
+        case PIXELS_INSPECTOR_FILTER_LT:
+            pruned = minComparison >= 0;
+            break;
+        case PIXELS_INSPECTOR_FILTER_LE:
+            pruned = minComparison > 0;
+            break;
+        case PIXELS_INSPECTOR_FILTER_GT:
+            pruned = maxComparison <= 0;
+            break;
+        case PIXELS_INSPECTOR_FILTER_GE:
+            pruned = maxComparison < 0;
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+
+bool InspectionSession::continueFilter()
+{
+    const proto::Footer &footer = fileTail_.footer();
+    while (!filterRequest_.predicateReady)
+    {
+        if (filterRequest_.rowGroup
+            >= static_cast<std::uint32_t>(
+                    footer.rowgroupinfos_size()))
+        {
+            return finishFilter(true);
+        }
+        const proto::RowGroupInformation &information =
+                footer.rowgroupinfos(
+                        static_cast<int>(filterRequest_.rowGroup));
+        if (!information.has_numberofrows())
+        {
+            state_ = State::FAILED;
+            return format::fail(
+                    error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                    "filter row group is missing its row count");
+        }
+        if (filterRequest_.rowOffset >= information.numberofrows())
+        {
+            ++filterRequest_.rowGroup;
+            filterRequest_.rowOffset = 0;
+            continue;
+        }
+        if (filterRequest_.rowOffset == 0)
+        {
+            bool pruned = false;
+            if (!rowGroupCanBePruned(
+                        filterRequest_.rowGroup, pruned))
+            {
+                state_ = State::FAILED;
+                return false;
+            }
+            if (pruned)
+            {
+                ++filterRequest_.prunedRowGroups;
+                filterRequest_.prunedRows +=
+                        information.numberofrows();
+                ++filterRequest_.rowGroup;
+                continue;
+            }
+        }
+        if (filterRequest_.countedRowGroup
+            != filterRequest_.rowGroup)
+        {
+            ++filterRequest_.scannedRowGroups;
+            filterRequest_.countedRowGroup =
+                    filterRequest_.rowGroup;
+        }
+        const std::uint64_t remaining =
+                information.numberofrows()
+                - filterRequest_.rowOffset;
+        filterRequest_.batchCount =
+                static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(
+                                remaining, MAX_OPERATION_ROWS));
+        return startOperationPage(
+                filterRequest_.rowGroup,
+                filterRequest_.predicateColumn,
+                filterRequest_.rowOffset,
+                filterRequest_.batchCount);
+    }
+
+    if (filterRequest_.matchingRows.empty())
+    {
+        filterRequest_.rowOffset += filterRequest_.batchCount;
+        filterRequest_.predicateReady = false;
+        filterRequest_.predicateValues.clear();
+        return continueFilter();
+    }
+
+    while (operationColumnIndex_ < operationColumns_.size())
+    {
+        if (operationColumns_[operationColumnIndex_]
+            == filterRequest_.predicateColumn)
+        {
+            operationColumnValues_[operationColumnIndex_] =
+                    filterRequest_.predicateValues;
+            ++operationColumnIndex_;
+            continue;
+        }
+        return startOperationPage(
+                filterRequest_.rowGroup,
+                operationColumns_[operationColumnIndex_],
+                filterRequest_.rowOffset,
+                filterRequest_.batchCount);
+    }
+
+    for (std::uint32_t match : filterRequest_.matchingRows)
+    {
+        filterResultRowGroups_.push_back(filterRequest_.rowGroup);
+        filterResultLocalRows_.push_back(
+                filterRequest_.rowOffset + match);
+        std::vector<std::string> row;
+        row.reserve(operationColumns_.size());
+        for (const std::vector<std::string> &column :
+             operationColumnValues_)
+        {
+            if (column.size() != filterRequest_.batchCount)
+            {
+                state_ = State::FAILED;
+                return format::fail(
+                        error_, format::ErrorCode::INVALID_STATE,
+                        "filter projection is not rectangular");
+            }
+            row.push_back(column[match]);
+        }
+        filterResultRows_.push_back(row);
+        if (filterResultRows_.size() == filterRequest_.limit)
+        {
+            filterRequest_.rowOffset +=
+                    static_cast<std::uint64_t>(match) + 1U;
+            const proto::RowGroupInformation &information =
+                    footer.rowgroupinfos(
+                            static_cast<int>(filterRequest_.rowGroup));
+            if (filterRequest_.rowOffset
+                >= information.numberofrows())
+            {
+                ++filterRequest_.rowGroup;
+                filterRequest_.rowOffset = 0;
+            }
+            if (filterRequest_.rowGroup
+                >= static_cast<std::uint32_t>(
+                        footer.rowgroupinfos_size()))
+            {
+                return finishFilter(true);
+            }
+            return finishFilter(false);
+        }
+    }
+
+    filterRequest_.rowOffset += filterRequest_.batchCount;
+    filterRequest_.predicateReady = false;
+    filterRequest_.predicateValues.clear();
+    filterRequest_.matchingRows.clear();
+    operationColumnValues_.clear();
+    operationColumnIndex_ = 0;
+    return continueFilter();
+}
+
+bool InspectionSession::finishFilter(bool completed)
+{
+    std::ostringstream output;
+    output << "{\"operation\":\"filter-v1\",\"columns\":[";
+    for (std::size_t column = 0;
+         column < operationColumns_.size(); ++column)
+    {
+        if (column != 0)
+        {
+            output << ",";
+        }
+        const std::uint32_t id = operationColumns_[column];
+        const proto::Type &type =
+                fileTail_.footer().types(static_cast<int>(id));
+        output << "{\"id\":" << id
+               << ",\"name\":\"" << escapeJson(type.name())
+               << "\",\"kind\":" << static_cast<int>(type.kind())
+               << "}";
+    }
+    output << "],\"rows\":[";
+    for (std::size_t row = 0; row < filterResultRows_.size(); ++row)
+    {
+        if (row != 0)
+        {
+            output << ",";
+        }
+        output << "{\"rowGroup\":" << filterResultRowGroups_[row]
+               << ",\"localRow\":\"" << filterResultLocalRows_[row]
+               << "\",\"absoluteRow\":\""
+               << absoluteRow(
+                       filterResultRowGroups_[row],
+                       filterResultLocalRows_[row])
+               << "\",\"values\":[";
+        for (std::size_t column = 0;
+             column < filterResultRows_[row].size(); ++column)
+        {
+            if (column != 0)
+            {
+                output << ",";
+            }
+            output << filterResultRows_[row][column];
+        }
+        output << "]}";
+    }
+    output << "],\"progress\":{\"scannedRowGroups\":"
+           << filterRequest_.scannedRowGroups
+           << ",\"prunedRowGroups\":"
+           << filterRequest_.prunedRowGroups
+           << ",\"scannedRows\":\""
+           << filterRequest_.scannedRows
+           << "\",\"prunedRows\":\""
+           << filterRequest_.prunedRows
+           << "\"},\"matched\":" << filterResultRows_.size()
+           << ",\"completed\":" << (completed ? "true" : "false")
+           << ",\"truncated\":" << (completed ? "false" : "true")
+           << ",\"cursor\":";
+    if (completed)
+    {
+        output << "null";
+    }
+    else
+    {
+        output << "\"v1:" << filterRequest_.rowGroup
+               << ":" << filterRequest_.rowOffset << "\"";
+    }
+    output << "}";
+    result_ = output.str();
+    if (result_.size() > MAX_RESULT_OUTPUT_BYTES)
+    {
+        result_.clear();
+        state_ = State::FAILED;
+        return format::fail(
+                error_, format::ErrorCode::OUT_OF_BOUNDS,
+                "filter result exceeds the bounded output limit");
+    }
+    operation_ = Operation::NONE;
+    resetOperation();
+    state_ = State::PAGE_READY;
+    return true;
 }
 
 bool InspectionSession::finishNestedPage()

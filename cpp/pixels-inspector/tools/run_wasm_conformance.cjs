@@ -7,7 +7,7 @@ const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 
 const EXPECTED_METADATA =
-  '{"abi":2,"version":1,"magic":"PIXELS","rows":10,' +
+  '{"abi":3,"version":1,"magic":"PIXELS","rows":10,' +
   '"pixelStride":10000,"schemaCount":4,"rowGroupCount":1,' +
   '"firstColumn":{"name":"id","kind":4},' +
   '"postscript":{"contentLength":"352","compression":0,' +
@@ -121,7 +121,7 @@ async function main() {
   let handle = 0;
   let rangeCopies = 0;
   try {
-    requireCondition(module._pixels_inspector_abi_version() === 2,
+    requireCondition(module._pixels_inspector_abi_version() === 3,
       "unexpected inspector ABI");
     requireCondition(
       module._pixels_inspector_capabilities_size(scratch) === 0,
@@ -153,8 +153,15 @@ async function main() {
       module._free(capabilityPointer);
     }
     requireCondition(
-      capabilities.abi === 2 &&
+      capabilities.abi === 3 &&
         capabilities.page === "generic-v1" &&
+        capabilities.rows === "rows-v1" &&
+        capabilities.filter === "filter-v1" &&
+        capabilities.maxRows === 500 &&
+        capabilities.defaultRows === 100 &&
+        capabilities.compression?.payload === "inactive" &&
+        JSON.stringify(capabilities.compression?.metadata) ===
+          JSON.stringify(["NONE", "ZLIB", "SNAPPY", "LZO", "LZ4", "ZSTD"]) &&
         capabilities.types.length === 20 &&
         capabilities.types.every(
           (type, index) => type.kind === index && typeof type.name === "string",
@@ -313,12 +320,79 @@ async function main() {
     requireCondition(readResult() === EXPECTED_DATE_PAGE,
       "WASM generic DATE page differs from the native golden");
 
+    const projectionPointer = module._malloc(8);
+    const literalPointer = module._malloc(1);
+    try {
+      const projectionView =
+        new DataView(module.HEAPU8.buffer, projectionPointer, 8);
+      projectionView.setUint32(0, 0, true);
+      projectionView.setUint32(4, 1, true);
+      requireCondition(
+        module._pixels_inspector_begin_rows(
+          handle, 0, projectionPointer, 2, 2n, 3,
+        ) === 1,
+        "rows-v1 did not start",
+      );
+      let status = 1;
+      let suppliedRanges = 0;
+      while (status === 1) {
+        status = supplyRange(nextRange());
+        suppliedRanges += 1;
+        requireCondition(suppliedRanges < 64,
+          "rows-v1 did not converge");
+      }
+      requireCondition(status === 2, "rows-v1 did not produce a result");
+      const rows = JSON.parse(readResult());
+      requireCondition(
+        rows.operation === "rows-v1" &&
+          rows.columns.map(({ id }) => id).join(",") === "0,1" &&
+          rows.rows.length === 3 &&
+          rows.rows[0].localRow === "2" &&
+          rows.rows.every((row) => row.values.length === 2),
+        "WASM rows-v1 differs from the native contract",
+      );
+
+      module.HEAPU8[literalPointer] = "8".charCodeAt(0);
+      requireCondition(
+        module._pixels_inspector_begin_filter(
+          handle, 0, 5, literalPointer, 1,
+          projectionPointer, 2, 0, 0, 100,
+        ) === 1,
+        "filter-v1 did not start",
+      );
+      status = 1;
+      suppliedRanges = 0;
+      while (status === 1) {
+        status = supplyRange(nextRange());
+        suppliedRanges += 1;
+        requireCondition(suppliedRanges < 128,
+          "filter-v1 did not converge");
+      }
+      requireCondition(status === 2,
+        "filter-v1 did not produce a result");
+      const filter = JSON.parse(readResult());
+      requireCondition(
+        filter.operation === "filter-v1" &&
+          filter.rows.length === 2 &&
+          filter.rows[0].localRow === "8" &&
+          filter.rows[1].localRow === "9" &&
+          filter.completed === true &&
+          filter.truncated === false &&
+          filter.cursor === null,
+        "WASM filter-v1 differs from the native contract",
+      );
+    } finally {
+      module._free(literalPointer);
+      module._free(projectionPointer);
+    }
+
     let corpusCases = 0;
     if (corpusPath !== "") {
       const corpus = JSON.parse(
         fs.readFileSync(path.join(corpusPath, "manifest.json"), "utf8"),
       );
-      requireCondition(corpus.abi === 2 && corpus.cases.length === 20,
+      requireCondition(corpus.abi === 3 && corpus.cases.length === 20 &&
+        Array.isArray(corpus.compatibility) && corpus.compatibility.length > 0,
         "conformance corpus inventory is incomplete");
       const expectedNames = capabilities.types.map((type) => type.name);
       requireCondition(
@@ -326,7 +400,7 @@ async function main() {
           JSON.stringify([...expectedNames].sort()),
         "corpus kinds differ from Core capabilities",
       );
-      for (const test of corpus.cases) {
+      for (const test of [...corpus.cases, ...corpus.compatibility]) {
         requireCondition(module._pixels_inspector_destroy(handle) === 0,
           `unable to reset session for ${test.name}`);
         handle = 0;
@@ -451,7 +525,7 @@ async function main() {
     );
 
     const metrics = {
-      abi: 2,
+      abi: 3,
       capabilities,
       corpusCases,
       wasmBytes: fs.statSync(wasmPath).size,
