@@ -5,7 +5,9 @@ native Pixels Reader. It contains:
 
 - checked immutable byte spans and integer/range operations;
 - FileTail and RowGroupFooter protobuf parsing and validation;
-- pure per-encoding decoders (currently the validation slice is `LONG/NONE`);
+- pure per-encoding decoders (the current `NONE` scalar slice includes packed
+  BOOLEAN, BYTE, 32/64-bit integers, FLOAT/DOUBLE, temporal values, and
+  short/long-decimal storage words);
 - a host-driven byte-range state machine;
 - a versioned C ABI compiled from the same sources for native and WebAssembly.
 
@@ -47,8 +49,13 @@ node cpp/pixels-inspector/tools/run_wasm_worker_conformance.cjs \
 ```
 
 The conformance runner validates the ABI, exact metadata/page output,
-cancellation, mismatched ranges, bounded linear memory, and the Emscripten
-import allowlist.
+cancellation, mismatched ranges, legacy LONG plus generic DATE output, bounded
+linear memory, and the Emscripten import allowlist.
+
+The generic page operation currently promotes null-free `NONE` scalar pages
+that remain within one pixel. Null streams, RLE, variable-width, vector, and
+nested values remain explicit follow-up work; the API returns an unsupported
+status instead of guessing their layout.
 
 ## Range protocol
 

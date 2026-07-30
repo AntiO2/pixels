@@ -51,6 +51,10 @@ public:
             std::uint32_t rowGroup, std::uint32_t column,
             std::uint64_t rowOffset, std::uint32_t rowCount);
 
+    [[nodiscard]] bool beginPage(
+            std::uint32_t rowGroup, std::uint32_t column,
+            std::uint64_t rowOffset, std::uint32_t rowCount);
+
     [[nodiscard]] bool nextRange(format::FileRange &range) const;
 
     [[nodiscard]] bool supplyRange(
@@ -80,6 +84,8 @@ private:
         std::uint32_t column = 0;
         std::uint64_t rowOffset = 0;
         std::uint32_t rowCount = 0;
+        bool legacyLongResult = false;
+        std::uint32_t bitOffset = 0;
     };
 
     [[nodiscard]] bool consumeTailPointer(const format::ByteSpan &bytes);
@@ -87,12 +93,16 @@ private:
     [[nodiscard]] bool consumeRowGroupFooter(const format::ByteSpan &bytes);
     [[nodiscard]] bool consumeColumnChunk(const format::ByteSpan &bytes);
     [[nodiscard]] bool validatePageRequest();
+    [[nodiscard]] bool beginPageRequest(
+            std::uint32_t rowGroup, std::uint32_t column,
+            std::uint64_t rowOffset, std::uint32_t rowCount,
+            bool legacyLongResult);
     [[nodiscard]] bool transitionFailure(
             format::ErrorCode code, const std::string &message);
 
     void setPendingRange(const format::FileRange &range, State state);
     void buildMetadataResult();
-    void buildPageResult(const std::vector<std::int64_t> &values);
+    void buildPageResult(const std::vector<std::string> &values);
 
     std::uint64_t fileSize_;
     State state_ = State::IDLE;

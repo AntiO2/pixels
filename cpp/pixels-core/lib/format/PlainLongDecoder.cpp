@@ -11,9 +11,7 @@
 
 #include "format/PlainLongDecoder.h"
 
-#include "format/ByteReader.h"
-
-#include <limits>
+#include "format/PlainScalarDecoder.h"
 
 namespace pixels
 {
@@ -25,58 +23,9 @@ bool PlainLongDecoder::decode(
         std::size_t valueCount, std::int64_t *destination,
         std::size_t destinationSize, FormatError &error)
 {
-    error.clear();
-    if (!bytes.isValid())
-    {
-        return fail(error, ErrorCode::INVALID_ARGUMENT,
-                    "plain LONG input span is invalid");
-    }
-    if (valueCount > 0 && destination == nullptr)
-    {
-        return fail(error, ErrorCode::INVALID_ARGUMENT,
-                    "plain LONG destination is null");
-    }
-    if (valueCount > destinationSize)
-    {
-        return fail(error, ErrorCode::BUFFER_TOO_SMALL,
-                    "plain LONG destination is too small");
-    }
-    static_assert(
-            sizeof(std::size_t) <= sizeof(std::uint64_t),
-            "decoder requires size_t to fit in uint64_t");
-    if (valueOffset > std::numeric_limits<std::uint64_t>::max()
-                      / sizeof(std::int64_t))
-    {
-        return fail(error, ErrorCode::OUT_OF_BOUNDS,
-                    "plain LONG element range overflows");
-    }
-
-    const std::uint64_t byteOffset =
-            valueOffset * sizeof(std::int64_t);
-    const std::uint64_t byteLength =
-            static_cast<std::uint64_t>(valueCount)
-            * sizeof(std::int64_t);
-    std::uint64_t byteEnd = 0;
-    if (!checkedAdd(byteOffset, byteLength, byteEnd)
-        || byteEnd > bytes.size())
-    {
-        return fail(error, ErrorCode::OUT_OF_BOUNDS,
-                    "plain LONG element range exceeds the input");
-    }
-
-    for (std::size_t index = 0; index < valueCount; ++index)
-    {
-        const std::size_t sourceOffset =
-                static_cast<std::size_t>(byteOffset)
-                + index * sizeof(std::int64_t);
-        if (!readSigned64(bytes, sourceOffset, littleEndian,
-                          destination[index]))
-        {
-            return fail(error, ErrorCode::OUT_OF_BOUNDS,
-                        "plain LONG value is truncated");
-        }
-    }
-    return true;
+    return PlainScalarDecoder::decodeInt64(
+            bytes, littleEndian, valueOffset, valueCount,
+            destination, destinationSize, error);
 }
 
 } // namespace format

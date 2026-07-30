@@ -8,9 +8,11 @@
 
 #include "format/ByteReader.h"
 #include "format/PlainLongDecoder.h"
+#include "format/PlainScalarDecoder.h"
 #include "pixels.pb.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -262,6 +264,64 @@ void testBoundedPageRange()
             "bounded page result differs from the golden");
 }
 
+void testGenericPlainScalarPages()
+{
+    const std::vector<std::uint8_t> file = readFixture();
+    {
+        Session session(file.size());
+        driveMetadata(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 2, 1, 3)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "DATE page did not request its row-group footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "DATE footer did not produce a value range");
+        const pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 196 && range.length == 12,
+                "DATE page range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "DATE bytes did not produce a page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":2,\"offset\":1,\"count\":3,"
+                   "\"values\":[\"10227\",\"10207\",\"11208\"]}",
+                "DATE page differs from the golden");
+    }
+    {
+        Session session(file.size());
+        driveMetadata(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 3, 0, 4)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "DECIMAL page did not request its row-group footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "DECIMAL footer did not produce a value range");
+        const pixels::format::FileRange range = nextRange(session);
+        require(range.offset == 256 && range.length == 32,
+                "DECIMAL page range is not exact");
+        require(supply(session, range, file)
+                == PIXELS_INSPECTOR_RESULT_READY,
+                "DECIMAL bytes did not produce a page");
+        require(readResult(session)
+                == "{\"rowGroup\":0,\"column\":3,\"offset\":0,\"count\":4,"
+                   "\"values\":[\"90.60\",\"10.10\",\"20.40\",\"54.60\"]}",
+                "DECIMAL page differs from the golden");
+    }
+    {
+        Session session(file.size());
+        driveMetadata(session, file);
+        require(pixels_inspector_begin_page(
+                        session.handle(), 0, 1, 0, 1)
+                == PIXELS_INSPECTOR_RANGE_READY,
+                "VARCHAR page did not request its row-group footer");
+        require(supply(session, nextRange(session), file)
+                == PIXELS_INSPECTOR_UNSUPPORTED_TYPE,
+                "VARCHAR was accepted as a plain scalar");
+    }
+}
+
 void testPlainLongDecoder()
 {
     const std::uint8_t littleEndian[] = {
@@ -302,6 +362,117 @@ void testPlainLongDecoder()
                     false, 0, 2, values, 1, error)
             && error.code == pixels::format::ErrorCode::BUFFER_TOO_SMALL,
             "small LONG destination was not rejected");
+}
+
+void testPlainScalarDecoder()
+{
+    pixels::format::FormatError error;
+
+    const std::uint8_t littleBits[] = {0x4D, 0x02};
+    bool booleans[7] = {};
+    require(pixels::format::PlainScalarDecoder::decodeBoolean(
+                    pixels::format::ByteSpan(
+                            littleBits, sizeof(littleBits)),
+                    true, 1, 7, booleans, 7, error),
+            "little-endian BOOLEAN decode failed");
+    const bool expectedLittle[] = {
+            false, true, true, false, false, true, false};
+    require(std::equal(
+                    booleans, booleans + 7, expectedLittle),
+            "little-endian BOOLEAN values differ");
+
+    const std::uint8_t bigBits[] = {0xB2};
+    require(pixels::format::PlainScalarDecoder::decodeBoolean(
+                    pixels::format::ByteSpan(bigBits, sizeof(bigBits)),
+                    false, 0, 8, booleans, 7, error)
+            == false
+            && error.code == pixels::format::ErrorCode::BUFFER_TOO_SMALL,
+            "small BOOLEAN destination was not rejected");
+    bool bigBooleans[8] = {};
+    const bool expectedBig[] = {
+            true, false, true, true, false, false, true, false};
+    require(pixels::format::PlainScalarDecoder::decodeBoolean(
+                    pixels::format::ByteSpan(bigBits, sizeof(bigBits)),
+                    false, 0, 8, bigBooleans, 8, error)
+            && std::equal(
+                    bigBooleans, bigBooleans + 8, expectedBig),
+            "big-endian BOOLEAN values differ");
+
+    const std::uint8_t bytes[] = {0x80, 0x00, 0x7F};
+    std::int8_t byteValues[3] = {};
+    require(pixels::format::PlainScalarDecoder::decodeByte(
+                    pixels::format::ByteSpan(bytes, sizeof(bytes)),
+                    0, 3, byteValues, 3, error)
+            && byteValues[0] == std::numeric_limits<std::int8_t>::min()
+            && byteValues[1] == 0
+            && byteValues[2] == std::numeric_limits<std::int8_t>::max(),
+            "BYTE boundary values differ");
+
+    const std::uint8_t int32Little[] = {
+            0x00, 0x00, 0x00, 0x80,
+            0xFF, 0xFF, 0xFF, 0x7F};
+    std::int32_t int32Values[2] = {};
+    require(pixels::format::PlainScalarDecoder::decodeInt32(
+                    pixels::format::ByteSpan(
+                            int32Little, sizeof(int32Little)),
+                    true, 0, 2, int32Values, 2, error)
+            && int32Values[0] == std::numeric_limits<std::int32_t>::min()
+            && int32Values[1] == std::numeric_limits<std::int32_t>::max(),
+            "little-endian INT32 boundary values differ");
+
+    const std::uint8_t int32Big[] = {
+            0xFF, 0xFF, 0xFF, 0xD6,
+            0x00, 0x00, 0x00, 0x2A};
+    require(pixels::format::PlainScalarDecoder::decodeInt32(
+                    pixels::format::ByteSpan(
+                            int32Big, sizeof(int32Big)),
+                    false, 0, 2, int32Values, 2, error)
+            && int32Values[0] == -42 && int32Values[1] == 42,
+            "big-endian INT32 values differ");
+
+    const std::uint8_t floatLittle[] = {
+            0x00, 0x00, 0xC0, 0x3F,
+            0x00, 0x00, 0x80, 0x7F};
+    float floatValues[2] = {};
+    require(pixels::format::PlainScalarDecoder::decodeFloat(
+                    pixels::format::ByteSpan(
+                            floatLittle, sizeof(floatLittle)),
+                    true, 0, 2, floatValues, 2, error)
+            && floatValues[0] == 1.5F
+            && std::isinf(floatValues[1]) && floatValues[1] > 0,
+            "FLOAT values differ");
+
+    const std::uint8_t doubleBig[] = {
+            0xC0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x7F, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    double doubleValues[2] = {};
+    require(pixels::format::PlainScalarDecoder::decodeDouble(
+                    pixels::format::ByteSpan(
+                            doubleBig, sizeof(doubleBig)),
+                    false, 0, 2, doubleValues, 2, error)
+            && doubleValues[0] == -2.5
+            && std::isnan(doubleValues[1]),
+            "DOUBLE values differ");
+
+    const std::uint8_t decimalWords[] = {
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    pixels::format::Int128Words decimal[1];
+    require(pixels::format::PlainScalarDecoder::decodeInt128(
+                    pixels::format::ByteSpan(
+                            decimalWords, sizeof(decimalWords)),
+                    true, 0, 1, decimal, 1, error)
+            && decimal[0].high
+               == std::numeric_limits<std::uint64_t>::max()
+            && decimal[0].low == 42,
+            "INT128 words differ");
+
+    require(!pixels::format::PlainScalarDecoder::decodeDouble(
+                    pixels::format::ByteSpan(
+                            doubleBig, sizeof(doubleBig) - 1),
+                    false, 0, 2, doubleValues, 2, error)
+            && error.code == pixels::format::ErrorCode::OUT_OF_BOUNDS,
+            "truncated DOUBLE range was not rejected");
 }
 
 void testLifecycleAndBuffers()
@@ -668,9 +839,11 @@ int main()
         require(pixels_inspector_abi_version()
                 == PIXELS_INSPECTOR_ABI_VERSION,
                 "unexpected inspector ABI version");
+        testPlainScalarDecoder();
         testPlainLongDecoder();
         testCanonicalFixture();
         testBoundedPageRange();
+        testGenericPlainScalarPages();
         testLifecycleAndBuffers();
         testInvalidRangeAndTerminalState();
         testPartialRange();

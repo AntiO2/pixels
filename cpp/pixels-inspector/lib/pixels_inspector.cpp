@@ -200,6 +200,31 @@ pixels_inspector_status pixels_inspector_begin_plain_long_page(
     }
 }
 
+pixels_inspector_status pixels_inspector_begin_page(
+        pixels_inspector_handle handle, std::uint32_t rowGroup,
+        std::uint32_t column, std::uint64_t rowOffset,
+        std::uint32_t rowCount)
+{
+    try
+    {
+        InspectionSession *session = findSession(handle);
+        if (session == nullptr)
+        {
+            return PIXELS_INSPECTOR_INVALID_HANDLE;
+        }
+        if (!session->beginPage(
+                    rowGroup, column, rowOffset, rowCount))
+        {
+            return currentStatus(*session);
+        }
+        return currentStatus(*session);
+    }
+    catch (...)
+    {
+        return PIXELS_INSPECTOR_INTERNAL_ERROR;
+    }
+}
+
 pixels_inspector_status pixels_inspector_next_range(
         pixels_inspector_handle handle, std::uint64_t *offset,
         std::uint64_t *length)

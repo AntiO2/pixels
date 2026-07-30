@@ -15,6 +15,10 @@ const EXPECTED_PAGE =
   '{"rowGroup":0,"column":0,"offset":0,"count":10,' +
   '"values":["0","1","2","3","4","5","6","7","8","9"]}';
 
+const EXPECTED_DATE_PAGE =
+  '{"rowGroup":0,"column":2,"offset":1,"count":3,' +
+  '"values":["10227","10207","11208"]}';
+
 function requireCondition(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -188,6 +192,35 @@ async function main() {
     requireCondition(readResult() === EXPECTED_PAGE,
       "WASM page differs from the native golden");
     const pageCompletedAt = performance.now();
+
+    requireCondition(module._pixels_inspector_destroy(handle) === 0,
+      "unable to destroy LONG page session");
+    handle = 0;
+    requireCondition(
+      module._pixels_inspector_create(BigInt(file.length), handlePointer) === 0,
+      "unable to create generic page session",
+    );
+    handle = new DataView(
+      module.HEAPU8.buffer,
+      handlePointer,
+      4,
+    ).getUint32(0, true);
+    requireCondition(module._pixels_inspector_begin_metadata(handle) === 1,
+      "generic page metadata did not start");
+    requireCondition(supplyRange(nextRange()) === 1,
+      "generic page tail pointer did not request FileTail");
+    requireCondition(supplyRange(nextRange()) === 2,
+      "generic page FileTail did not produce metadata");
+    requireCondition(
+      module._pixels_inspector_begin_page(handle, 0, 2, 1n, 3) === 1,
+      "generic DATE page did not request its footer",
+    );
+    requireCondition(supplyRange(nextRange()) === 1,
+      "generic DATE footer did not request values");
+    requireCondition(supplyRange(nextRange()) === 2,
+      "generic DATE values did not produce a page");
+    requireCondition(readResult() === EXPECTED_DATE_PAGE,
+      "WASM generic DATE page differs from the native golden");
 
     requireCondition(
       module._pixels_inspector_create(BigInt(file.length), scratch) === 0,

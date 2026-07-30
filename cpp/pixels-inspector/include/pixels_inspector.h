@@ -52,6 +52,10 @@ pixels_inspector_status pixels_inspector_begin_plain_long_page(
         pixels_inspector_handle handle, uint32_t row_group, uint32_t column,
         uint64_t row_offset, uint32_t row_count);
 
+pixels_inspector_status pixels_inspector_begin_page(
+        pixels_inspector_handle handle, uint32_t row_group, uint32_t column,
+        uint64_t row_offset, uint32_t row_count);
+
 pixels_inspector_status pixels_inspector_next_range(
         pixels_inspector_handle handle, uint64_t *offset, uint64_t *length);
 

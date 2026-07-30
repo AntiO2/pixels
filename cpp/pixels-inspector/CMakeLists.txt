@@ -122,6 +122,7 @@ target_link_libraries(pixels-inspector-proto PUBLIC libprotobuf-lite)
 
 add_library(pixels-format STATIC
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PixelsFormatReader.cpp"
+    "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainScalarDecoder.cpp"
     "${PIXELS_CPP_ROOT}/pixels-core/lib/format/PlainLongDecoder.cpp")
 target_include_directories(pixels-format PUBLIC
     "${PIXELS_CPP_ROOT}/pixels-core/include")
@@ -210,5 +211,5 @@ if(EMSCRIPTEN)
         "SHELL:-sMAXIMUM_MEMORY=268435456"
         "SHELL:-sINCOMING_MODULE_JS_API=['wasmBinary','locateFile','print','printErr','noInitialRun']"
         "SHELL:-sEXPORTED_RUNTIME_METHODS=['HEAPU8']"
-        "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_pixels_inspector_abi_version','_pixels_inspector_create','_pixels_inspector_destroy','_pixels_inspector_begin_metadata','_pixels_inspector_begin_plain_long_page','_pixels_inspector_next_range','_pixels_inspector_supply_range','_pixels_inspector_result_size','_pixels_inspector_copy_result','_pixels_inspector_error_size','_pixels_inspector_copy_error','_pixels_inspector_cancel']")
+        "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_pixels_inspector_abi_version','_pixels_inspector_create','_pixels_inspector_destroy','_pixels_inspector_begin_metadata','_pixels_inspector_begin_plain_long_page','_pixels_inspector_begin_page','_pixels_inspector_next_range','_pixels_inspector_supply_range','_pixels_inspector_result_size','_pixels_inspector_copy_result','_pixels_inspector_error_size','_pixels_inspector_copy_error','_pixels_inspector_cancel']")
 endif()
