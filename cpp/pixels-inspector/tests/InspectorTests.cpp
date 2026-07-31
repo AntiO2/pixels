@@ -783,6 +783,38 @@ std::vector<std::uint8_t> makeMultiPixelLongFixture(
                     canonical.data() + 506, 276),
             "unable to parse canonical FileTail");
 
+    // Pixel stride is file-global. Keep this generated fixture genuinely
+    // LONG-only so every declared root column has the same three-Pixel shape.
+    // Retaining the canonical fixture's other single-Pixel columns would make
+    // their indexes inconsistent with the rewritten stride of four rows.
+    while (rowGroupFooter.mutable_rowgroupindexentry()
+                   ->columnchunkindexentries_size() > 1)
+    {
+        rowGroupFooter.mutable_rowgroupindexentry()
+                ->mutable_columnchunkindexentries()->RemoveLast();
+    }
+    while (rowGroupFooter.mutable_rowgroupencoding()
+                   ->columnchunkencodings_size() > 1)
+    {
+        rowGroupFooter.mutable_rowgroupencoding()
+                ->mutable_columnchunkencodings()->RemoveLast();
+    }
+    while (fileTail.mutable_footer()->types_size() > 1)
+    {
+        fileTail.mutable_footer()->mutable_types()->RemoveLast();
+    }
+    while (fileTail.mutable_footer()->columnstats_size() > 1)
+    {
+        fileTail.mutable_footer()->mutable_columnstats()->RemoveLast();
+    }
+    require(fileTail.mutable_footer()->rowgroupstats_size() == 1,
+            "canonical fixture must contain one row-group statistic");
+    while (fileTail.mutable_footer()->mutable_rowgroupstats(0)
+                   ->columnchunkstats_size() > 1)
+    {
+        fileTail.mutable_footer()->mutable_rowgroupstats(0)
+                ->mutable_columnchunkstats()->RemoveLast();
+    }
     pixels::proto::ColumnChunkIndex *chunk =
             rowGroupFooter.mutable_rowgroupindexentry()
                     ->mutable_columnchunkindexentries(0);
@@ -802,6 +834,7 @@ std::vector<std::uint8_t> makeMultiPixelLongFixture(
                 nullMasks[pixel] != 0);
         const std::uint32_t rowStart = pixel * 4U;
         const std::uint32_t rows = pixel == 2 ? 2U : 4U;
+        statistics->mutable_statistic()->set_numberofvalues(rows);
         std::vector<std::int64_t> pixelValues;
         for (std::uint32_t row = 0; row < rows; ++row)
         {
@@ -1879,6 +1912,113 @@ std::string decodePage(
     return readResult(session);
 }
 
+void verifyMultiPixelLongRoundTrip(
+        const std::vector<std::uint8_t> &file)
+{
+    require(file.size() >= 8,
+            "multi-pixel fixture has no tail pointer");
+    std::uint64_t tailOffset = 0;
+    for (std::size_t byte = file.size() - 8;
+         byte < file.size(); ++byte)
+    {
+        tailOffset = (tailOffset << 8U) | file[byte];
+    }
+    require(tailOffset <= file.size() - 8,
+            "multi-pixel fixture tail pointer is out of bounds");
+
+    pixels::proto::FileTail tail;
+    require(tail.ParseFromArray(
+                    file.data() + static_cast<std::size_t>(tailOffset),
+                    static_cast<int>(
+                            file.size() - 8U
+                            - static_cast<std::size_t>(tailOffset))),
+            "unable to parse generated multi-pixel FileTail");
+    require(tail.has_postscript()
+            && tail.postscript().pixelstride() == 4
+            && tail.postscript().numberofrows() == 10,
+            "multi-pixel FileTail does not describe 10 rows at stride 4");
+    require(tail.has_footer()
+            && tail.footer().rowgroupinfos_size() == 1
+            && tail.footer().types_size() == 1
+            && tail.footer().columnstats_size() == 1
+            && tail.footer().rowgroupstats_size() == 1
+            && tail.footer().rowgroupstats(0)
+                       .columnchunkstats_size() == 1,
+            "multi-pixel fixture must contain one LONG column and row group");
+
+    const pixels::proto::RowGroupInformation &rowGroup =
+            tail.footer().rowgroupinfos(0);
+    require(rowGroup.numberofrows() == 10
+            && rowGroup.footeroffset() <= file.size()
+            && rowGroup.footerlength()
+               <= file.size() - rowGroup.footeroffset(),
+            "multi-pixel row-group bounds or row count are invalid");
+    pixels::proto::RowGroupFooter footer;
+    require(footer.ParseFromArray(
+                    file.data()
+                    + static_cast<std::size_t>(rowGroup.footeroffset()),
+                    static_cast<int>(rowGroup.footerlength())),
+            "unable to parse generated multi-pixel RowGroupFooter");
+    require(footer.has_rowgroupindexentry()
+            && footer.rowgroupindexentry()
+                       .columnchunkindexentries_size() == 1
+            && footer.has_rowgroupencoding()
+            && footer.rowgroupencoding()
+                       .columnchunkencodings_size() == 1,
+            "multi-pixel row group must contain one column chunk");
+    const pixels::proto::ColumnChunkIndex &chunk =
+            footer.rowgroupindexentry().columnchunkindexentries(0);
+    const std::uint32_t expectedPositions[] = {0, 32, 64};
+    const std::uint64_t expectedCounts[] = {4, 4, 2};
+    require(chunk.pixelpositions_size() == 3
+            && chunk.pixelstatistics_size() == 3,
+            "multi-pixel row group must contain three Pixel segments");
+    std::uint64_t coveredRows = 0;
+    for (int pixel = 0; pixel < 3; ++pixel)
+    {
+        require(chunk.pixelpositions(pixel)
+                        == expectedPositions[pixel],
+                "multi-pixel segment has an incorrect start position");
+        const pixels::proto::PixelStatistic &statistics =
+                chunk.pixelstatistics(pixel);
+        require(statistics.has_statistic()
+                && statistics.statistic().has_numberofvalues()
+                && statistics.statistic().numberofvalues()
+                           == expectedCounts[pixel],
+                "multi-pixel segment has an incorrect logical row count");
+        coveredRows += statistics.statistic().numberofvalues();
+    }
+    require(coveredRows == rowGroup.numberofrows(),
+            "multi-pixel segment row counts do not cover the row group");
+
+    Session session(file.size());
+    driveMetadataFlexible(session, file);
+    const std::string metadata = readResult(session);
+    require(metadata.find("\"pixelStride\":4") != std::string::npos
+            && metadata.find("\"rowGroupCount\":1")
+                       != std::string::npos,
+            "Core metadata did not preserve multi-pixel shape");
+    require(pixels_inspector_begin_row_group(session.handle(), 0)
+            == PIXELS_INSPECTOR_RANGE_READY,
+            "Core row-group inspection did not request the footer");
+    require(supply(session, nextRange(session), file)
+            == PIXELS_INSPECTOR_RESULT_READY,
+            "Core did not parse the generated multi-pixel row group");
+    const std::string layout = readResult(session);
+    require(layout.find("\"position\":0") != std::string::npos
+            && layout.find("\"position\":32") != std::string::npos
+            && layout.find("\"position\":64") != std::string::npos
+            && layout.find("\"numberOfValues\":\"2\"")
+                       != std::string::npos,
+            "Core row-group layout lost generated Pixel boundaries");
+
+    require(decodePage(file, 0, 0, 10)
+            == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":10,"
+               "\"values\":[\"0\",\"1\",\"2\",\"3\",\"4\",\"5\","
+               "\"6\",\"7\",\"8\",\"9\"]}",
+            "Core page decode did not round-trip multi-pixel values 0..9");
+}
+
 std::string driveOperation(
         Session &session, const std::vector<std::uint8_t> &file,
         pixels_inspector_status status)
@@ -2213,6 +2353,7 @@ void testMultiPixelPlainPages()
     {
         const std::vector<std::uint8_t> file =
                 makeMultiPixelLongFixture(false, {0, 0, 0});
+        verifyMultiPixelLongRoundTrip(file);
         Session session(file.size());
         driveMetadataFlexible(session, file);
         require(pixels_inspector_begin_plain_long_page(
@@ -4822,6 +4963,17 @@ int main(int argc, char **argv)
         {
             writeBytes(argv[2], makeTpchLineitemFixture());
             std::cout << "pixels-inspector TPC-H lineitem fixture: PASS\n";
+            return EXIT_SUCCESS;
+        }
+        if (argc == 3
+            && std::string(argv[1])
+               == "--write-multi-pixel-long")
+        {
+            const std::vector<std::uint8_t> fixture =
+                    makeMultiPixelLongFixture(false, {0, 0, 0});
+            verifyMultiPixelLongRoundTrip(fixture);
+            writeBytes(argv[2], fixture);
+            std::cout << "pixels-inspector multi-pixel LONG fixture: PASS\n";
             return EXIT_SUCCESS;
         }
         if (argc == 2

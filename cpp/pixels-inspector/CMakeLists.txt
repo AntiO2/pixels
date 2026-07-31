@@ -62,7 +62,7 @@ set(protobuf_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(protobuf_BUILD_CONFORMANCE OFF CACHE BOOL "" FORCE)
 set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(protobuf_WITH_ZLIB OFF CACHE BOOL "" FORCE)
-if(CMAKE_CROSSCOMPILING)
+if(CMAKE_CROSSCOMPILING OR PIXELS_PROTOC_EXECUTABLE)
     set(protobuf_BUILD_PROTOC_BINARIES OFF CACHE BOOL "" FORCE)
 else()
     set(protobuf_BUILD_PROTOC_BINARIES ON CACHE BOOL "" FORCE)
@@ -71,11 +71,11 @@ add_subdirectory("${PIXELS_PROTOBUF_ROOT}"
                  "${CMAKE_CURRENT_BINARY_DIR}/third-party/protobuf"
                  EXCLUDE_FROM_ALL)
 
-if(CMAKE_CROSSCOMPILING)
+if(CMAKE_CROSSCOMPILING OR PIXELS_PROTOC_EXECUTABLE)
     if(NOT PIXELS_PROTOC_EXECUTABLE
        OR NOT EXISTS "${PIXELS_PROTOC_EXECUTABLE}")
         message(FATAL_ERROR
-                "Cross builds require -DPIXELS_PROTOC_EXECUTABLE=<host protoc>")
+                "This build requires -DPIXELS_PROTOC_EXECUTABLE=<host protoc>")
     endif()
     set(PIXELS_PROTOC_COMMAND "${PIXELS_PROTOC_EXECUTABLE}")
     set(PIXELS_PROTOC_DEPENDS)
@@ -238,6 +238,16 @@ if(PIXELS_INSPECTOR_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     add_test(
         NAME pixels-inspector-variable-tests
         COMMAND pixels-inspector-variable-tests)
+
+    add_executable(
+        pixels-customer-fixture-generator
+        tools/generate_customer_fixture.cpp)
+    target_link_libraries(
+        pixels-customer-fixture-generator PRIVATE pixels-inspector)
+    add_test(
+        NAME pixels-customer-fixture-generator-test
+        COMMAND pixels-customer-fixture-generator
+                "${CMAKE_CURRENT_BINARY_DIR}/customer-test.pxl")
 endif()
 
 if(EMSCRIPTEN)
