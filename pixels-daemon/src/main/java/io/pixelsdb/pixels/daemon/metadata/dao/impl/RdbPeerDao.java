@@ -151,11 +151,11 @@ public class RdbPeerDao extends PeerDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO PEERS(" +
-                "`PEER_NAME`," +
-                "`PEER_LOCATION`," +
-                "`PEER_HOST`," +
-                "`PEER_PORT`," +
-                "`PEER_STORAGE_SCHEME`) VALUES (?,?,?,?,?)";
+                "PEER_NAME," +
+                "PEER_LOCATION," +
+                "PEER_HOST," +
+                "PEER_PORT," +
+                "PEER_STORAGE_SCHEME) VALUES (?,?,?,?,?)";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, peer.getName());
@@ -178,11 +178,11 @@ public class RdbPeerDao extends PeerDao
         Connection conn = db.getConnection();
         String sql = "UPDATE PEERS\n" +
                 "SET\n" +
-                "`PEER_LOCATION` = ?," +
-                "`PEER_HOST` = ?," +
-                "`PEER_PORT` = ?," +
-                "`PEER_STORAGE_SCHEME` = ?\n" +
-                "WHERE `PEER_ID` = ? OR `PEER_NAME` = ?";
+                "PEER_LOCATION = ?," +
+                "PEER_HOST = ?," +
+                "PEER_PORT = ?," +
+                "PEER_STORAGE_SCHEME = ?\n" +
+                "WHERE PEER_ID = ? OR PEER_NAME = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, peer.getLocation());

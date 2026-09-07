@@ -103,8 +103,10 @@ if [ $CP_ETC -eq 1 ]; then
 fi
 
 # find and copy pixels.properties
+PIXELS_PROPERTIES_CREATED=0
 if [ ! -f "$PIXELS_HOME/etc/pixels.properties" ]; then
   cp -v ./pixels-common/src/main/resources/pixels.properties $PIXELS_HOME/etc
+  PIXELS_PROPERTIES_CREATED=1
   echo "$(
     tput setaf 1
     tput setab 7
@@ -149,6 +151,12 @@ else
   fi
 
   rm -f $TEMPLATE_KEYS $TARGET_KEYS $NEW_KEYS $DEPRECATED_KEYS $NEW_OPTIONS $DEPRECATED_OPTIONS
+fi
+
+# Make a fresh Derby installation independent of the source checkout path.
+if [ $PIXELS_PROPERTIES_CREATED -eq 1 ]; then
+  sed -i "s#^pixels.var.dir=.*#pixels.var.dir=$PIXELS_HOME/var/#" $PIXELS_HOME/etc/pixels.properties
+  sed -i "s#^metadata.db.url=jdbc:derby:.*#metadata.db.url=jdbc:derby:$PIXELS_HOME/var/pixels_metadata;create=true#" $PIXELS_HOME/etc/pixels.properties
 fi
 
 # find and copy pixels-cpp.properties

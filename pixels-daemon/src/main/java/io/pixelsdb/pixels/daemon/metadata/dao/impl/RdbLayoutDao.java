@@ -217,16 +217,16 @@ public class RdbLayoutDao extends LayoutDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO LAYOUTS(" +
-                "`LAYOUT_VERSION`," +
-                "`LAYOUT_CREATE_AT`," +
-                "`LAYOUT_PERMISSION`," +
-                "`LAYOUT_ORDERED`," +
-                "`LAYOUT_COMPACT`," +
-                "`LAYOUT_SPLITS`," +
-                "`LAYOUT_PROJECTIONS`," +
-                "`SCHEMA_VERSIONS_SV_ID`," +
-                "`TBLS_TBL_ID`) VALUES (?,?,?,?,?,?,?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "LAYOUT_VERSION," +
+                "LAYOUT_CREATE_AT," +
+                "LAYOUT_PERMISSION," +
+                "LAYOUT_ORDERED," +
+                "LAYOUT_COMPACT," +
+                "LAYOUT_SPLITS," +
+                "LAYOUT_PROJECTIONS," +
+                "SCHEMA_VERSIONS_SV_ID," +
+                "TBLS_TBL_ID) VALUES (?,?,?,?,?,?,?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setLong(1, layout.getVersion());
             pst.setLong(2, layout.getCreateAt());
@@ -239,7 +239,7 @@ public class RdbLayoutDao extends LayoutDao
             pst.setLong(9, layout.getTableId());
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);
@@ -266,14 +266,14 @@ public class RdbLayoutDao extends LayoutDao
         Connection conn = db.getConnection();
         String sql = "UPDATE LAYOUTS\n" +
                 "SET\n" +
-                "`LAYOUT_VERSION` = ?," +
-                "`LAYOUT_CREATE_AT` = ?," +
-                "`LAYOUT_PERMISSION` = ?," +
-                "`LAYOUT_ORDERED` = ?," +
-                "`LAYOUT_COMPACT` = ?," +
-                "`LAYOUT_SPLITS` = ?," +
-                "`LAYOUT_PROJECTIONS` = ?\n" +
-                "WHERE `LAYOUT_ID` = ?";
+                "LAYOUT_VERSION = ?," +
+                "LAYOUT_CREATE_AT = ?," +
+                "LAYOUT_PERMISSION = ?," +
+                "LAYOUT_ORDERED = ?," +
+                "LAYOUT_COMPACT = ?," +
+                "LAYOUT_SPLITS = ?," +
+                "LAYOUT_PROJECTIONS = ?\n" +
+                "WHERE LAYOUT_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setLong(1, layout.getVersion());

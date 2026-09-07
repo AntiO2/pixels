@@ -234,14 +234,14 @@ public class RdbColumnDao extends ColumnDao
         Connection conn = db.getConnection();
         String sql = "UPDATE COLS\n" +
                 "SET\n" +
-                "`COL_NAME` = ?," +
-                "`COL_TYPE` = ?," +
-                "`COL_CHUNK_SIZE` = ?," +
-                "`COL_SIZE` = ?," +
-                "`COL_NULL_FRACTION` = ?," +
-                "`COL_CARDINALITY` = ?," +
-                "`COL_RECORD_STATS` = ?\n" +
-                "WHERE `COL_ID` = ?";
+                "COL_NAME = ?," +
+                "COL_TYPE = ?," +
+                "COL_CHUNK_SIZE = ?," +
+                "COL_SIZE = ?," +
+                "COL_NULL_FRACTION = ?," +
+                "COL_CARDINALITY = ?," +
+                "COL_RECORD_STATS = ?\n" +
+                "WHERE COL_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, column.getName());

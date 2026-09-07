@@ -220,14 +220,14 @@ public class RdbFileDao extends FileDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO FILES(" +
-                "`FILE_NAME`," +
-                "`FILE_TYPE`," +
-                "`FILE_NUM_RG`," +
-                "`FILE_MIN_ROW_ID`," +
-                "`FILE_MAX_ROW_ID`," +
-                "`PATHS_PATH_ID`," +
-                "`FILE_CLEANUP_AT`) VALUES (?,?,?,?,?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "FILE_NAME," +
+                "FILE_TYPE," +
+                "FILE_NUM_RG," +
+                "FILE_MIN_ROW_ID," +
+                "FILE_MAX_ROW_ID," +
+                "PATHS_PATH_ID," +
+                "FILE_CLEANUP_AT) VALUES (?,?,?,?,?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setString(1, file.getName());
             pst.setInt(2, file.getTypeValue());
@@ -238,7 +238,7 @@ public class RdbFileDao extends FileDao
             setCleanupAt(pst, 7, file);
             if (pst.executeUpdate() == 1)
             {
-                try (ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()"))
+                try (ResultSet rs = pst.getGeneratedKeys())
                 {
                     if (rs.next())
                     {
@@ -267,13 +267,13 @@ public class RdbFileDao extends FileDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO FILES(" +
-                "`FILE_NAME`," +
-                "`FILE_TYPE`," +
-                "`FILE_NUM_RG`," +
-                "`FILE_MIN_ROW_ID`," +
-                "`FILE_MAX_ROW_ID`," +
-                "`PATHS_PATH_ID`," +
-                "`FILE_CLEANUP_AT`) VALUES (?,?,?,?,?,?,?)";
+                "FILE_NAME," +
+                "FILE_TYPE," +
+                "FILE_NUM_RG," +
+                "FILE_MIN_ROW_ID," +
+                "FILE_MAX_ROW_ID," +
+                "PATHS_PATH_ID," +
+                "FILE_CLEANUP_AT) VALUES (?,?,?,?,?,?,?)";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             for (MetadataProto.File file : files)
@@ -301,13 +301,13 @@ public class RdbFileDao extends FileDao
     {
         Connection conn = db.getConnection();
         String sql = "UPDATE FILES SET\n" +
-                "`FILE_NAME` = ?," +
-                "`FILE_TYPE` = ?," +
-                "`FILE_NUM_RG` = ?," +
-                "`FILE_MIN_ROW_ID` = ?," +
-                "`FILE_MAX_ROW_ID` = ?," +
-                "`FILE_CLEANUP_AT` = ?\n" +
-                "WHERE `FILE_ID` = ?";
+                "FILE_NAME = ?," +
+                "FILE_TYPE = ?," +
+                "FILE_NUM_RG = ?," +
+                "FILE_MIN_ROW_ID = ?," +
+                "FILE_MAX_ROW_ID = ?," +
+                "FILE_CLEANUP_AT = ?\n" +
+                "WHERE FILE_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, file.getName());

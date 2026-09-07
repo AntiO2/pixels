@@ -192,11 +192,11 @@ public class RdbTableDao extends TableDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO TBLS(" +
-                "`TBL_NAME`," +
-                "`TBL_TYPE`," +
-                "`TBL_STORAGE_SCHEME`," +
-                "`TBL_ROW_COUNT`," +
-                "`DBS_DB_ID`) VALUES (?,?,?,?,?)";
+                "TBL_NAME," +
+                "TBL_TYPE," +
+                "TBL_STORAGE_SCHEME," +
+                "TBL_ROW_COUNT," +
+                "DBS_DB_ID) VALUES (?,?,?,?,?)";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, table.getName());
@@ -218,11 +218,11 @@ public class RdbTableDao extends TableDao
         Connection conn = db.getConnection();
         String sql = "UPDATE TBLS\n" +
                 "SET\n" +
-                "`TBL_NAME` = ?," +
-                "`TBL_TYPE` = ?," +
-                "`TBL_STORAGE_SCHEME` = ?," +
-                "`TBL_ROW_COUNT` = ?\n" +
-                "WHERE `TBL_ID` = ?";
+                "TBL_NAME = ?," +
+                "TBL_TYPE = ?," +
+                "TBL_STORAGE_SCHEME = ?," +
+                "TBL_ROW_COUNT = ?\n" +
+                "WHERE TBL_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, table.getName());

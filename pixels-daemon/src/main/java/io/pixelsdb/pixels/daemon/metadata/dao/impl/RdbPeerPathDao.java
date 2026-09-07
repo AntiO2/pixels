@@ -153,11 +153,11 @@ public class RdbPeerPathDao extends PeerPathDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO PEER_PATHS(" +
-                "`PEER_PATH_URI`," +
-                "`PEER_PATH_COLUMNS`," +
-                "`PATHS_PATH_ID`," +
-                "`PEERS_PEER_ID`) VALUES (?,?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "PEER_PATH_URI," +
+                "PEER_PATH_COLUMNS," +
+                "PATHS_PATH_ID," +
+                "PEERS_PEER_ID) VALUES (?,?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setString(1, peerPath.getUri());
             pst.setString(2, JSON.toJSONString(new Columns(peerPath.getColumnsList())));
@@ -165,7 +165,7 @@ public class RdbPeerPathDao extends PeerPathDao
             pst.setLong(4, peerPath.getPeerId());
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);
@@ -193,9 +193,9 @@ public class RdbPeerPathDao extends PeerPathDao
         Connection conn = db.getConnection();
         String sql = "UPDATE PEER_PATHS\n" +
                 "SET\n" +
-                "`PEER_PATH_URI` = ?," +
-                "`PEER_PATH_COLUMNS` = ?\n" +
-                "WHERE `PEER_PATH_ID` = ?";
+                "PEER_PATH_URI = ?," +
+                "PEER_PATH_COLUMNS = ?\n" +
+                "WHERE PEER_PATH_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, peerPath.getUri());

@@ -537,11 +537,11 @@ public class TestRdbFileDao
     private PreparedStatement stubPreparedStatementForInsert() throws SQLException
     {
         PreparedStatement pst = mock(PreparedStatement.class);
-        when(mockConn.prepareStatement(anyString())).thenReturn(pst);
+        when(mockConn.prepareStatement(anyString(), eq(Statement.RETURN_GENERATED_KEYS))).thenReturn(pst);
         when(pst.executeUpdate()).thenReturn(1);
-        // Stub LAST_INSERT_ID() on the insert statement.
+        // Stub the JDBC-standard generated-keys result on the insert statement.
         ResultSet idRs = mock(ResultSet.class);
-        when(pst.executeQuery(anyString())).thenReturn(idRs);
+        when(pst.getGeneratedKeys()).thenReturn(idRs);
         when(idRs.next()).thenReturn(true);
         when(idRs.getLong(1)).thenReturn(1L);
         return pst;
