@@ -49,6 +49,19 @@ public class LocalIndexService implements IndexService
     }
 
     @Override
+    public List<IndexProto.RowLocation> lookupRowLocations(long tableId, List<Long> rowIds) throws IndexException
+    {
+        try
+        {
+            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
+            List<IndexProto.RowLocation> result = new java.util.ArrayList<>(rowIds.size());
+            for (long rowId : rowIds) { result.add(mainIndex.getLocation(rowId)); }
+            return result;
+        }
+        catch (MainIndexException e) { throw new IndexException("Cannot resolve MainIndex rows", e); }
+    }
+
+    @Override
     public IndexProto.RowIdBatch allocateRowIdBatch(long tableId, int numRowIds) throws IndexException
     {
         try
@@ -473,29 +486,24 @@ public class LocalIndexService implements IndexService
     }
 
     @Override
-    public boolean flushIndexEntriesOfFile
-            (long tableId, long indexId, long fileId, boolean isPrimary, IndexOption indexOption) throws IndexException
+    public boolean flushMainIndexOfFile(long tableId, long fileId) throws IndexException
     {
         try
         {
-            if (isPrimary)
-            {
-                // get the MainIndex for the table
-                MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
-                if (mainIndex == null)
-                {
-                    // MainIndex not found
-                    return false;
-                }
-                // flush cache of the specified file
-                mainIndex.flushCache(fileId);
-            }
-            return true;
+            MainIndex mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
+            return mainIndex != null && mainIndex.flushCache(fileId);
         }
         catch (MainIndexException e)
         {
             throw new IndexException("Failed to flush main index for tableId=" + tableId + ", fileId=" + fileId, e);
         }
+    }
+
+    @Override
+    public boolean flushIndexEntriesOfFile
+            (long tableId, long indexId, long fileId, boolean isPrimary, IndexOption indexOption) throws IndexException
+    {
+        return !isPrimary || flushMainIndexOfFile(tableId, fileId);
     }
 
     @Override

@@ -1,61 +1,74 @@
-# Transactional ingestion: stream-staging foundation
+# Transactional ingestion: SQL integration milestone
 
 Related: pixelsdb/pixels-trino#180.
 
-## Implemented boundary
+## Implemented components
 
-`pixels-common.ingest` defines immutable mutation stream IDs, opaque batches,
-content-bound SHA-256 digests, exact stream seals, and a transport interface.
-`LocalMutationJournal` persists multiple writers and transactions in one local
-journal. No business primary key is required; equal-valued rows remain distinct
-batches/rows. `DELETE_ROWS` is reserved as a transport kind, not implemented SQL DELETE.
+`pixels-common.ingest` contains immutable stream/batch identities, exact seals,
+a bounded columnar codec, authenticated RPC clients and a checksummed atomic
+LOCAL state file. `LocalMutationJournal` retains transaction-private payloads.
 
-The journal does not call MainIndex, SinglePointIndex, RowIdAllocator, or Retina
-visibility. Those remain the authoritative storage primitives for committed
-installation. Staging must not allocate replacement identities or expose rows.
+`RetinaIngestParticipant` validates authoritative stream registration and exact
+seals before preparing. `DurableIngestCoordinator` persists mutually exclusive
+COMMIT/ABORT decisions, drives installation, and publishes only the complete
+installed commit prefix. Its local state volume has a single owner.
 
-## Local storage contract
+`PixelsIngestInstaller` records existing allocator results and buffer placements
+before shared installation. It reuses `MainIndex`, `SinglePointIndex`, native
+Retina visibility, shared `PixelsWriteBuffer` instances and background Pixels
+file generation. Keyless file finalization persists MainIndex without requiring
+a business primary index. Identical rows are never deduplicated by value.
 
-Append acknowledges acceptance. A stream seal verifies sequence, schema/format,
-counts, and digest, then forces the WAL, atomically replaces a checksummed
-`durable.offset`, and forces the directory. Recovery validates the entire
-acknowledged prefix. Only an unacknowledged suffix is truncated. A lost/corrupt
-marker or acknowledged record is an error, not a fresh deployment.
+Read pins prevent physical file publication from racing a statement's file/buffer
+selection. The buffer reader consumes prefetch results in source order, associates
+each batch with its own visibility bitmap, drains the entire queue, propagates
+read failures, and owns data before closing a physical reader's native buffers.
 
-Use an already-created directory on a local filesystem supporting atomic rename,
-file force, and directory force. A local file lock permits one owner; it is not
-distributed fencing. Local-volume loss is outside this guarantee. No power-loss
-or storage-hardware durability certification is implied by the tests.
+## Validation
 
-The byte and record limits bound disk admission and in-memory descriptors.
-Rotation, checkpoints, and reclamation are not implemented. A full journal fails
-admission; the caller must not treat this journal as an unlimited production WAL.
-`close()` does not make unsealed appends acknowledged.
+The matching pixels-trino checkout provides:
 
-`discardAbortedTransaction` records a previously verified authoritative ABORT.
-It is not a transaction decision API. Its persistent tombstone rejects old and
-new streams for that transaction. Payload cleanup is deferred; no shared row or
-index compensation occurs.
+```sh
+bash /path/to/pixels-trino/tools/verify-sql-insert.sh "$PWD"
+```
 
-## Verification
+It starts real Trino SQL execution, separate-process RPC services, and actual
+Retina/Pixels storage. The catalog, topology and external ID allocation are test
+fixtures; data, installation, MainIndex, visibility and query results are not.
+The test verifies 1,008 visible rows, including two INSERT SELECT statements,
+and an aborted statement whose accepted private rows never become public.
+
+Focused tests:
 
 ```sh
 bash tools/verify-ingest-contract.sh
+mvn -pl pixels-core -DskipTests=false -Dtest=TestBufferSnapshotRead test
+mvn -pl pixels-daemon -DskipTests=false -Dtest=TestPixelsIngestStorage test
 ```
 
-Requires JDK 9+ and validates the Java-8-compatible subset without Maven, native
-Retina, or running services. JUnit 4 wrappers in `pixels-retina` run the same 17
-contract cases under the normal module test runner. Explicitly enable tests in
-this repository's Maven configuration.
+When using JDK 23, the native/local reader tests require the Java module opens
+used by `verify-sql-insert.sh`. Use the installed native library path and preload
+jemalloc when required by the Retina build. The root Surefire configuration now
+honors the explicit `skipTests` property; check the reported executed test counts.
 
-## Required integration before SQL enablement
+## Operational limits
 
-Participant registration and authorization; owner epochs; the RPC/payload
-adapter; schema validation and constraint/row intents; durable transaction
-manifest and Prepare/Commit/Abort decisions; replay-safe installation using the
-existing indexes; publication/ReadViews; checkpoint and log reclamation; and
-primary-key-optional file finalization remain separate implementation work.
+This is a LOCAL-durability, fixed-owner experimental path, disabled unless both
+the connector and Retina ingestion settings are enabled. It does not implement
+replicated recovery or safe live ownership transfer. Prepare acknowledgements
+require durable local records; permanent loss of the acknowledged volume is not
+covered.
 
-Do not register the new SQL write path until those correctness boundaries are
-implemented. The staging journal is not a committed database and has no public
-query API.
+The new RPC services are started explicitly by the integration harness. Standard
+daemon lifecycle registration, migration from the legacy timestamp domain and
+production activation are not completed by this milestone. Do not mix the new
+transaction domain with legacy writers or rewriting GC on the same table.
+
+Journals and install plans currently retain recovery references and enforce
+capacity limits. Transaction checkpointing, WAL/terminal-state reclamation and
+rewrite-GC coordination remain separate work. `DELETE_ROWS` is reserved but not
+enabled. Replay after arbitrary rewrite, table movement or schema evolution is
+rejected rather than silently accepted.
+
+The existing indexes remain authoritative. No parallel row directory, new row-ID
+allocator or replacement index implementation is introduced.

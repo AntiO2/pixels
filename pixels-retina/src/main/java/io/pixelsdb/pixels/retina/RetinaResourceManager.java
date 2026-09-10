@@ -72,6 +72,29 @@ public class RetinaResourceManager
     private final MetadataService metadataService;
     private final IndexService indexService;
     private final Map<String, RGVisibility> rgVisibilityMap;
+    private final io.pixelsdb.pixels.retina.ingest.IngestReadPins ingestReadPins =
+            new io.pixelsdb.pixels.retina.ingest.IngestReadPins(new io.pixelsdb.pixels.common.ingest.rpc.IngestOptions().readLeaseMillis);
+    public io.pixelsdb.pixels.retina.ingest.IngestReadPins getIngestReadPins() { return ingestReadPins; }
+
+    public synchronized PixelsWriteBuffer getIngestBuffer(String schema, String table, int vnode) throws RetinaException
+    {
+        Map<Integer, PixelsWriteBuffer> existing = pixelsWriteBufferMap.get(RetinaUtils.buildWriteBufferKey(schema, table));
+        if (existing == null || !existing.containsKey(vnode)) { addWriteBuffer(schema, table); }
+        return checkPixelsWriteBuffer(schema, table, vnode);
+    }
+
+    /** Recovery requires an unchanged placement baseline until GC/checkpoint handoff is implemented. */
+    public void initializeIngestBaseline(Set<Long> managedFiles) throws RetinaException
+    {
+        if (Boolean.parseBoolean(ConfigFactory.Instance().getProperty("retina.storage.gc.enabled")))
+        { throw new RetinaException("Transactional replay requires rewriting GC to be disabled"); }
+        for (long fileId : managedFiles)
+        {
+            if (!rgVisibilityMap.containsKey(RetinaUtils.buildRgKey(fileId, 0)))
+            { throw new RetinaException("Missing recovered visibility for ingest file " + fileId); }
+        }
+    }
+
     private final Map<String, Map<Integer, PixelsWriteBuffer>> pixelsWriteBufferMap;
     private String retinaHostName;
 
@@ -668,7 +691,7 @@ public class RetinaResourceManager
         checkRGVisibility(fileId, rgId, false).importDeletionChain(items);
     }
 
-    public void addWriteBuffer(String schemaName, String tableName) throws RetinaException
+    public synchronized void addWriteBuffer(String schemaName, String tableName) throws RetinaException
     {
         try
         {
@@ -710,6 +733,7 @@ public class RetinaResourceManager
 
             for (int i = 0; i < totalVirtualNodeNum; i++)
             {
+                if (nodeBuffers.containsKey(i)) { continue; }
                 PixelsWriteBuffer pixelsWriteBuffer = new PixelsWriteBuffer(latestLayout.getTableId(),
                         schema, orderMapping, orderedPaths.get(0), compactPaths.get(0), retinaHostName, i);
                 nodeBuffers.put(i, pixelsWriteBuffer);
@@ -761,7 +785,7 @@ public class RetinaResourceManager
         RetinaProto.GetWriteBufferResponse.Builder responseBuilder = RetinaProto.GetWriteBufferResponse.newBuilder();
 
         // get super version
-        PixelsWriteBuffer writeBuffer = checkPixelsWriteBuffer(schemaName, tableName, vNodeId);
+        PixelsWriteBuffer writeBuffer = getIngestBuffer(schemaName, tableName, vNodeId);
         SuperVersion superVersion = writeBuffer.getCurrentVersion();
         MemTable activeMemtable = superVersion.getActiveMemTable();
         List<MemTable> immutableMemTables = superVersion.getImmutableMemTables();
@@ -771,7 +795,14 @@ public class RetinaResourceManager
 
         // Active memTable returns its full appended rows; visibility is masked
         // downstream by the RGVisibility bitmap slice below.
-        int activeSize = activeMemtable.getSize();
+        if (activeMemtable == null)
+        {
+            superVersion.unref();
+            return responseBuilder;
+        }
+        int activeSize;
+        synchronized (activeMemtable) { activeSize = activeMemtable.getSize();
+
         if (activeSize > 0)
         {
             ByteString data = ByteString.copyFrom(activeMemtable.serialize());
@@ -779,6 +810,8 @@ public class RetinaResourceManager
         } else
         {
             responseBuilder.setData(ByteString.EMPTY);
+        }
+
         }
 
         // statistics on id and fileId

@@ -28,7 +28,6 @@ import io.pixelsdb.pixels.common.index.RowIdAllocator;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.File;
 import io.pixelsdb.pixels.common.metadata.domain.Path;
-import io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex;
 import io.pixelsdb.pixels.common.physical.Storage;
 import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
@@ -64,6 +63,9 @@ public class PixelsWriteBuffer
 {
     private static final Logger logger = LogManager.getLogger(PixelsWriteBuffer.class);
 
+    private final boolean transactional = Boolean.parseBoolean(ConfigFactory.Instance().getProperty("retina.ingest.enabled"));
+    private final Map<String, Integer> installedSpanRows = new HashMap<>();
+    private boolean installFailed;
     private final long tableId;
 
     // column information is recorded to create rowBatch
@@ -129,7 +131,6 @@ public class PixelsWriteBuffer
     private final Object rowLock = new Object();
 
     private String retinaHostName;
-    private SinglePointIndex index;
     private final int virtualNodeId;
     private final IndexOption indexOption;
 
@@ -179,24 +180,102 @@ public class PixelsWriteBuffer
         this.objectStorageManager = ObjectStorageManager.Instance();
         this.objectStorageManager.setIdPrefix(retinaHostName + "_");
 
-        this.currentFileWriterManager = new FileWriterManager(
-                this.tableId, this.schema, this.targetOrderedDirPath,
-                this.targetOrderedStorage, this.memTableSize, this.blockSize,
-                this.replication, this.encodingLevel, this.nullsPadding,
-                idCounter, this.memTableSize * this.maxMemTableCount, retinaHostName, virtualNodeId);
-        this.ingestFilePublisher = new IngestFilePublisher(this.currentFileWriterManager.getFirstBlockId());
-
-        this.activeMemTable = new MemTable(this.idCounter, schema, memTableSize,
-                TypeDescription.VectorLayout.NONE, this.orderMapping,
-                this.currentFileWriterManager.getFileId(), 0, this.memTableSize);
-        this.idCounter++;
-        this.currentMemTableCount = 1;
-
-        // initialization adds reference counts to all data
-        this.currentVersion = new SuperVersion(activeMemTable, immutableMemTables, objectEntries);
+        if (!transactional) { initializeActive(null); }
+        else { this.currentVersion = new SuperVersion(null, immutableMemTables, objectEntries); }
         this.rowIdAllocator = new RowIdAllocator(tableId, this.memTableSize, IndexServiceProvider.ServiceMode.local);
 
         startFlushObjectToFileScheduler(Long.parseLong(configFactory.getProperty("retina.buffer.flush.interval")));
+    }
+
+    private void initializeActive(io.pixelsdb.pixels.ingest.IngestProto.BufferSpan restored) throws RetinaException
+    {
+        long first = restored == null ? idCounter : restored.getFirstBlockId();
+        this.currentFileWriterManager = new FileWriterManager(tableId, schema, targetOrderedDirPath,
+                targetOrderedStorage, memTableSize, blockSize, replication, encodingLevel,
+                nullsPadding, first, memTableSize * maxMemTableCount, retinaHostName, virtualNodeId, restored);
+        if (ingestFilePublisher == null) { ingestFilePublisher = new IngestFilePublisher(first); }
+        long block = restored == null ? first : restored.getBlockId();
+        int offset = restored == null ? 0 : restored.getBlockStartOffset();
+        activeMemTable = new MemTable(block, schema, memTableSize, TypeDescription.VectorLayout.NONE,
+                orderMapping, currentFileWriterManager.getFileId(), offset, memTableSize);
+        idCounter = block + 1;
+        currentMemTableCount = offset / memTableSize + 1;
+        SuperVersion old = currentVersion;
+        currentVersion = new SuperVersion(activeMemTable, immutableMemTables, objectEntries);
+        if (old != null) { old.unref(); }
+    }
+
+    /** Assigns a placement before the caller persists its install plan. */
+    public io.pixelsdb.pixels.ingest.IngestProto.BufferSpan planSpan(int remaining, long rowIdStart) throws RetinaException
+    {
+        synchronized (rowLock)
+        {
+            versionLock.writeLock().lock();
+            try
+            {
+                if (!transactional || installFailed || remaining <= 0) { throw new RetinaException("Buffer cannot plan an install"); }
+                if (activeMemTable == null) { initializeActive(null); }
+                if (activeMemTable.isFull()) { retireActiveMemTableLocked(); }
+                int count = Math.min(remaining, memTableSize - activeMemTable.getSize());
+                return io.pixelsdb.pixels.ingest.IngestProto.BufferSpan.newBuilder()
+                        .setFileId(activeMemTable.getFileId()).setFileName(currentFileWriterManager.getFileName())
+                        .setPathId(targetOrderedDirPath.getId()).setFirstBlockId(currentFileWriterManager.getFirstBlockId())
+                        .setBlockId(activeMemTable.getId()).setMemtableSize(memTableSize)
+                        .setFileCapacity(memTableSize * maxMemTableCount).setBlockStartOffset(activeMemTable.getStartIndex())
+                        .setOffsetInBlock(activeMemTable.getSize()).setRowCount(count).setRowIdStart(rowIdStart).build();
+            }
+            finally { versionLock.writeLock().unlock(); }
+        }
+    }
+
+    /** Reuses persisted rowIds and placements. Partial live appends fail closed. */
+    public void installSpan(io.pixelsdb.pixels.ingest.IngestProto.BufferSpan span,
+                            List<byte[][]> rows, long timestamp) throws RetinaException
+    {
+        synchronized (rowLock)
+        {
+            versionLock.writeLock().lock();
+            try
+            {
+                if (!transactional || installFailed || span.getRowCount() != rows.size()
+                        || span.getMemtableSize() != memTableSize || span.getFileCapacity() != memTableSize * maxMemTableCount)
+                { throw new RetinaException("Invalid installation placement"); }
+                String key = span.getFileId() + ":" + span.getBlockId() + ":" + span.getOffsetInBlock();
+                int done = installedSpanRows.getOrDefault(key, 0);
+                if (done == rows.size()) { return; }
+                if (activeMemTable == null) { initializeActive(span); }
+                if (activeMemTable.getId() != span.getBlockId() && activeMemTable.isFull())
+                {
+                    // Normal live rotation is planned first; this path restores a recorded next block.
+                    retireActiveMemTableLocked();
+                }
+                if (activeMemTable.getFileId() != span.getFileId() || activeMemTable.getId() != span.getBlockId()
+                        || activeMemTable.getStartIndex() != span.getBlockStartOffset()
+                        || activeMemTable.getSize() != span.getOffsetInBlock() + done)
+                { throw new RetinaException("Recorded placement no longer matches the active buffer"); }
+                for (int i = done; i < rows.size(); i++)
+                {
+                    int position;
+                    try { position = activeMemTable.add(rows.get(i), timestamp); }
+                    catch (Exception failure) { installFailed = true; throw failure; }
+                    if (position != span.getOffsetInBlock() + i) { installFailed = true; throw new RetinaException("Non-contiguous installation"); }
+                    currentFileWriterManager.includeRowId(span.getRowIdStart() + i);
+                    installedSpanRows.put(key, i + 1);
+                }
+            }
+            finally { versionLock.writeLock().unlock(); }
+        }
+    }
+
+    /** Published file contents are read from the catalog, not appended again during recovery. */
+    public void observePublishedSpan(io.pixelsdb.pixels.ingest.IngestProto.BufferSpan span) throws RetinaException
+    {
+        synchronized (rowLock)
+        {
+            if (activeMemTable != null) { throw new RetinaException("Published spans must precede unmaterialized replay"); }
+            idCounter = Math.max(idCounter, span.getBlockId() + 1);
+            continuousFlushedId.set(Math.max(continuousFlushedId.get(), span.getBlockId()));
+        }
     }
 
     /**
@@ -214,6 +293,7 @@ public class PixelsWriteBuffer
      */
     public long addRow(byte[][] values, long timestamp, IndexProto.RowLocation.Builder builder) throws RetinaException
     {
+        if (transactional) { throw new RetinaException("Legacy row ingress is disabled in transactional mode"); }
         checkArgument(values.length == this.schema.getChildren().size(),
                 "Column values count does not match schema column count.");
 
@@ -393,6 +473,7 @@ public class PixelsWriteBuffer
      */
     public long getEarliestPendingMinTs()
     {
+        if (this.ingestFilePublisher == null) { return Long.MAX_VALUE; }
         long nextBlockId = this.ingestFilePublisher.getNextCommitFirstBlockId();
         SuperVersion sv = getCurrentVersion();
         try
@@ -449,18 +530,9 @@ public class PixelsWriteBuffer
 
             if (!fileWriterManager.isIndexFlushed())
             {
-                if (this.index == null)
-                {
-                    this.index = MetadataService.Instance().getPrimaryIndex(tableId);
-                    if (this.index == null)
-                    {
-                        throw new RetinaException("Primary index not found for table " + tableId);
-                    }
-                }
-
+                // MainIndex is required even when the table has no business key index.
                 boolean flushed = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local)
-                        .flushIndexEntriesOfFile(
-                                tableId, index.getId(), fileWriterManager.getFileId(), true, indexOption);
+                        .flushMainIndexOfFile(tableId, fileWriterManager.getFileId());
                 if (!flushed)
                 {
                     throw new RetinaException("Failed to flush main index for ingest file "
@@ -472,9 +544,6 @@ public class PixelsWriteBuffer
         {
             throw new RetinaException("Failed to flush main index for ingest file "
                     + fileWriterManager.getFileId(), e);
-        } catch (MetadataException e)
-        {
-            throw new RetinaException("Failed to load primary index for table " + tableId, e);
         }
         return this.ingestFilePublisher.admitReady(fileWriterManager, this::publishPreparedFile);
     }
@@ -530,11 +599,25 @@ public class PixelsWriteBuffer
                     {
                         break;
                     }
+                    if (transactional)
+                    {
+                        RetinaResourceManager.Instance().getIngestReadPins().publish(() -> {
                     List<FileWriterManager> publishedFiles = publishFinishedFile(fileWriterManager);
                     for (FileWriterManager publishedFile : publishedFiles)
                     {
                         this.fileWriterManagers.remove(publishedFile);
                         cleanupPublishedObjects(publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
+                    }
+                        });
+                    }
+                    else
+                    {
+                    List<FileWriterManager> publishedFiles = publishFinishedFile(fileWriterManager);
+                    for (FileWriterManager publishedFile : publishedFiles)
+                    {
+                        this.fileWriterManagers.remove(publishedFile);
+                        cleanupPublishedObjects(publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
+                    }
                     }
                 }
             } catch (Exception e)
@@ -606,7 +689,7 @@ public class PixelsWriteBuffer
         this.versionLock.writeLock().lock();
         try
         {
-            if (!this.activeMemTable.isEmpty())
+            if (this.activeMemTable != null && !this.activeMemTable.isEmpty())
             {
                 retireActiveMemTableLocked();
             }
