@@ -41,7 +41,7 @@ public class TestIngestWriterAllocation {
                     public List<Route> routes() { return Collections.singletonList(ROUTE); }
                 },
                 new DurableIngestCoordinator.Participants() {
-                    public PrepareToken prepare(String owner, Transaction tx) {
+                    public PrepareToken prepare(String owner, Transaction tx) throws IOException {
                         return PrepareToken.newBuilder().setOwner(owner)
                                 .setDigest(ByteString.copyFrom(IngestWire.prepareDigest(tx, owner)))
                                 .build();
