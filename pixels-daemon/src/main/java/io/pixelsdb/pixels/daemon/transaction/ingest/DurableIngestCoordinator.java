@@ -126,6 +126,17 @@ public final class DurableIngestCoordinator implements Closeable {
                         && transaction.getCommitTimestamp() > snapshot.getPublishedTimestamp()) {
                     throw new IOException("Published transaction above publication point");
                 }
+                Set<Long> writerIds = new HashSet<>();
+                Set<String> writerRequests = new HashSet<>();
+                for (WriterAssignment writer : transaction.getWritersList()) {
+                    if (writer.getWriterId() <= 0
+                            || writer.getRequestId().isEmpty()
+                            || writer.getRequestId().length() > 512
+                            || !writerIds.add(writer.getWriterId())
+                            || !writerRequests.add(writer.getRequestId())) {
+                        throw new IOException("Invalid writer assignment in checkpoint");
+                    }
+                }
                 if (transaction.getState() == TransactionState.UNRECOGNIZED) {
                     throw new IOException("Unknown transaction state");
                 }
@@ -292,6 +303,50 @@ public final class DurableIngestCoordinator implements Closeable {
                     .addAllRoutes(snapshot.getRoutesList())
                     .build();
         }
+    }
+
+    /** Allocate an idempotent, transaction-local identity for one physical writer. */
+    public synchronized WriterAssignment allocateWriter(AllocateWriterRequest request)
+            throws IOException {
+        if (request.getRequestId().isEmpty() || request.getRequestId().length() > 512) {
+            throw new IllegalArgumentException("A bounded writer request id is required");
+        }
+        Transaction tx = get(request.getTransactionId());
+        if (tx.getState() == TransactionState.ABORTED) {
+            throw new IOException("Transaction aborted");
+        }
+        long maximum = 0;
+        for (WriterAssignment writer : tx.getWritersList()) {
+            if (writer.getRequestId().equals(request.getRequestId())) {
+                if (writer.getTaskId() != request.getTaskId()) {
+                    throw new IOException("Writer request reused with a different task identity");
+                }
+                return writer;
+            }
+            maximum = Math.max(maximum, writer.getWriterId());
+        }
+        if (tx.getState() != TransactionState.OPEN) {
+            throw new IOException("Transaction input is sealed");
+        }
+        live(tx);
+        if (tx.getWritersCount() >= maxStreams) {
+            throw new IOException("Transaction writer limit exceeded");
+        }
+        // Existing clients may already have registered a stream before using this API.
+        for (StreamId stream : tx.getStreamsList()) {
+            maximum = Math.max(maximum, stream.getWriterId());
+        }
+        if (maximum == Long.MAX_VALUE) {
+            throw new IOException("Transaction writer identities exhausted");
+        }
+        WriterAssignment assignment =
+                WriterAssignment.newBuilder()
+                        .setRequestId(request.getRequestId())
+                        .setTaskId(request.getTaskId())
+                        .setWriterId(maximum + 1)
+                        .build();
+        replace(tx.toBuilder().addWriters(assignment).setExpiresAtMillis(expiry()).build());
+        return assignment;
     }
 
     public synchronized Transaction register(StreamId stream) throws IOException {

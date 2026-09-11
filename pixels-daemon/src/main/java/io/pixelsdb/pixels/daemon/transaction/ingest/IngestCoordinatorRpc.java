@@ -49,6 +49,20 @@ public final class IngestCoordinatorRpc
     }
 
     @Override
+    public void allocateWriter(AllocateWriterRequest r, StreamObserver<WriterAssignment> o) {
+        try {
+            o.onNext(target.allocateWriter(r));
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
     public void registerStream(RegisterStreamRequest r, StreamObserver<Transaction> o) {
         try {
             o.onNext(target.register(r.getStream()));

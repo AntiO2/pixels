@@ -7,6 +7,7 @@ import "google/protobuf/empty.proto";
 
 service IngestCoordinatorService {
   rpc BeginWrite(BeginWriteRequest) returns (Transaction);
+  rpc AllocateWriter(AllocateWriterRequest) returns (WriterAssignment);
   rpc RegisterStream(RegisterStreamRequest) returns (Transaction);
   rpc PrepareWrite(PrepareWriteRequest) returns (Transaction);
   rpc CommitWrite(TransactionId) returns (Transaction);
@@ -80,6 +81,17 @@ message BeginWriteRequest {
   string table_name = 3;
   uint64 read_timestamp = 4;
 }
+// One writer is one sink instance; multiple sinks may share an engine task id.
+message AllocateWriterRequest {
+  uint64 transaction_id = 1;
+  string request_id = 2;
+  uint64 task_id = 3;
+}
+message WriterAssignment {
+  string request_id = 1;
+  uint64 task_id = 2;
+  uint64 writer_id = 3;
+}
 message TransactionId { uint64 transaction_id = 1; }
 message RegisterStreamRequest { StreamId stream = 1; }
 message PrepareWriteRequest { uint64 transaction_id = 1; repeated StreamSeal seals = 2; }
@@ -103,6 +115,7 @@ message Transaction {
   repeated StreamSeal seals = 8;
   repeated PrepareToken tokens = 9;
   uint64 expires_at_millis = 10;
+  repeated WriterAssignment writers = 11;
 }
 message ParticipantRequest { Transaction transaction = 1; string owner = 2; }
 message OwnerRequest { string owner = 1; }
