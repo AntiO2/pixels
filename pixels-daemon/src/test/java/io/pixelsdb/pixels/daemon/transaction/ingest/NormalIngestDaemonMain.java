@@ -22,6 +22,8 @@ import io.pixelsdb.pixels.common.ingest.wire.ColumnBatchCodec;
 import io.pixelsdb.pixels.common.ingest.wire.IngestWire;
 import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
+import io.pixelsdb.pixels.common.utils.Constants;
+import io.pixelsdb.pixels.common.utils.EtcdUtil;
 import io.pixelsdb.pixels.common.utils.NetUtils;
 import io.pixelsdb.pixels.core.PixelsFooterCache;
 import io.pixelsdb.pixels.core.PixelsReader;
@@ -70,6 +72,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class NormalIngestDaemonMain
 {
+    private static final long CUTOVER_BASELINE = 1_000_000_000L;
+
     private NormalIngestDaemonMain() {}
 
     public static void main(String[] args)
@@ -80,7 +84,8 @@ public final class NormalIngestDaemonMain
             if (args.length != 5)
             {
                 throw new IllegalArgumentException(
-                        "usage: ROOT ETCD_PORT RETINA_PORT TRANSACTION_PORT write|recover");
+                        "usage: ROOT ETCD_PORT RETINA_PORT TRANSACTION_PORT "
+                                + "write|recover|cutover-reject|cutover");
             }
             run(Paths.get(args[0]), Integer.parseInt(args[1]),
                     Integer.parseInt(args[2]), Integer.parseInt(args[3]), args[4]);
@@ -120,7 +125,9 @@ public final class NormalIngestDaemonMain
         setting(config, "retina.ingest.coordinator.state.dir", root.resolve("decisions").toString());
         setting(config, "retina.ingest.participant.plan.dir", root.resolve("plans").toString());
         setting(config, "retina.ingest.participant.wal.dir", root.resolve("wal").toString());
-        setting(config, "retina.ingest.cutover.baseline.timestamp", "0");
+        boolean cutover = phase.equals("cutover") || phase.equals("cutover-reject");
+        setting(config, "retina.ingest.cutover.baseline.timestamp",
+                Long.toString(cutover ? CUTOVER_BASELINE : 0));
         setting(config, "retina.ingest.transaction.lease.ms", "30000");
         setting(config, "retina.ingest.terminal.retention.ms", "30000");
         setting(config, "retina.server.host", host);
@@ -131,6 +138,14 @@ public final class NormalIngestDaemonMain
         setting(config, "retina.ingest.coordinator.port", Integer.toString(transactionPort));
         setting(config, "etcd.hosts", "127.0.0.1");
         setting(config, "etcd.port", Integer.toString(etcdPort));
+        if (phase.equals("cutover"))
+        {
+            // The supported operator procedure performs a guarded/CAS advance while all
+            // writers are drained. This isolated etcd has no concurrent writer, so a direct
+            // assignment models the already-completed administrative step.
+            EtcdUtil.Instance().putKeyValue(
+                    Constants.AI_TRANS_ID_KEY, Long.toString(CUTOVER_BASELINE + 1));
+        }
         setting(config, "retina.storage.gc.enabled", "false");
         setting(config, "retina.gc.interval", "1");
         setting(config, "retina.buffer.memTable.size", "64");
@@ -152,12 +167,13 @@ public final class NormalIngestDaemonMain
         setting(config, "scaling.enabled", "false");
         setting(config, "retina.buffer.split.enable", "true");
 
-        if (!phase.equals("write") && !phase.equals("recover"))
+        if (!phase.equals("write") && !phase.equals("recover")
+                && !phase.equals("cutover-reject") && !phase.equals("cutover"))
         {
             throw new IllegalArgumentException("Unknown daemon verification phase: " + phase);
         }
-        PhaseState recoveredState = phase.equals("recover") ? loadPhaseState(root) : null;
-        if (recoveredState != null)
+        PhaseState recoveredState = phase.equals("write") ? null : loadPhaseState(root);
+        if (phase.equals("recover"))
         {
             verifyCheckpointReclamation(root, recoveredState);
         }
@@ -193,6 +209,7 @@ public final class NormalIngestDaemonMain
 
         ServerContainer container = new ServerContainer();
         IngestClient client = null;
+        long cutoverCommitTimestamp = -1;
         try
         {
             TransServer transaction = new TransServer(transactionPort);
@@ -217,10 +234,26 @@ public final class NormalIngestDaemonMain
                 System.out.println("PIXELS_NORMAL_INGEST_DAEMON_PHASE1_PASS rows=65"
                         + " checkpointedTransaction=" + checkpointed.transaction.getTransactionId());
             }
-            else
+            else if (phase.equals("recover"))
             {
                 assertPublished(client, recoveredState.checkpointTransactionId);
                 assertPublished(client, recoveredState.replayTransactionId);
+            }
+            else if (phase.equals("cutover"))
+            {
+                InsertResult afterCutover = insertRows(client, 1, "after-cutover", 3);
+                cutoverCommitTimestamp = afterCutover.transaction.getCommitTimestamp();
+                if (cutoverCommitTimestamp <= CUTOVER_BASELINE)
+                {
+                    throw new AssertionError("cutover commit timestamp did not exceed baseline");
+                }
+                verifyLegacyFence(retinaPort);
+                verifyBufferedRows(retinaPort, cutoverCommitTimestamp, 1);
+            }
+            else
+            {
+                throw new AssertionError(
+                        "daemon accepted an allocator value at/below the cutover baseline");
             }
         }
         finally
@@ -236,16 +269,23 @@ public final class NormalIngestDaemonMain
             catalog.close();
         }
         long rows = countPublishedRows(catalog, root);
-        if (rows != 65)
+        long expectedRows = phase.equals("cutover") ? 66 : 65;
+        if (rows != expectedRows)
         {
             throw new AssertionError("graceful shutdown/restart produced " + rows
-                    + " physical rows instead of 65");
+                    + " physical rows instead of " + expectedRows);
         }
         if (phase.equals("recover"))
         {
             System.out.println("PIXELS_NORMAL_INGEST_DAEMON_PASS rows=65 pixelsFiles="
                     + catalog.publishedFileCount()
                     + " services=TransServer,RetinaServer checkpointRestart=2");
+        }
+        else if (phase.equals("cutover"))
+        {
+            System.out.println("PIXELS_NORMAL_INGEST_CUTOVER_PASS oldRows=65 totalRows=66"
+                    + " baseline=" + CUTOVER_BASELINE
+                    + " commitTimestamp=" + cutoverCommitTimestamp + " legacyFence=1");
         }
     }
 

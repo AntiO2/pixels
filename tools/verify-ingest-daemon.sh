@@ -107,6 +107,14 @@ if run_phase recover "$WORK/corrupt-decision-state" > "$WORK/corrupt-decision.lo
 fi
 grep -q 'State checksum mismatch' "$WORK/corrupt-decision.log"
 
+# Reusing a legacy timestamp domain without advancing the allocator must be rejected before
+# new writes are admitted.
+if run_phase cutover-reject > "$WORK/cutover-reject.log" 2>&1; then
+    echo "daemon accepted an allocator value at/below the cutover baseline" >&2
+    exit 1
+fi
+grep -q 'is not above ingest/cutover timestamp floor' "$WORK/cutover-reject.log"
+
 # The recovery pointer remains in real etcd. Moving its body creates a recoverable, explicit
 # missing-data fault and must keep Retina out of READY.
 mapfile -t checkpoint_bodies < <(find "$WORK/state/recovery" -maxdepth 1 -type f -name 'recovery_*')
@@ -121,4 +129,9 @@ if run_phase recover > "$WORK/missing-checkpoint.log" 2>&1; then
 fi
 grep -Eq 'reading the checkpoint body failed|No such file' \
     "$WORK/missing-checkpoint.log"
-echo 'PIXELS_NORMAL_INGEST_FAIL_CLOSED_PASS corruptDecision=1 missingCheckpoint=1'
+mv "${checkpoint_bodies[0]}.missing" "${checkpoint_bodies[0]}"
+
+run_phase cutover 2>&1 | tee -a "$WORK/daemon.log"
+grep -Eq '^PIXELS_NORMAL_INGEST_CUTOVER_PASS oldRows=65 totalRows=66 baseline=1000000000 commitTimestamp=[0-9]+ legacyFence=1$' \
+    "$WORK/daemon.log"
+echo 'PIXELS_NORMAL_INGEST_FAIL_CLOSED_PASS corruptDecision=1 missingCheckpoint=1 allocatorFloor=1'
