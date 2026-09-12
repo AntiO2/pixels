@@ -88,7 +88,7 @@ public class TestRetinaServer
 
         try
         {
-            RetinaServerImpl server = new RetinaServerImpl(metadataService, indexService, resourceManager);
+            RetinaServerImpl server = newServer(metadataService, indexService, resourceManager);
             fail("RetinaServerImpl must fail closed when initialization fails: " + server);
         }
         catch (IllegalStateException e)
@@ -129,7 +129,7 @@ public class TestRetinaServer
             return null;
         }).when(resourceManager).startBackgroundGc();
 
-        new RetinaServerImpl(metadataService, indexService, resourceManager);
+        newServer(metadataService, indexService, resourceManager);
 
         assertTrue(lifecycleEvents.indexOf("recover") >= 0);
         int writeBufferIndex = lifecycleEvents.indexOf("writeBuffer");
@@ -152,7 +152,7 @@ public class TestRetinaServer
 
         try
         {
-            RetinaServerImpl server = new RetinaServerImpl(metadataService, indexService, resourceManager);
+            RetinaServerImpl server = newServer(metadataService, indexService, resourceManager);
             fail("RetinaServerImpl must fail closed when background GC cannot start: " + server);
         }
         catch (IllegalStateException e)
@@ -179,7 +179,7 @@ public class TestRetinaServer
         MetadataService metadataService = mock(MetadataService.class);
         prepareRecoveryMocks(metadataService, rm);
         when(metadataService.getSchemas()).thenReturn(Collections.emptyList());
-        return new RetinaServerImpl(metadataService, localIndex, rm);
+        return newServer(metadataService, localIndex, rm);
     }
 
     private static IndexProto.IndexKey makeKey(long tableId, long indexId, String key, long ts)
@@ -630,7 +630,7 @@ public class TestRetinaServer
         prepareRecoveryMocks(md, rm);
         when(md.getSchemas()).thenReturn(Collections.emptyList());
 
-        new RetinaServerImpl(md, nonLocal, rm);
+        newServer(md, nonLocal, rm);
 
         verify(rm).recoverStorageGc(Collections.emptySet());
         verify(rm).startBackgroundGc();
@@ -644,5 +644,26 @@ public class TestRetinaServer
                 .thenReturn(Collections.emptySet());
         when(metadataService.getFilesByType(ArgumentMatchers.anySet()))
                 .thenReturn(Collections.emptyList());
+    }
+
+    private static RetinaServerImpl newServer(
+            MetadataService metadataService, IndexService indexService,
+            RetinaResourceManager resourceManager)
+    {
+        return new RetinaServerImpl(metadataService, indexService, resourceManager,
+                new RetinaServerImpl.CheckpointSource()
+                {
+                    @Override
+                    public int getVirtualNodesPerNode()
+                    {
+                        return 1;
+                    }
+
+                    @Override
+                    public io.pixelsdb.pixels.retina.RecoveryCheckpoint.LoadedCheckpoint load()
+                    {
+                        return null;
+                    }
+                });
     }
 }

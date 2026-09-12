@@ -71,6 +71,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     private final MetadataService metadataService;
     private final IndexService indexService;
     private final RetinaResourceManager retinaResourceManager;
+    private final CheckpointSource checkpointSource;
     private final boolean transactionalIngestEnabled;
     private final Striped<Lock> updateLocks = Striped.lock(1024);
     private volatile RetinaStatus status;
@@ -90,9 +91,17 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     RetinaServerImpl(MetadataService metadataService, IndexService indexService,
                      RetinaResourceManager retinaResourceManager)
     {
+        this(metadataService, indexService, retinaResourceManager, new ConfiguredCheckpointSource());
+    }
+
+    RetinaServerImpl(MetadataService metadataService, IndexService indexService,
+                     RetinaResourceManager retinaResourceManager,
+                     CheckpointSource checkpointSource)
+    {
         this.metadataService = requireNonNull(metadataService, "metadataService is null");
         this.indexService = requireNonNull(indexService, "indexService is null");
         this.retinaResourceManager = requireNonNull(retinaResourceManager, "retinaResourceManager is null");
+        this.checkpointSource = requireNonNull(checkpointSource, "checkpointSource is null");
         this.transactionalIngestEnabled = new IngestOptions().enabled;
 
         int totalBuckets = Integer.parseInt(ConfigFactory.Instance().getProperty("index.bucket.num"));
@@ -155,8 +164,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     {
         String recoveryEpoch = UUID.randomUUID().toString();
 
-        RecoveryCheckpoint recoveryCheckpoint = RecoveryCheckpoint.createFromConfig();
-        int virtualNodesPerNode = recoveryCheckpoint.getVirtualNodesPerNode();
+        int virtualNodesPerNode = checkpointSource.getVirtualNodesPerNode();
         if (virtualNodesPerNode <= 0)
         {
             throw new RetinaException("virtualNodesPerNode must be positive, got " + virtualNodesPerNode);
@@ -170,8 +178,41 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
 
         return new RecoveryContext(
                 recoveryEpoch,
-                recoveryCheckpoint.load(),
+                checkpointSource.load(),
                 expectedVnodes);
+    }
+
+    interface CheckpointSource
+    {
+        int getVirtualNodesPerNode() throws RetinaException;
+
+        LoadedCheckpoint load() throws RetinaException;
+    }
+
+    private static final class ConfiguredCheckpointSource implements CheckpointSource
+    {
+        private RecoveryCheckpoint checkpoint;
+
+        private synchronized RecoveryCheckpoint checkpoint() throws RetinaException
+        {
+            if (checkpoint == null)
+            {
+                checkpoint = RecoveryCheckpoint.createFromConfig();
+            }
+            return checkpoint;
+        }
+
+        @Override
+        public int getVirtualNodesPerNode() throws RetinaException
+        {
+            return checkpoint().getVirtualNodesPerNode();
+        }
+
+        @Override
+        public LoadedCheckpoint load() throws RetinaException
+        {
+            return checkpoint().load();
+        }
     }
 
     private RecoveryResult recoverRetinaState(RecoveryContext context) throws RetinaException
