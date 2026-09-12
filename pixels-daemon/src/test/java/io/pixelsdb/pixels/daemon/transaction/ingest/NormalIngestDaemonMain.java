@@ -85,7 +85,7 @@ public final class NormalIngestDaemonMain
             {
                 throw new IllegalArgumentException(
                         "usage: ROOT ETCD_PORT RETINA_PORT TRANSACTION_PORT "
-                                + "write|recover|cutover-reject|cutover");
+                                + "write|recover|fail-closed|cutover-reject|cutover");
             }
             run(Paths.get(args[0]), Integer.parseInt(args[1]),
                     Integer.parseInt(args[2]), Integer.parseInt(args[3]), args[4]);
@@ -168,6 +168,7 @@ public final class NormalIngestDaemonMain
         setting(config, "retina.buffer.split.enable", "true");
 
         if (!phase.equals("write") && !phase.equals("recover")
+                && !phase.equals("fail-closed")
                 && !phase.equals("cutover-reject") && !phase.equals("cutover"))
         {
             throw new IllegalArgumentException("Unknown daemon verification phase: " + phase);
@@ -250,10 +251,14 @@ public final class NormalIngestDaemonMain
                 verifyLegacyFence(retinaPort);
                 verifyBufferedRows(retinaPort, cutoverCommitTimestamp, 1);
             }
-            else
+            else if (phase.equals("cutover-reject"))
             {
                 throw new AssertionError(
                         "daemon accepted an allocator value at/below the cutover baseline");
+            }
+            else
+            {
+                throw new AssertionError("fail-closed verification unexpectedly reached READY");
             }
         }
         finally

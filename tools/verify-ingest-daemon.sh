@@ -101,7 +101,7 @@ if len(payload) < 41:
 payload[8] ^= 0x01
 path.write_bytes(payload)
 PY
-if run_phase recover "$WORK/corrupt-decision-state" > "$WORK/corrupt-decision.log" 2>&1; then
+if run_phase fail-closed "$WORK/corrupt-decision-state" > "$WORK/corrupt-decision.log" 2>&1; then
     echo "daemon accepted corrupt committed decision state" >&2
     exit 1
 fi
@@ -123,7 +123,7 @@ if [[ ${#checkpoint_bodies[@]} != 1 ]]; then
     exit 1
 fi
 mv "${checkpoint_bodies[0]}" "${checkpoint_bodies[0]}.missing"
-if run_phase recover > "$WORK/missing-checkpoint.log" 2>&1; then
+if run_phase fail-closed > "$WORK/missing-checkpoint.log" 2>&1; then
     echo "daemon accepted a missing recovery checkpoint body" >&2
     exit 1
 fi
