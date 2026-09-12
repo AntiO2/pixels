@@ -76,6 +76,7 @@ public final class IngestClient implements Closeable {
     public IngestParticipantServiceGrpc.IngestParticipantServiceBlockingStub participant(
             String target) {
         return IngestParticipantServiceGrpc.newBlockingStub(channel(target))
+                .withWaitForReady()
                 .withDeadlineAfter(timeout, TimeUnit.MILLISECONDS);
     }
 
