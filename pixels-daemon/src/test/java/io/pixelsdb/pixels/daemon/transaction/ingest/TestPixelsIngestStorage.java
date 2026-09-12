@@ -96,6 +96,10 @@ public class TestPixelsIngestStorage {
                             .build();
         }
 
+        /** Called after a catalog mutation and before its successful RPC reply. */
+        protected void catalogMutated() {
+        }
+
         private MetadataProto.Table table() {
             return MetadataProto.Table.newBuilder()
                     .setId(73).setName("t").setType("user").setSchemaId(1)
@@ -191,6 +195,7 @@ public class TestPixelsIngestStorage {
                 long id = ids.incrementAndGet();
                 files.put(id, f.toBuilder().setId(id).build());
             }
+            catalogMutated();
             reply(
                     o,
                     MetadataProto.AddFilesResponse.newBuilder()
@@ -252,6 +257,7 @@ public class TestPixelsIngestStorage {
                 return;
             }
             files.put(r.getFile().getId(), r.getFile());
+            catalogMutated();
             reply(
                     o,
                     MetadataProto.UpdateFileResponse.newBuilder()
@@ -263,6 +269,7 @@ public class TestPixelsIngestStorage {
                 MetadataProto.DeleteFilesRequest r,
                 StreamObserver<MetadataProto.DeleteFilesResponse> o) {
             r.getFileIdsList().forEach(files::remove);
+            catalogMutated();
             reply(
                     o,
                     MetadataProto.DeleteFilesResponse.newBuilder()
@@ -288,6 +295,7 @@ public class TestPixelsIngestStorage {
                             .setCleanupAt(r.getCleanupAt()).build());
                 }
             }
+            catalogMutated();
             reply(o, MetadataProto.AtomicSwapFilesResponse.newBuilder()
                     .setHeader(ok(r.getHeader())).build());
         }

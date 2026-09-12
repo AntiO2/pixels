@@ -151,6 +151,37 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         return current != null && current.getState() == RetinaState.READY;
     }
 
+    boolean isRecovering()
+    {
+        RetinaStatus current = this.status;
+        return current != null && current.getState() == RetinaState.RECOVERING;
+    }
+
+    /**
+     * Transactional ingestion owns every post-cutover mutation, so its WAL/plan replay replaces
+     * the legacy CDC replay acknowledgement after a recovery checkpoint is loaded.
+     */
+    synchronized void completeTransactionalRecovery() throws RetinaException
+    {
+        if (!transactionalIngestEnabled)
+        {
+            throw new RetinaException("Transactional recovery completion requires ingestion mode");
+        }
+        RetinaStatus current = this.status;
+        if (current.getState() == RetinaState.READY)
+        {
+            return;
+        }
+        if (current.getState() != RetinaState.RECOVERING)
+        {
+            throw new RetinaException("Retina is " + current.getState()
+                    + "; cannot complete transactional recovery");
+        }
+        retinaResourceManager.startBackgroundGc();
+        this.status = current.toBuilder().setState(RetinaState.READY).build();
+        this.retinaResourceManager.setRecovering(false);
+    }
+
     private void notifyReady()
     {
         Runnable listener = this.readyListener;

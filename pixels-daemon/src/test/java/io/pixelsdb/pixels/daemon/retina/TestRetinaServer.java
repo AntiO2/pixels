@@ -433,7 +433,10 @@ public class TestRetinaServer
 
         RetinaServerImpl server = buildServerWithLocalIndex(localIndex, rm);
         AtomicReference<RetinaProto.UpdateRecordResponse> respHolder = new AtomicReference<>();
-        server.updateRecord(makeInsertRequest(tableId, indexId, "s", "tbl", ts, "k0", "k1"),
+        // Keep both rows in one bucket. The production path processes buckets in parallel and
+        // deliberately stops after the first failing bucket, so using two unrelated keys here
+        // made the number of rows appended before cancellation scheduler-dependent.
+        server.updateRecord(makeInsertRequest(tableId, indexId, "s", "tbl", ts, "k0", "k0"),
                 new StreamObserver<RetinaProto.UpdateRecordResponse>()
                 {
                     @Override public void onNext(RetinaProto.UpdateRecordResponse v) { respHolder.set(v); }

@@ -18,6 +18,8 @@ mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
 CLIENT_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
 PEER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+RETINA_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+TRANSACTION_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
 ETCD_PID=''
 
 cleanup() {
@@ -70,9 +72,16 @@ if [[ -f "$PIXELS_HOME/lib/libjemalloc.so.2" ]]; then
 elif [[ -f "$PIXELS_HOME/lib/libjemalloc.so" ]]; then
     ALLOCATOR=("LD_PRELOAD=$PIXELS_HOME/lib/libjemalloc.so${LD_PRELOAD:+:$LD_PRELOAD}")
 fi
-env "${ALLOCATOR[@]}" \
-    PIXELS_CONFIG="$ROOT/pixels-common/src/main/resources/pixels.properties" \
-    java -Xmx1g -cp "$CP" \
-    io.pixelsdb.pixels.daemon.transaction.ingest.NormalIngestDaemonMain \
-    "$WORK/state" "$CLIENT_PORT" 2>&1 | tee "$WORK/daemon.log"
-grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PASS rows=1 ' "$WORK/daemon.log"
+run_phase() {
+    local phase=$1
+    env "${ALLOCATOR[@]}" \
+        PIXELS_CONFIG="$ROOT/pixels-common/src/main/resources/pixels.properties" \
+        java -Xmx1g -cp "$CP" \
+        io.pixelsdb.pixels.daemon.transaction.ingest.NormalIngestDaemonMain \
+        "$WORK/state" "$CLIENT_PORT" "$RETINA_PORT" "$TRANSACTION_PORT" "$phase"
+}
+
+run_phase write 2>&1 | tee "$WORK/daemon.log"
+run_phase recover 2>&1 | tee -a "$WORK/daemon.log"
+grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PHASE1_PASS rows=65 ' "$WORK/daemon.log"
+grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PASS rows=65 .* checkpointRestart=2$' "$WORK/daemon.log"

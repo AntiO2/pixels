@@ -234,12 +234,13 @@ public class RetinaServer implements Server
 
     private void recoverIngestAndPublishReady(RetinaServerImpl service)
     {
-        if (!this.running || !service.isReady())
+        if (!this.running)
         {
             return;
         }
         RetinaIngestParticipant participant = this.ingestParticipant;
-        if (participant != null && !participant.isReady())
+        if (participant != null && !participant.isReady()
+                && (service.isReady() || service.isRecovering()))
         {
             if (!ingestRecoveryStarted.compareAndSet(false, true))
             {
@@ -263,7 +264,27 @@ public class RetinaServer implements Server
                 return;
             }
         }
-        if (this.running && (participant == null || participant.isReady()))
+        if (participant != null && participant.isReady() && service.isRecovering())
+        {
+            try
+            {
+                service.completeTransactionalRecovery();
+            }
+            catch (Throwable e)
+            {
+                ingestRecoveryFailure.compareAndSet(null, e);
+                HeartbeatWorker.setCurrentStatus(NodeStatus.EXIT);
+                log.error("Retina transactional recovery could not publish READY", e);
+                io.grpc.Server server = this.rpcServer;
+                if (server != null)
+                {
+                    server.shutdownNow();
+                }
+                return;
+            }
+        }
+        if (this.running && service.isReady()
+                && (participant == null || participant.isReady()))
         {
             HeartbeatWorker.setCurrentStatus(NodeStatus.READY);
             log.info("Retina service and transactional ingestion are ready");

@@ -15,12 +15,21 @@ import io.grpc.stub.StreamObserver;
 import io.pixelsdb.pixels.common.ingest.MutationBatch;
 import io.pixelsdb.pixels.common.ingest.MutationStreamId;
 import io.pixelsdb.pixels.common.ingest.MutationStreamSeal;
+import io.pixelsdb.pixels.common.ingest.durable.AtomicStateFile;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestClient;
+import io.pixelsdb.pixels.common.ingest.rpc.IngestOptions;
 import io.pixelsdb.pixels.common.ingest.wire.ColumnBatchCodec;
 import io.pixelsdb.pixels.common.ingest.wire.IngestWire;
+import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.common.utils.NetUtils;
+import io.pixelsdb.pixels.core.PixelsFooterCache;
+import io.pixelsdb.pixels.core.PixelsReader;
+import io.pixelsdb.pixels.core.PixelsReaderImpl;
+import io.pixelsdb.pixels.core.reader.PixelsReaderOption;
+import io.pixelsdb.pixels.core.reader.PixelsRecordReader;
 import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
+import io.pixelsdb.pixels.daemon.MetadataProto;
 import io.pixelsdb.pixels.daemon.NodeProto;
 import io.pixelsdb.pixels.daemon.NodeServiceGrpc;
 import io.pixelsdb.pixels.daemon.ServerContainer;
@@ -28,6 +37,7 @@ import io.pixelsdb.pixels.daemon.retina.RetinaServer;
 import io.pixelsdb.pixels.daemon.transaction.TransServer;
 import io.pixelsdb.pixels.ingest.IngestProto.AllocateWriterRequest;
 import io.pixelsdb.pixels.ingest.IngestProto.BeginWriteRequest;
+import io.pixelsdb.pixels.ingest.IngestProto.InstallationSnapshot;
 import io.pixelsdb.pixels.ingest.IngestProto.PrepareWriteRequest;
 import io.pixelsdb.pixels.ingest.IngestProto.ReadPin;
 import io.pixelsdb.pixels.ingest.IngestProto.Transaction;
@@ -35,14 +45,18 @@ import io.pixelsdb.pixels.ingest.IngestProto.TransactionState;
 import io.pixelsdb.pixels.ingest.IngestProto.WriterAssignment;
 import io.pixelsdb.pixels.retina.RetinaProto;
 import io.pixelsdb.pixels.retina.RetinaWorkerServiceGrpc;
+import io.pixelsdb.pixels.retina.ingest.LocalMutationJournal;
 
-import java.net.ServerSocket;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -63,7 +77,13 @@ public final class NormalIngestDaemonMain
         int exit = 0;
         try
         {
-            run(Paths.get(args[0]), Integer.parseInt(args[1]));
+            if (args.length != 5)
+            {
+                throw new IllegalArgumentException(
+                        "usage: ROOT ETCD_PORT RETINA_PORT TRANSACTION_PORT write|recover");
+            }
+            run(Paths.get(args[0]), Integer.parseInt(args[1]),
+                    Integer.parseInt(args[2]), Integer.parseInt(args[3]), args[4]);
         }
         catch (Throwable failure)
         {
@@ -73,18 +93,25 @@ public final class NormalIngestDaemonMain
         System.exit(exit);
     }
 
-    private static void run(Path root, int etcdPort) throws Exception
+    private static void run(Path root, int etcdPort, int retinaPort,
+                            int transactionPort, String phase) throws Exception
     {
         Files.createDirectories(root);
         Files.createDirectories(root.resolve("ordered"));
         Files.createDirectories(root.resolve("compact"));
-        int retinaPort = freePort();
-        int transactionPort = freePort();
         String host = NetUtils.getLocalHostName();
         String owner = host + ":" + retinaPort;
-        String secret = "normal-daemon-" + UUID.randomUUID();
         Path secretFile = root.resolve("credential");
-        Files.write(secretFile, secret.getBytes(StandardCharsets.UTF_8));
+        String secret;
+        if (Files.exists(secretFile))
+        {
+            secret = new String(Files.readAllBytes(secretFile), StandardCharsets.UTF_8).trim();
+        }
+        else
+        {
+            secret = "normal-daemon-" + UUID.randomUUID();
+            Files.write(secretFile, secret.getBytes(StandardCharsets.UTF_8));
+        }
 
         ConfigFactory config = ConfigFactory.Instance();
         setting(config, "retina.enable", "true");
@@ -107,8 +134,8 @@ public final class NormalIngestDaemonMain
         setting(config, "retina.storage.gc.enabled", "false");
         setting(config, "retina.gc.interval", "1");
         setting(config, "retina.buffer.memTable.size", "64");
-        setting(config, "retina.buffer.flush.count", "2");
-        setting(config, "retina.buffer.flush.interval", "3600");
+        setting(config, "retina.buffer.flush.count", "1");
+        setting(config, "retina.buffer.flush.interval", "1");
         setting(config, "retina.buffer.object.storage.folder", root.resolve("objects").toUri().toString());
         setting(config, "retina.storage.gc.journal.dir", root.resolve("gc").toUri().toString());
         setting(config, "retina.offload.checkpoint.dir", root.resolve("offload").toUri().toString());
@@ -125,7 +152,21 @@ public final class NormalIngestDaemonMain
         setting(config, "scaling.enabled", "false");
         setting(config, "retina.buffer.split.enable", "true");
 
+        if (!phase.equals("write") && !phase.equals("recover"))
+        {
+            throw new IllegalArgumentException("Unknown daemon verification phase: " + phase);
+        }
+        PhaseState recoveredState = phase.equals("recover") ? loadPhaseState(root) : null;
+        if (recoveredState != null)
+        {
+            verifyCheckpointReclamation(root, recoveredState);
+        }
+
         SqlIngestFixture.Catalog catalog = new SqlIngestFixture.Catalog(root);
+        if (recoveredState != null && countPublishedRows(catalog, root) != 65)
+        {
+            throw new AssertionError("phase-one files do not contain exactly 65 rows");
+        }
         Server metadata = ServerBuilder.forPort(0).addService(catalog).build().start();
         setting(config, "metadata.server.host", "127.0.0.1");
         setting(config, "metadata.server.port", Integer.toString(metadata.getPort()));
@@ -152,7 +193,6 @@ public final class NormalIngestDaemonMain
 
         ServerContainer container = new ServerContainer();
         IngestClient client = null;
-        ManagedChannel retinaReads = null;
         try
         {
             TransServer transaction = new TransServer(transactionPort);
@@ -165,85 +205,26 @@ public final class NormalIngestDaemonMain
             client = new IngestClient("127.0.0.1", transactionPort, secret,
                     64 * 1024 * 1024, 30000);
             awaitParticipantReady(client, owner);
-
-            Transaction opened = client.coordinator().beginWrite(BeginWriteRequest.newBuilder()
-                    .setRequestId("normal-daemon-insert")
-                    .setSchemaName("s").setTableName("t").setReadTimestamp(0).build());
-            WriterAssignment writer = client.coordinator().allocateWriter(
-                    AllocateWriterRequest.newBuilder()
-                            .setTransactionId(opened.getTransactionId())
-                            .setRequestId("normal-daemon-writer").setTaskId(1).build());
-            MutationStreamId stream = new MutationStreamId(
-                    opened.getTransactionId(), writer.getWriterId(),
-                    opened.getTable().getTableId(), 0, MutationStreamId.Kind.APPEND_ROWS);
-            byte[][] row = new byte[][] {
-                    ByteBuffer.allocate(Long.BYTES).putLong(7).array(),
-                    "daemon".getBytes(StandardCharsets.UTF_8)
-            };
-            byte[] payload = ColumnBatchCodec.encode(
-                    Collections.singletonList(row), opened.getTable().getColumnsCount(), 4096);
-            MutationBatch batch = new MutationBatch(
-                    stream, 0, opened.getTable().getSchemaVersion(),
-                    ColumnBatchCodec.FORMAT, 1, payload);
-            client.transport(opened.getTable()).append(batch).get(30, TimeUnit.SECONDS);
-            MutationStreamSeal expected = new MutationStreamSeal(
-                    stream, 1, 1, payload.length,
-                    MutationStreamSeal.extendDigest(
-                            MutationStreamSeal.emptyDigest(), batch.getDigest()));
-            MutationStreamSeal seal =
-                    client.transport(opened.getTable()).seal(expected).get(30, TimeUnit.SECONDS);
-            Transaction prepared = client.coordinator().prepareWrite(
-                    PrepareWriteRequest.newBuilder()
-                            .setTransactionId(opened.getTransactionId())
-                            .addSeals(IngestWire.encode(seal)).build());
-            if (prepared.getState() != TransactionState.PREPARED)
+            if (phase.equals("write"))
             {
-                throw new AssertionError("transaction did not prepare: " + prepared.getState());
+                InsertResult checkpointed = insertRows(client, 64, "checkpointed", 1);
+                InsertResult replay = insertRows(client, 1, "replay", 2);
+                savePhaseState(root, checkpointed, replay);
+                verifyLegacyFence(retinaPort);
+                verifyBufferedRows(retinaPort, replay.transaction.getCommitTimestamp(), 1);
+                awaitPublishedFiles(catalog, 1);
+                awaitJournalGeneration(root.resolve("wal"), 1);
+                System.out.println("PIXELS_NORMAL_INGEST_DAEMON_PHASE1_PASS rows=65"
+                        + " checkpointedTransaction=" + checkpointed.transaction.getTransactionId());
             }
-            Transaction committed =
-                    client.coordinator().commitWrite(IngestWire.id(opened.getTransactionId()));
-            if (committed.getState() != TransactionState.PUBLISHED)
+            else
             {
-                throw new AssertionError("transaction did not publish: " + committed.getState());
-            }
-
-            retinaReads = ManagedChannelBuilder.forAddress("127.0.0.1", retinaPort)
-                    .usePlaintext().build();
-            RetinaWorkerServiceGrpc.RetinaWorkerServiceBlockingStub retinaStub =
-                    RetinaWorkerServiceGrpc.newBlockingStub(retinaReads)
-                            .withDeadlineAfter(30, TimeUnit.SECONDS);
-            RetinaProto.UpdateRecordResponse legacyWrite = retinaStub.updateRecord(
-                    RetinaProto.UpdateRecordRequest.newBuilder()
-                            .setHeader(RetinaProto.RequestHeader.newBuilder()
-                                    .setToken("legacy-write-must-fail"))
-                            .setSchemaName("s").setVirtualNodeId(0).build());
-            if (legacyWrite.getHeader().getErrorCode() == 0)
-            {
-                throw new AssertionError("legacy Retina write bypassed transactional cutover");
-            }
-            RetinaProto.GetWriteBufferResponse response =
-                    retinaStub.getWriteBuffer(RetinaProto.GetWriteBufferRequest.newBuilder()
-                                    .setHeader(RetinaProto.RequestHeader.newBuilder()
-                                            .setToken("normal-daemon-read"))
-                                    .setSchemaName("s").setTableName("t")
-                                    .setVirtualNodeId(0)
-                                    .setTimestamp(committed.getCommitTimestamp()).build());
-            if (response.getData().isEmpty())
-            {
-                throw new AssertionError("published row was not visible in the shared buffer");
-            }
-            try (VectorizedRowBatch rows =
-                    VectorizedRowBatch.deserialize(response.getData().toByteArray()))
-            {
-                if (rows.size != 1)
-                {
-                    throw new AssertionError("expected one visible row, got " + rows.size);
-                }
+                assertPublished(client, recoveredState.checkpointTransactionId);
+                assertPublished(client, recoveredState.replayTransactionId);
             }
         }
         finally
         {
-            if (retinaReads != null) retinaReads.shutdownNow();
             if (client != null) client.close();
             container.shutdownAll();
             if (!container.awaitTermination(90, TimeUnit.SECONDS))
@@ -252,13 +233,315 @@ public final class NormalIngestDaemonMain
             }
             topology.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
             metadata.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+            catalog.close();
         }
-        if (catalog.publishedFileCount() < 1)
+        long rows = countPublishedRows(catalog, root);
+        if (rows != 65)
         {
-            throw new AssertionError("graceful shutdown did not materialize the shared buffer");
+            throw new AssertionError("graceful shutdown/restart produced " + rows
+                    + " physical rows instead of 65");
         }
-        System.out.println("PIXELS_NORMAL_INGEST_DAEMON_PASS rows=1 pixelsFiles="
-                + catalog.publishedFileCount() + " services=TransServer,RetinaServer");
+        if (phase.equals("recover"))
+        {
+            System.out.println("PIXELS_NORMAL_INGEST_DAEMON_PASS rows=65 pixelsFiles="
+                    + catalog.publishedFileCount()
+                    + " services=TransServer,RetinaServer checkpointRestart=2");
+        }
+    }
+
+    private static final class InsertResult
+    {
+        private final Transaction transaction;
+        private final int payloadBytes;
+
+        private InsertResult(Transaction transaction, int payloadBytes)
+        {
+            this.transaction = transaction;
+            this.payloadBytes = payloadBytes;
+        }
+    }
+
+    private static final class PhaseState
+    {
+        private final long checkpointTransactionId;
+        private final long replayTransactionId;
+        private final int checkpointPayloadBytes;
+
+        private PhaseState(long checkpointTransactionId, long replayTransactionId,
+                           int checkpointPayloadBytes)
+        {
+            this.checkpointTransactionId = checkpointTransactionId;
+            this.replayTransactionId = replayTransactionId;
+            this.checkpointPayloadBytes = checkpointPayloadBytes;
+        }
+    }
+
+    private static InsertResult insertRows(
+            IngestClient client, int count, String label, int taskId) throws Exception
+    {
+        Transaction opened = client.coordinator().beginWrite(BeginWriteRequest.newBuilder()
+                .setRequestId("normal-daemon-" + label)
+                .setSchemaName("s").setTableName("t").setReadTimestamp(0).build());
+        WriterAssignment writer = client.coordinator().allocateWriter(
+                AllocateWriterRequest.newBuilder()
+                        .setTransactionId(opened.getTransactionId())
+                        .setRequestId("normal-daemon-" + label + "-writer")
+                        .setTaskId(taskId).build());
+        MutationStreamId stream = new MutationStreamId(
+                opened.getTransactionId(), writer.getWriterId(),
+                opened.getTable().getTableId(), 0, MutationStreamId.Kind.APPEND_ROWS);
+        List<byte[][]> rows = new ArrayList<>(count);
+        for (int i = 0; i < count; i++)
+        {
+            rows.add(new byte[][] {
+                    ByteBuffer.allocate(Long.BYTES).putLong(i).array(),
+                    label.getBytes(StandardCharsets.UTF_8)
+            });
+        }
+        byte[] payload = ColumnBatchCodec.encode(
+                rows, opened.getTable().getColumnsCount(), 1024 * 1024);
+        MutationBatch batch = new MutationBatch(
+                stream, 0, opened.getTable().getSchemaVersion(),
+                ColumnBatchCodec.FORMAT, count, payload);
+        client.transport(opened.getTable()).append(batch).get(30, TimeUnit.SECONDS);
+        MutationStreamSeal expected = new MutationStreamSeal(
+                stream, 1, count, payload.length,
+                MutationStreamSeal.extendDigest(
+                        MutationStreamSeal.emptyDigest(), batch.getDigest()));
+        MutationStreamSeal seal =
+                client.transport(opened.getTable()).seal(expected).get(30, TimeUnit.SECONDS);
+        Transaction prepared = client.coordinator().prepareWrite(
+                PrepareWriteRequest.newBuilder()
+                        .setTransactionId(opened.getTransactionId())
+                        .addSeals(IngestWire.encode(seal)).build());
+        if (prepared.getState() != TransactionState.PREPARED)
+        {
+            throw new AssertionError("transaction did not prepare: " + prepared.getState());
+        }
+        Transaction committed =
+                client.coordinator().commitWrite(IngestWire.id(opened.getTransactionId()));
+        if (committed.getState() != TransactionState.PUBLISHED)
+        {
+            throw new AssertionError("transaction did not publish: " + committed.getState());
+        }
+        return new InsertResult(committed, payload.length);
+    }
+
+    private static void savePhaseState(
+            Path root, InsertResult checkpointed, InsertResult replay) throws Exception
+    {
+        Properties properties = new Properties();
+        properties.setProperty("checkpoint.transaction",
+                Long.toString(checkpointed.transaction.getTransactionId()));
+        properties.setProperty("checkpoint.payload.bytes",
+                Integer.toString(checkpointed.payloadBytes));
+        properties.setProperty("replay.transaction",
+                Long.toString(replay.transaction.getTransactionId()));
+        Path target = root.resolve("phase-state.properties");
+        Path temporary = root.resolve("phase-state.properties.new");
+        try (OutputStream output = Files.newOutputStream(temporary))
+        {
+            properties.store(output, "Normal daemon checkpoint/restart state");
+        }
+        Files.move(temporary, target,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private static PhaseState loadPhaseState(Path root) throws Exception
+    {
+        Properties properties = new Properties();
+        try (InputStream input = Files.newInputStream(root.resolve("phase-state.properties")))
+        {
+            properties.load(input);
+        }
+        long checkpoint = Long.parseLong(properties.getProperty("checkpoint.transaction", "-1"));
+        long replay = Long.parseLong(properties.getProperty("replay.transaction", "-1"));
+        int payload = Integer.parseInt(properties.getProperty("checkpoint.payload.bytes", "-1"));
+        if (checkpoint <= 0 || replay <= checkpoint || payload <= 0)
+        {
+            throw new AssertionError("invalid phase-one verification state");
+        }
+        return new PhaseState(checkpoint, replay, payload);
+    }
+
+    private static void verifyCheckpointReclamation(Path root, PhaseState phase) throws Exception
+    {
+        IngestOptions options = new IngestOptions();
+        try (AtomicStateFile plans = new AtomicStateFile(
+                root.resolve("plans"), options.maxStateBytes))
+        {
+            InstallationSnapshot snapshot = InstallationSnapshot.parseFrom(plans.read());
+            boolean payloadPlanRetained = snapshot.getBatchesList().stream()
+                    .anyMatch(batch -> batch.getStream().getTransactionId()
+                            == phase.checkpointTransactionId);
+            boolean checkpointRetained = snapshot.getCheckpointsList().stream()
+                    .anyMatch(checkpoint -> checkpoint.getTransactionId()
+                            == phase.checkpointTransactionId);
+            if (payloadPlanRetained || !checkpointRetained)
+            {
+                throw new AssertionError(
+                        "checkpoint did not replace the transaction batch plan");
+            }
+        }
+        try (LocalMutationJournal journal = new LocalMutationJournal(
+                root.resolve("wal"), options.maxBatchBytes,
+                options.walMaxBytes, options.walMaxRecords))
+        {
+            if (journal.getGeneration() <= 0
+                    || !journal.getCheckpointedTransactions()
+                            .contains(phase.checkpointTransactionId))
+            {
+                throw new AssertionError("WAL payload was not replaced by a checkpoint fence");
+            }
+            if (journal.getJournalBytes() >= phase.checkpointPayloadBytes)
+            {
+                throw new AssertionError("checkpointed WAL payload was not physically reclaimed");
+            }
+            try (java.util.stream.Stream<Path> paths = Files.list(root.resolve("wal")))
+            {
+                long generations = paths.filter(path ->
+                        path.getFileName().toString().matches("mutations(?:\\.[0-9]+)?\\.wal"))
+                        .count();
+                if (generations != 1)
+                {
+                    throw new AssertionError("obsolete WAL generations remain: " + generations);
+                }
+            }
+        }
+    }
+
+    private static void assertPublished(IngestClient client, long transactionId)
+    {
+        Transaction recovered = client.coordinator().getWrite(IngestWire.id(transactionId));
+        if (recovered.getState() != TransactionState.PUBLISHED)
+        {
+            throw new AssertionError("recovered transaction is not PUBLISHED: "
+                    + transactionId + " " + recovered.getState());
+        }
+    }
+
+    private static void verifyLegacyFence(int retinaPort) throws Exception
+    {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("127.0.0.1", retinaPort)
+                .usePlaintext().build();
+        try
+        {
+            RetinaWorkerServiceGrpc.RetinaWorkerServiceBlockingStub retina =
+                    RetinaWorkerServiceGrpc.newBlockingStub(channel)
+                            .withDeadlineAfter(30, TimeUnit.SECONDS);
+            RetinaProto.UpdateRecordResponse legacyWrite = retina.updateRecord(
+                    RetinaProto.UpdateRecordRequest.newBuilder()
+                            .setHeader(RetinaProto.RequestHeader.newBuilder()
+                                    .setToken("legacy-write-must-fail"))
+                            .setSchemaName("s").setVirtualNodeId(0).build());
+            if (legacyWrite.getHeader().getErrorCode() == 0)
+            {
+                throw new AssertionError("legacy Retina write bypassed transactional cutover");
+            }
+        }
+        finally
+        {
+            channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static void verifyBufferedRows(int retinaPort, long timestamp, int expected)
+            throws Exception
+    {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("127.0.0.1", retinaPort)
+                .usePlaintext().build();
+        try
+        {
+            RetinaProto.GetWriteBufferResponse response =
+                    RetinaWorkerServiceGrpc.newBlockingStub(channel)
+                            .withDeadlineAfter(30, TimeUnit.SECONDS)
+                            .getWriteBuffer(RetinaProto.GetWriteBufferRequest.newBuilder()
+                                    .setHeader(RetinaProto.RequestHeader.newBuilder()
+                                            .setToken("normal-daemon-read"))
+                                    .setSchemaName("s").setTableName("t")
+                                    .setVirtualNodeId(0).setTimestamp(timestamp).build());
+            if (response.getData().isEmpty())
+            {
+                throw new AssertionError("published row was not visible in the shared buffer");
+            }
+            try (VectorizedRowBatch rows =
+                    VectorizedRowBatch.deserialize(response.getData().toByteArray()))
+            {
+                if (rows.size != expected)
+                {
+                    throw new AssertionError("expected " + expected
+                            + " visible buffer row(s), got " + rows.size);
+                }
+            }
+        }
+        finally
+        {
+            channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static void awaitPublishedFiles(SqlIngestFixture.Catalog catalog, long expected)
+            throws Exception
+    {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
+        while (System.nanoTime() < deadline)
+        {
+            if (catalog.publishedFileCount() >= expected)
+            {
+                return;
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("Retina did not publish the expected Pixels file");
+    }
+
+    private static void awaitJournalGeneration(Path wal, long expected) throws Exception
+    {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
+        while (System.nanoTime() < deadline)
+        {
+            try (java.util.stream.Stream<Path> paths = Files.list(wal))
+            {
+                if (paths.anyMatch(path -> path.getFileName().toString()
+                        .matches("mutations\\.[1-9][0-9]*\\.wal")))
+                {
+                    return;
+                }
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("journal did not advance to generation " + expected);
+    }
+
+    private static long countPublishedRows(SqlIngestFixture.Catalog catalog, Path root)
+            throws Exception
+    {
+        long rows = 0;
+        for (MetadataProto.File file : catalog.files.values())
+        {
+            if (file.getType() != MetadataProto.File.Type.REGULAR)
+            {
+                continue;
+            }
+            String path = root.resolve("ordered").resolve(file.getName()).toUri().toString();
+            try (PixelsReader reader = PixelsReaderImpl.newBuilder()
+                    .setStorage(StorageFactory.Instance().getStorage(path))
+                    .setPath(path).setPixelsFooterCache(new PixelsFooterCache()).build())
+            {
+                PixelsReaderOption option = new PixelsReaderOption();
+                option.includeCols(new String[] {"id", "label"});
+                try (PixelsRecordReader records = reader.read(option))
+                {
+                    VectorizedRowBatch batch;
+                    while ((batch = records.readBatch()) != null && batch.size > 0)
+                    {
+                        rows += batch.size;
+                    }
+                }
+            }
+        }
+        return rows;
     }
 
     private static void awaitParticipantReady(IngestClient client, String owner) throws Exception
@@ -294,14 +577,6 @@ public final class NormalIngestDaemonMain
             Thread.sleep(50);
         }
         throw new IllegalStateException(name + " server thread did not start");
-    }
-
-    private static int freePort() throws Exception
-    {
-        try (ServerSocket socket = new ServerSocket(0))
-        {
-            return socket.getLocalPort();
-        }
     }
 
     private static void setting(ConfigFactory config, String key, String value)

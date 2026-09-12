@@ -112,7 +112,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                     throw new IOException("Invalid installation checkpoint coverage");
                 }
                 for (RowIdRange range : checkpoint.getRowRangesList()) {
-                    if (range.getRowIdStart() <= 0 || range.getRowCount() <= 0) {
+                    if (range.getRowIdStart() < 0 || range.getRowCount() <= 0) {
                         throw new IOException("Invalid installation checkpoint row range");
                     }
                 }

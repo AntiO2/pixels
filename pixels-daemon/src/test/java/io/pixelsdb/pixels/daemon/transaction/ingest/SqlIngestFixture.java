@@ -19,6 +19,7 @@ import io.pixelsdb.pixels.ingest.IngestProto.*;
 import io.pixelsdb.pixels.retina.*;
 import io.pixelsdb.pixels.retina.ingest.*;
 
+import java.io.*;
 import java.lang.reflect.*;
 import java.net.ServerSocket;
 import java.nio.file.*;
@@ -42,7 +43,13 @@ public final class SqlIngestFixture implements AutoCloseable {
         return MetadataProto.ResponseHeader.newBuilder().setToken(request.getToken()).build();
     }
 
-    public static final class Catalog extends TestPixelsIngestStorage.Catalog {
+    public static final class Catalog extends TestPixelsIngestStorage.Catalog
+            implements AutoCloseable {
+        private static final int CATALOG_MAGIC = 0x50464331;
+        private static final int CATALOG_VERSION = 1;
+        private static final int MAX_CATALOG_BYTES = 16 * 1024 * 1024;
+
+        private final AtomicStateFile catalogState;
         private final MetadataProto.Layout sqlLayout;
         private final MetadataProto.Table table =
                 MetadataProto.Table.newBuilder()
@@ -53,13 +60,83 @@ public final class SqlIngestFixture implements AutoCloseable {
                         .setStorageScheme("file")
                         .build();
 
-        Catalog(Path root) {
+        Catalog(Path root) throws Exception {
             super(root);
+            catalogState = new AtomicStateFile(root.resolve("fixture-catalog"), MAX_CATALOG_BYTES);
+            restoreCatalog(catalogState.read());
             sqlLayout =
                     layout.toBuilder()
                             .setOrdered("{\"columnOrder\":[\"id\",\"label\"]}")
                             .setSplits("{\"numRowGroupInFile\":1,\"splitPatterns\":[]}")
                             .build();
+        }
+
+        private void restoreCatalog(byte[] snapshot) throws Exception {
+            if (snapshot.length == 0) {
+                return;
+            }
+            try (DataInputStream input =
+                    new DataInputStream(new ByteArrayInputStream(snapshot))) {
+                if (input.readInt() != CATALOG_MAGIC
+                        || input.readInt() != CATALOG_VERSION) {
+                    throw new IOException("Invalid fixture catalog state header");
+                }
+                long restoredId = input.readLong();
+                int count = input.readInt();
+                if (restoredId < 100 || count < 0 || count > 100000) {
+                    throw new IOException("Invalid fixture catalog state bounds");
+                }
+                long maximumId = 100;
+                for (int i = 0; i < count; i++) {
+                    int length = input.readInt();
+                    if (length <= 0 || length > MAX_CATALOG_BYTES || length > input.available()) {
+                        throw new IOException("Invalid fixture catalog file entry length");
+                    }
+                    byte[] bytes = new byte[length];
+                    input.readFully(bytes);
+                    MetadataProto.File file = MetadataProto.File.parseFrom(bytes);
+                    if (file.getId() <= 0 || files.put(file.getId(), file) != null) {
+                        throw new IOException("Invalid duplicate fixture catalog file identity");
+                    }
+                    maximumId = Math.max(maximumId, file.getId());
+                }
+                if (input.available() != 0 || restoredId < maximumId) {
+                    throw new IOException("Invalid trailing fixture catalog state");
+                }
+                ids.set(restoredId);
+            }
+        }
+
+        private byte[] snapshotCatalog() throws IOException {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream output = new DataOutputStream(bytes)) {
+                output.writeInt(CATALOG_MAGIC);
+                output.writeInt(CATALOG_VERSION);
+                output.writeLong(ids.get());
+                List<MetadataProto.File> ordered = new ArrayList<>(files.values());
+                ordered.sort(Comparator.comparingLong(MetadataProto.File::getId));
+                output.writeInt(ordered.size());
+                for (MetadataProto.File file : ordered) {
+                    byte[] encoded = file.toByteArray();
+                    output.writeInt(encoded.length);
+                    output.write(encoded);
+                }
+            }
+            return bytes.toByteArray();
+        }
+
+        @Override
+        protected synchronized void catalogMutated() {
+            try {
+                catalogState.store(snapshotCatalog());
+            } catch (IOException failure) {
+                throw new UncheckedIOException("Cannot persist fixture catalog mutation", failure);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            catalogState.close();
         }
 
         @Override
@@ -662,5 +739,6 @@ public final class SqlIngestFixture implements AutoCloseable {
                 Arrays.asList(retinaServer, transactionServer, nodeServer, metadataServer)) {
             server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
         }
+        catalog.close();
     }
 }

@@ -681,9 +681,21 @@ public class TransServiceImpl extends TransServiceGrpc.TransServiceImplBase
                                                   StreamObserver<TransProto.GetSafeVisibilityFoldingTimestampResponse> responseObserver)
     {
         long writerSafeTs = Math.max(0, publishedReadTimestamp());
-        long safeTs = request.getIncludeRunningQueries()
-                ? Math.min(lowWatermark.get(), writerSafeTs)
-                : writerSafeTs;
+        long safeTs = writerSafeTs;
+        if (request.getIncludeRunningQueries())
+        {
+            // A persisted low watermark can legitimately remain at zero before the first
+            // read-only transaction terminates. Treating that stale value as an active read
+            // pin prevents the normal Retina checkpoint from ever advancing. The context
+            // manager is the live-query authority: when it has no running read, publication
+            // is the safe bound; otherwise the oldest query and publication both constrain it.
+            long oldestRunningRead =
+                    TransContextManager.Instance().getMinRunningTransTimestamp(true);
+            if (oldestRunningRead >= 0)
+            {
+                safeTs = Math.min(oldestRunningRead, writerSafeTs);
+            }
+        }
         TransProto.GetSafeVisibilityFoldingTimestampResponse response =
                 TransProto.GetSafeVisibilityFoldingTimestampResponse.newBuilder()
                         .setErrorCode(ErrorCode.SUCCESS)
