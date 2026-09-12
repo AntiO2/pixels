@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real etcd + production TransServer/RetinaServer lifecycle + one INSERT/read.
+# Real etcd + production TransServer/RetinaServer checkpoint/restart/fail-closed lifecycle.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -74,14 +74,51 @@ elif [[ -f "$PIXELS_HOME/lib/libjemalloc.so" ]]; then
 fi
 run_phase() {
     local phase=$1
+    local state=${2:-$WORK/state}
     env "${ALLOCATOR[@]}" \
         PIXELS_CONFIG="$ROOT/pixels-common/src/main/resources/pixels.properties" \
         java -Xmx1g -cp "$CP" \
         io.pixelsdb.pixels.daemon.transaction.ingest.NormalIngestDaemonMain \
-        "$WORK/state" "$CLIENT_PORT" "$RETINA_PORT" "$TRANSACTION_PORT" "$phase"
+        "$state" "$CLIENT_PORT" "$RETINA_PORT" "$TRANSACTION_PORT" "$phase"
 }
 
 run_phase write 2>&1 | tee "$WORK/daemon.log"
 run_phase recover 2>&1 | tee -a "$WORK/daemon.log"
 grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PHASE1_PASS rows=65 ' "$WORK/daemon.log"
 grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PASS rows=65 .* checkpointRestart=2$' "$WORK/daemon.log"
+
+# A committed decision is recovery authority. A checksum failure must stop the transaction
+# server; it must never be treated as an empty coordinator on a fresh deployment.
+cp -a "$WORK/state" "$WORK/corrupt-decision-state"
+python3 - "$WORK/corrupt-decision-state/decisions/state" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = bytearray(path.read_bytes())
+if len(payload) < 41:
+    raise SystemExit("decision state is unexpectedly short")
+payload[8] ^= 0x01
+path.write_bytes(payload)
+PY
+if run_phase recover "$WORK/corrupt-decision-state" > "$WORK/corrupt-decision.log" 2>&1; then
+    echo "daemon accepted corrupt committed decision state" >&2
+    exit 1
+fi
+grep -q 'State checksum mismatch' "$WORK/corrupt-decision.log"
+
+# The recovery pointer remains in real etcd. Moving its body creates a recoverable, explicit
+# missing-data fault and must keep Retina out of READY.
+mapfile -t checkpoint_bodies < <(find "$WORK/state/recovery" -maxdepth 1 -type f -name 'recovery_*')
+if [[ ${#checkpoint_bodies[@]} != 1 ]]; then
+    echo "expected exactly one published recovery checkpoint body" >&2
+    exit 1
+fi
+mv "${checkpoint_bodies[0]}" "${checkpoint_bodies[0]}.missing"
+if run_phase recover > "$WORK/missing-checkpoint.log" 2>&1; then
+    echo "daemon accepted a missing recovery checkpoint body" >&2
+    exit 1
+fi
+grep -Eq 'reading the checkpoint body failed|No such file' \
+    "$WORK/missing-checkpoint.log"
+echo 'PIXELS_NORMAL_INGEST_FAIL_CLOSED_PASS corruptDecision=1 missingCheckpoint=1'
