@@ -33,10 +33,13 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.TreeSet;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -61,8 +64,13 @@ import java.util.zip.CRC32;
  * <p>This class never updates a MemTable, index, row allocator, or transaction
  * outcome. discardAbortedTransaction must only be invoked after the caller has
  * verified an authoritative ABORT decision. Payloads remain on disk; only batch
- * descriptors and stream state are retained in memory. Rotation/reclamation are
- * not implemented: admission fails at the configured byte/record limits.
+ * descriptors and stream state are retained in memory. Checkpoint-backed compaction
+ * replaces the WAL using a checksummed generation pointer. Terminal transaction
+ * fences survive payload reclamation; the transaction coordinator remains the
+ * authority for outcomes and for when data/index/visibility checkpoints are safe.
+ *
+ * <p>A returned frame offset is generation-local, not a stable external LSN.
+ * Callers must retain batch identities, not these physical offsets.
  */
 public final class LocalMutationJournal implements Closeable
 {
@@ -73,18 +81,34 @@ public final class LocalMutationJournal implements Closeable
     static final String WAL_NAME = "mutations.wal";
     static final String MARKER_NAME = "durable.offset";
     private static final int MARKER_BYTES = 20;
+    private static final int GENERATION_MARKER_BYTES = 28;
+    private static final int GENERATION_MARKER_VERSION = 2;
+    private static final String LOCK_NAME = "journal.lock";
     private static final int MAX_FIXED_BODY_BYTES = 96;
     private static final int APPEND = 1;
     private static final int SEAL = 2;
     private static final int ABORT = 3;
+    private static final int CHECKPOINTED = 4;
 
     private final Path directory;
     private final Path markerPath;
     private final int maxPayloadBytes;
     private final long maxJournalBytes;
     private final int maxRecords;
-    private final FileChannel channel;
+    private FileChannel channel;
+    private FileLock walLock;
+    private final FileChannel lockChannel;
     private final FileLock lock;
+    private long generation;
+    private final FaultInjector faults;
+    private final Set<Long> checkpointedTransactions = new HashSet<>();
+
+    enum GcPhase { BEFORE_WAL_SYNC, AFTER_WAL_SYNC, BEFORE_POINTER, AFTER_POINTER, BEFORE_OLD_DELETE }
+
+    interface FaultInjector
+    {
+        void at(GcPhase phase) throws IOException;
+    }
     private final Map<MutationStreamId, StreamState> streams = new HashMap<>();
     private final Set<Long> abortedTransactions = new HashSet<>();
     private long durableOffset;
@@ -95,64 +119,78 @@ public final class LocalMutationJournal implements Closeable
     public LocalMutationJournal(Path directory, int maxPayloadBytes,
                                 long maxJournalBytes, int maxRecords) throws IOException
     {
+        this(directory, maxPayloadBytes, maxJournalBytes, maxRecords, phase -> {});
+    }
+
+    LocalMutationJournal(Path directory, int maxPayloadBytes,
+                         long maxJournalBytes, int maxRecords, FaultInjector faults) throws IOException
+    {
         if (maxPayloadBytes <= 0 || maxPayloadBytes > Integer.MAX_VALUE - MAX_FIXED_BODY_BYTES - 8
                 || maxJournalBytes < HEADER_BYTES || maxRecords <= 0)
         {
             throw new IllegalArgumentException("Invalid journal limits");
         }
         this.directory = directory.toRealPath();
-        if (!Files.isDirectory(this.directory))
-        {
-            throw new IOException("Journal directory must already exist");
-        }
+        if (!Files.isDirectory(this.directory)) { throw new IOException("Journal directory must already exist"); }
         this.markerPath = this.directory.resolve(MARKER_NAME);
         this.maxPayloadBytes = maxPayloadBytes;
         this.maxJournalBytes = maxJournalBytes;
         this.maxRecords = maxRecords;
-        Path walPath = this.directory.resolve(WAL_NAME);
-        if (Files.exists(markerPath) && !Files.exists(walPath))
-        {
-            throw new IOException("Durable marker exists but WAL is missing");
-        }
-        this.channel = FileChannel.open(walPath, StandardOpenOption.CREATE,
-                StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.faults = java.util.Objects.requireNonNull(faults, "faults");
+        this.lockChannel = FileChannel.open(this.directory.resolve(LOCK_NAME),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         FileLock acquired = null;
         try
         {
-            try
-            {
-                acquired = channel.tryLock();
-            }
-            catch (OverlappingFileLockException e)
-            {
-                throw new IOException("Journal already has an owner", e);
-            }
-            if (acquired == null)
-            {
-                throw new IOException("Journal already has an owner");
-            }
+            try { acquired = lockChannel.tryLock(); }
+            catch (OverlappingFileLockException e) { throw new IOException("Journal already has an owner", e); }
+            if (acquired == null) { throw new IOException("Journal already has an owner"); }
+            // Lock the directory across generation changes, not the replaceable WAL inode.
+            if (Files.exists(markerPath)) { readMarker(); }
+            Path walPath = walPath(generation);
+            if (Files.exists(markerPath) && !Files.isRegularFile(walPath))
+            { throw new IOException("Durable marker exists but WAL is missing"); }
+            this.channel = FileChannel.open(walPath, StandardOpenOption.CREATE,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE);
+            // Also fence a pre-generation implementation which only locks the WAL.
+            try { this.walLock = channel.tryLock(); }
+            catch (OverlappingFileLockException e) { throw new IOException("WAL already has an owner", e); }
+            if (this.walLock == null) { throw new IOException("WAL already has an owner"); }
             if (channel.size() == 0 && !Files.exists(markerPath))
             {
-                ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).putInt(MAGIC).putInt(VERSION);
-                header.flip();
-                writeFully(channel, header);
+                // A missing pointer with generation files is not a fresh database.
+                if (hasGenerationFiles()) { throw new IOException("WAL generations exist without a durable marker"); }
+                writeHeader(channel);
                 persistDurablePrefix();
             }
-            else
-            {
-                recover();
-            }
+            else { recover(); }
             this.lock = acquired;
         }
         catch (IOException | RuntimeException e)
         {
-            if (acquired != null)
-            {
-                try { acquired.release(); } catch (IOException releaseError) { e.addSuppressed(releaseError); }
-            }
-            try { channel.close(); } catch (IOException closeError) { e.addSuppressed(closeError); }
+            if (channel != null) { try { channel.close(); } catch (IOException ex) { e.addSuppressed(ex); } }
+            if (acquired != null) { try { acquired.release(); } catch (IOException ex) { e.addSuppressed(ex); } }
+            try { lockChannel.close(); } catch (IOException ex) { e.addSuppressed(ex); }
             throw e;
         }
+    }
+
+    private Path walPath(long value)
+    {
+        return directory.resolve(value == 0 ? WAL_NAME : "mutations." + value + ".wal");
+    }
+
+    private boolean hasGenerationFiles() throws IOException
+    {
+        try (DirectoryStream<Path> paths = Files.newDirectoryStream(directory, "mutations.*.wal"))
+        { return paths.iterator().hasNext(); }
+    }
+
+    private static void writeHeader(FileChannel output) throws IOException
+    {
+        ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).putInt(MAGIC).putInt(VERSION);
+        header.flip();
+        writeFully(output, header);
     }
 
     /** Return the original frame offset for identical retransmissions. */
@@ -261,6 +299,8 @@ public final class LocalMutationJournal implements Closeable
         {
             throw new IllegalArgumentException("Negative transaction id");
         }
+        if (checkpointedTransactions.contains(transactionId))
+        { throw new IOException("Cannot abort a checkpoint-covered committed transaction"); }
         if (!abortedTransactions.contains(transactionId))
         {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -279,24 +319,30 @@ public final class LocalMutationJournal implements Closeable
         return durableOffset;
     }
 
+    private void readMarker() throws IOException
+    {
+        long size = Files.exists(markerPath) ? Files.size(markerPath) : -1;
+        if (size != MARKER_BYTES && size != GENERATION_MARKER_BYTES)
+        { throw new IOException("Missing or malformed durable-prefix marker"); }
+        byte[] bytes = Files.readAllBytes(markerPath);
+        ByteBuffer marker = ByteBuffer.wrap(bytes);
+        if (marker.getInt() != MARKER_MAGIC) { throw new IOException("Invalid durable-prefix marker magic"); }
+        int version = marker.getInt();
+        if (version == VERSION && size == MARKER_BYTES) { generation = 0; }
+        else if (version == GENERATION_MARKER_VERSION && size == GENERATION_MARKER_BYTES)
+        { generation = marker.getLong(); }
+        else { throw new IOException("Unsupported durable-prefix marker"); }
+        durableOffset = marker.getLong();
+        if (marker.getInt() != checksum(bytes, 0, bytes.length - 4)
+                || generation < 0 || durableOffset < HEADER_BYTES || durableOffset > maxJournalBytes)
+        { throw new IOException("Invalid durable-prefix marker checksum or bounds"); }
+    }
+
     private void recover() throws IOException
     {
-        if (!Files.exists(markerPath) || Files.size(markerPath) != MARKER_BYTES)
-        {
-            throw new IOException("Missing or malformed durable-prefix marker");
-        }
-        ByteBuffer marker = ByteBuffer.wrap(Files.readAllBytes(markerPath));
-        if (marker.getInt() != MARKER_MAGIC || marker.getInt() != VERSION)
-        {
-            throw new IOException("Unsupported durable-prefix marker");
-        }
-        durableOffset = marker.getLong();
-        if (marker.getInt() != checksum(marker.array(), 0, MARKER_BYTES - 4)
-                || durableOffset < HEADER_BYTES || durableOffset > maxJournalBytes
-                || durableOffset > channel.size())
-        {
-            throw new IOException("Invalid durable prefix or truncated acknowledged WAL");
-        }
+        readMarker();
+        if (durableOffset > channel.size())
+        { throw new IOException("Truncated acknowledged WAL"); }
         ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES);
         readFully(channel, header, 0);
         header.flip();
@@ -334,10 +380,16 @@ public final class LocalMutationJournal implements Closeable
                     }
                     state.seal = seal;
                 }
+                else if (type == CHECKPOINTED)
+                {
+                    long txId = in.readLong();
+                    if (txId < 0 || abortedTransactions.contains(txId) || !checkpointedTransactions.add(txId))
+                    { throw new IOException("Invalid checkpointed transaction fence"); }
+                }
                 else if (type == ABORT)
                 {
                     long txId = in.readLong();
-                    if (txId < 0 || !abortedTransactions.add(txId))
+                    if (txId < 0 || checkpointedTransactions.contains(txId) || !abortedTransactions.add(txId))
                     {
                         throw new IOException("Invalid duplicate ABORT record");
                     }
@@ -369,31 +421,175 @@ public final class LocalMutationJournal implements Closeable
         {
             long end = channel.position();
             channel.force(true);
-            ByteBuffer marker = ByteBuffer.allocate(MARKER_BYTES);
-            marker.putInt(MARKER_MAGIC).putInt(VERSION).putLong(end);
-            marker.putInt(checksum(marker.array(), 0, MARKER_BYTES - 4));
-            marker.flip();
-            Path temporary = directory.resolve("durable.offset.tmp");
-            try (FileChannel output = FileChannel.open(temporary, StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE))
-            {
-                writeFully(output, marker);
-                output.force(true);
-            }
-            Files.move(temporary, markerPath, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
-            try (FileChannel dir = FileChannel.open(directory, StandardOpenOption.READ))
-            {
-                dir.force(true);
-            }
+            storeMarker(generation, end);
             durableOffset = end;
         }
-        catch (IOException e)
+        catch (IOException e) { failed = true; throw e; }
+    }
+
+    private void storeMarker(long targetGeneration, long end) throws IOException
+    {
+        // Keep the original marker representation until the first compaction.
+        int length = targetGeneration == 0 ? MARKER_BYTES : GENERATION_MARKER_BYTES;
+        ByteBuffer marker = ByteBuffer.allocate(length);
+        marker.putInt(MARKER_MAGIC).putInt(targetGeneration == 0 ? VERSION : GENERATION_MARKER_VERSION);
+        if (targetGeneration != 0) { marker.putLong(targetGeneration); }
+        marker.putLong(end).putInt(checksum(marker.array(), 0, length - 4)).flip();
+        Path temporary = directory.resolve("durable.offset.tmp");
+        try (FileChannel output = FileChannel.open(temporary, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE))
+        { writeFully(output, marker); output.force(true); }
+        Files.move(temporary, markerPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        forceDirectory();
+    }
+
+    private void forceDirectory() throws IOException
+    {
+        try (FileChannel dir = FileChannel.open(directory, StandardOpenOption.READ)) { dir.force(true); }
+    }
+
+    /**
+     * Reclaim payloads for durable ABORTs and caller-verified checkpoint-covered
+     * committed transactions. The caller MUST publish a recovery checkpoint covering
+     * data, MainIndex, SinglePointIndex, visibility, and installation identities before
+     * supplying an id here. File close, PUBLISHED alone, age, or WAL offset are not proof.
+     *
+     * <p>Other transactions (including unsealed, PREPARED and COMMIT_DECIDED) remain
+     * byte-for-byte recoverable. This operation intentionally fences retired ids;
+     * a late request is rejected rather than acknowledged as a new mutation.
+     *
+     * <p>Compaction blocks append/seal while copying and needs temporary disk space for a
+     * second WAL. The only commit point is the generation-pointer replacement.
+     * After any I/O failure the instance is fail-closed; reopen to resolve the pointer.
+     *
+     * @return reclaimed bytes in the active WAL, not including tiny retained fences
+     */
+    public synchronized long compactCheckpointedTransactions(Set<Long> coveredTransactions) throws IOException
+    {
+        ensureOpen();
+        Set<Long> covered = new TreeSet<>(java.util.Objects.requireNonNull(coveredTransactions, "coveredTransactions"));
+        for (Long id : covered)
+        {
+            if (id == null || id < 0 || abortedTransactions.contains(id))
+            { throw new IOException("Invalid checkpoint transaction id"); }
+            boolean found = checkpointedTransactions.contains(id);
+            for (Map.Entry<MutationStreamId, StreamState> entry : streams.entrySet())
+            {
+                if (entry.getKey().getTransactionId() != id) { continue; }
+                found = true;
+                if (entry.getValue().seal == null) { throw new IOException("Cannot checkpoint an unsealed stream"); }
+            }
+            if (!found) { throw new IOException("Checkpoint references an unknown transaction"); }
+        }
+        // Duplicate invocations are permitted, but do not roll a file per invocation.
+        boolean hasGarbage = false;
+        for (MutationStreamId id : streams.keySet())
+        { if (covered.contains(id.getTransactionId()) || abortedTransactions.contains(id.getTransactionId())) { hasGarbage = true; } }
+        if (!hasGarbage) { return 0; }
+        FileChannel replacement = null;
+        FileLock replacementLock;
+        try
+        {
+            persistDurablePrefix(); // Retain also accepted, not-yet-sealed live batches.
+            long oldSize = channel.size();
+            long nextGeneration = Math.addExact(generation, 1L);
+            while (Files.exists(walPath(nextGeneration))) { nextGeneration = Math.addExact(nextGeneration, 1L); }
+            replacement = FileChannel.open(walPath(nextGeneration), StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE);
+            replacementLock = replacement.tryLock();
+            if (replacementLock == null) { throw new IOException("Replacement WAL unexpectedly locked"); }
+            writeHeader(replacement);
+            Set<Long> checkpointFences = new TreeSet<>(checkpointedTransactions);
+            checkpointFences.addAll(covered);
+            int keptRecords = 0;
+            for (Long id : new TreeSet<>(abortedTransactions))
+            { writeFrame(replacement, encodeTerminal(ABORT, id)); keptRecords++; }
+            for (Long id : checkpointFences)
+            { writeFrame(replacement, encodeTerminal(CHECKPOINTED, id)); keptRecords++; }
+            long offset = HEADER_BYTES;
+            while (offset < durableOffset)
+            {
+                byte[] body = readBody(offset, durableOffset); // Verify even discarded acknowledged bytes.
+                DataInputStream in = new DataInputStream(new ByteArrayInputStream(body));
+                int type = in.readUnsignedByte();
+                if (type == APPEND || type == SEAL)
+                {
+                    long txId = readId(in).getTransactionId();
+                    if (!abortedTransactions.contains(txId) && !checkpointFences.contains(txId))
+                    { writeFrame(replacement, body); keptRecords++; }
+                }
+                else if (type != ABORT && type != CHECKPOINTED) { throw new IOException("Unknown WAL record during GC"); }
+                offset += 8L + body.length;
+            }
+            if (keptRecords > maxRecords || replacement.position() > maxJournalBytes)
+            { throw new IOException("Compacted journal exceeds configured limits"); }
+            faults.at(GcPhase.BEFORE_WAL_SYNC);
+            replacement.force(true);
+            forceDirectory(); // New filename is durable before the pointer may refer to it.
+            faults.at(GcPhase.AFTER_WAL_SYNC);
+            faults.at(GcPhase.BEFORE_POINTER);
+            storeMarker(nextGeneration, replacement.position());
+            faults.at(GcPhase.AFTER_POINTER);
+            FileChannel old = channel;
+            channel = replacement;
+            walLock = replacementLock;
+            replacement = null;
+            generation = nextGeneration;
+            old.close();
+            streams.clear(); abortedTransactions.clear(); checkpointedTransactions.clear(); recordCount = 0;
+            recover(); // Rebuild generation-local offsets from the selected durable bytes.
+            faults.at(GcPhase.BEFORE_OLD_DELETE);
+            removeObsoleteGenerations();
+            return Math.max(0L, oldSize - channel.size());
+        }
+        catch (IOException | RuntimeException e)
         {
             failed = true;
             throw e;
         }
+        finally { if (replacement != null) { replacement.close(); } }
     }
+
+    private static byte[] encodeTerminal(int kind, long id) throws IOException
+    {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(bytes);
+        out.writeByte(kind); out.writeLong(id);
+        return bytes.toByteArray();
+    }
+
+    private static void writeFrame(FileChannel output, byte[] body) throws IOException
+    {
+        ByteBuffer frame = ByteBuffer.allocate(8 + body.length);
+        frame.putInt(body.length).putInt(checksum(body, 0, body.length)).put(body).flip();
+        writeFully(output, frame);
+    }
+
+    /** Retry physical removal after a crash or transient filesystem failure. */
+    public synchronized void removeObsoleteGenerations() throws IOException
+    {
+        ensureOpen();
+        if (generation == 0) { return; }
+        // A restart can observe an atomic rename before its directory sync completed.
+        // Make the selected pointer durable before removing any fallback generation.
+        forceDirectory();
+        try (DirectoryStream<Path> paths = Files.newDirectoryStream(directory, "mutations*.wal"))
+        {
+            for (Path path : paths)
+            {
+                String name = path.getFileName().toString();
+                if (!name.equals(WAL_NAME) && !name.matches("mutations\\.[0-9]+\\.wal")) { continue; }
+                if (!path.equals(walPath(generation))) { Files.deleteIfExists(path); }
+            }
+        }
+        forceDirectory();
+    }
+
+    public synchronized Set<Long> getCheckpointedTransactions() throws IOException
+    { ensureOpen(); return Collections.unmodifiableSet(new HashSet<>(checkpointedTransactions)); }
+
+    public synchronized long getGeneration() throws IOException { ensureOpen(); return generation; }
+    public synchronized long getJournalBytes() throws IOException { ensureOpen(); return channel.size(); }
 
     private long appendRecord(byte[] body) throws IOException
     {
@@ -551,6 +747,7 @@ public final class LocalMutationJournal implements Closeable
     private void requireNotAborted(long txId) throws IOException
     {
         if (abortedTransactions.contains(txId)) { throw new IOException("Transaction was aborted: " + txId); }
+        if (checkpointedTransactions.contains(txId)) { throw new IOException("Transaction is checkpoint-covered: " + txId); }
     }
 
     private void ensureOpen() throws IOException
@@ -586,8 +783,12 @@ public final class LocalMutationJournal implements Closeable
     {
         if (closed) { return; }
         closed = true;
-        try { lock.release(); }
-        finally { channel.close(); }
+        try { channel.close(); }
+        finally
+        {
+            try { lock.release(); }
+            finally { lockChannel.close(); }
+        }
     }
 
     private static final class Entry

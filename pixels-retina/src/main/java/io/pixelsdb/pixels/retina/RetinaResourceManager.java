@@ -83,11 +83,9 @@ public class RetinaResourceManager
         return checkPixelsWriteBuffer(schema, table, vnode);
     }
 
-    /** Recovery requires an unchanged placement baseline until GC/checkpoint handoff is implemented. */
+    /** Verify that every in-flight installation file is present in recovered visibility. */
     public void initializeIngestBaseline(Set<Long> managedFiles) throws RetinaException
     {
-        if (Boolean.parseBoolean(ConfigFactory.Instance().getProperty("retina.storage.gc.enabled")))
-        { throw new RetinaException("Transactional replay requires rewriting GC to be disabled"); }
         for (long fileId : managedFiles)
         {
             if (!rgVisibilityMap.containsKey(RetinaUtils.buildRgKey(fileId, 0)))
@@ -101,6 +99,7 @@ public class RetinaResourceManager
     // GC related fields
     private final ScheduledExecutorService gcExecutor;
     private final AtomicBoolean gcScheduled;
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
     private final StorageGcWal storageGcWal;
     private final StorageGarbageCollector storageGarbageCollector;
     // Initialised by startBackgroundGc(); recovery checkpoint publication
@@ -108,6 +107,29 @@ public class RetinaResourceManager
     // then so unit/integration tests that never start the scheduler are
     // unaffected.
     private RecoveryCheckpoint recoveryCheckpoint;
+    private volatile long durableRecoveryCheckpointTimestamp = -1L;
+    private volatile Set<Long> durableRecoveryCheckpointFiles = Collections.emptySet();
+
+    public void adoptRecoveryCheckpoint(RecoveryCheckpoint.Body body)
+    {
+        if (body == null)
+        {
+            durableRecoveryCheckpointTimestamp = -1L;
+            durableRecoveryCheckpointFiles = Collections.emptySet();
+            return;
+        }
+        Set<Long> files = body.getRgEntries().stream()
+                .map(RecoveryCheckpoint.VisibilityEntry::getFileId)
+                .collect(Collectors.toSet());
+        durableRecoveryCheckpointFiles = Collections.unmodifiableSet(files);
+        durableRecoveryCheckpointTimestamp = body.getCheckpointAppliedTs();
+    }
+
+    public boolean isIngestRecoveryCheckpointDurable(long commitTimestamp, Set<Long> fileIds)
+    {
+        return durableRecoveryCheckpointTimestamp >= commitTimestamp
+                && durableRecoveryCheckpointFiles.containsAll(fileIds);
+    }
 
     private volatile long latestGcTimestamp = -1;
     private final int totalVirtualNodeNum;
@@ -244,6 +266,41 @@ public class RetinaResourceManager
         return storageGcWal;
     }
 
+    /**
+     * Reconcile storage-rewrite state against the selected recovery checkpoint.
+     * Keeping this operation on the resource manager prevents daemon startup
+     * code from depending on the concrete WAL implementation.
+     */
+    public void recoverStorageGc(Set<Long> baselineVisibleFileIds) throws RetinaException
+    {
+        new StorageGcWal.RecoveryHandler(storageGcWal, metadataService, indexService)
+                .recover(baselineVisibleFileIds);
+    }
+
+    /** Return files that startup retirement must preserve for incomplete rewrites. */
+    public Set<Long> getStorageGcRecoveryProtectedFiles()
+    {
+        return storageGcWal.collectPendingFileIds();
+    }
+
+    /**
+     * Delete terminal rewrite journals after their outcome is represented by
+     * the selected checkpoint. The operation is idempotent across restarts.
+     */
+    public int cleanupTerminalStorageGcTasks() throws RetinaException
+    {
+        List<StorageGcWal.Task> terminalTasks = storageGcWal.listTerminalTasks();
+        if (terminalTasks.isEmpty())
+        {
+            return 0;
+        }
+        List<String> taskIds = terminalTasks.stream()
+                .map(StorageGcWal.Task::getTaskId)
+                .collect(Collectors.toList());
+        storageGcWal.deleteTerminalTasks(taskIds);
+        return taskIds.size();
+    }
+
     private static final class InstanceHolder
     {
         private static final RetinaResourceManager instance = new RetinaResourceManager();
@@ -295,6 +352,8 @@ public class RetinaResourceManager
         // or storage backend), refuse to start the GC scheduler rather than
         // silently run without crash recovery.
         this.recoveryCheckpoint = RecoveryCheckpoint.createFromConfig();
+        RecoveryCheckpoint.LoadedCheckpoint loaded = this.recoveryCheckpoint.load();
+        adoptRecoveryCheckpoint(loaded == null ? null : loaded.body);
 
         try
         {
@@ -316,6 +375,83 @@ public class RetinaResourceManager
     public boolean isBackgroundGcStarted()
     {
         return this.gcScheduled.get();
+    }
+
+    /**
+     * Quiesce every long-lived Retina resource owned by the daemon.
+     *
+     * <p>The RPC server must stop accepting work before this method is called. Committed rows
+     * still resident in buffers are materialized by {@link PixelsWriteBuffer#close()}; transaction
+     * WAL/installation state is deliberately retained unless its normal recovery checkpoint
+     * handoff has already completed.</p>
+     */
+    public void shutdown() throws RetinaException
+    {
+        if (!shuttingDown.compareAndSet(false, true))
+        {
+            return;
+        }
+
+        RetinaException failure = null;
+        gcExecutor.shutdown();
+        offloadCheckpointExecutor.shutdown();
+        try
+        {
+            if (!gcExecutor.awaitTermination(60, TimeUnit.SECONDS))
+            {
+                gcExecutor.shutdownNow();
+                failure = new RetinaException("Timed out waiting for Retina GC to stop");
+            }
+            if (!offloadCheckpointExecutor.awaitTermination(60, TimeUnit.SECONDS))
+            {
+                offloadCheckpointExecutor.shutdownNow();
+                RetinaException timeout =
+                        new RetinaException("Timed out waiting for Retina checkpoint workers to stop");
+                if (failure == null) failure = timeout;
+                else failure.addSuppressed(timeout);
+            }
+        }
+        catch (InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            gcExecutor.shutdownNow();
+            offloadCheckpointExecutor.shutdownNow();
+            failure = new RetinaException("Interrupted while stopping Retina background workers", e);
+        }
+
+        Set<PixelsWriteBuffer> buffers = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Map<Integer, PixelsWriteBuffer> perTable : pixelsWriteBufferMap.values())
+        {
+            buffers.addAll(perTable.values());
+        }
+        for (PixelsWriteBuffer buffer : buffers)
+        {
+            try
+            {
+                buffer.close();
+            }
+            catch (RetinaException e)
+            {
+                if (failure == null) failure = e;
+                else failure.addSuppressed(e);
+            }
+        }
+        pixelsWriteBufferMap.clear();
+
+        for (RGVisibility visibility : rgVisibilityMap.values())
+        {
+            if (visibility != null)
+            {
+                visibility.close();
+            }
+        }
+        rgVisibilityMap.clear();
+        ingestReadPins.stop();
+
+        if (failure != null)
+        {
+            throw failure;
+        }
     }
 
     public void setRecovering(boolean recovering)
@@ -433,11 +569,20 @@ public class RetinaResourceManager
      */
     public void processRetiredFiles()
     {
+        if (ingestReadPins.active() > 0)
+        {
+            return;
+        }
+        Set<Long> recoveryProtectedFiles = storageGcWal.collectPendingFileIds();
         // In-memory queue for files retired in this process.
         long now = System.currentTimeMillis();
         retiredFiles.removeIf(rf ->
         {
             if (now <= rf.retireTimestamp)
+            {
+                return false;
+            }
+            if (recoveryProtectedFiles.contains(rf.fileId))
             {
                 return false;
             }
@@ -482,6 +627,10 @@ public class RetinaResourceManager
             }
             for (File file : dueFiles)
             {
+                if (recoveryProtectedFiles.contains(file.getId()))
+                {
+                    continue;
+                }
                 RetiredPathInfo pathInfo = pathsById.get(file.getPathId());
                 if (pathInfo == null)
                 {
@@ -529,7 +678,7 @@ public class RetinaResourceManager
         {
             try
             {
-                indexService.deleteMainIndexRange(tableId, fileId, rowIdStart, (int) rowCount);
+                indexService.deleteMainIndexEntriesForFile(tableId, fileId);
             }
             catch (Exception e)
             {
@@ -1065,12 +1214,15 @@ public class RetinaResourceManager
                 }
                 recoveryCheckpoint.generate(timestamp, rgEntries, segments);
 
+                Set<Long> checkpointFileIds = rgEntries.stream()
+                        .map(VisibilityEntry::getFileId)
+                        .collect(Collectors.toSet());
+                durableRecoveryCheckpointFiles = Collections.unmodifiableSet(checkpointFileIds);
+                durableRecoveryCheckpointTimestamp = timestamp;
+
                 if (!rgEntries.isEmpty())
                 {
                     // A checkpoint containing the new file makes the GC WAL task durable.
-                    Set<Long> checkpointFileIds = rgEntries.stream()
-                            .map(VisibilityEntry::getFileId)
-                            .collect(Collectors.toSet());
                     for (StorageGcWal.Task task : storageGcWal.listAllTasks())
                     {
                         if (task.getState() != StorageGcWal.State.SWAPPED_NOT_CHECKPOINTED

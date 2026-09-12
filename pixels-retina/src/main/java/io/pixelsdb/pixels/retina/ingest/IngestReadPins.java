@@ -49,6 +49,12 @@ public final class IngestReadPins {
         ready = true;
     }
 
+    /** Reject new/renewed reads and release every process-local physical coverage lease. */
+    public synchronized void stop() {
+        ready = false;
+        pins.clear();
+    }
+
     private void expire() {
         pins.values().removeIf(p -> p.getExpiresAtMillis() <= clock.millis());
     }

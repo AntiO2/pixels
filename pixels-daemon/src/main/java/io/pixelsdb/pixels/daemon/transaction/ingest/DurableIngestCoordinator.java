@@ -51,6 +51,10 @@ public final class DurableIngestCoordinator implements Closeable {
 
         void install(String owner, Transaction transaction) throws Exception;
 
+        default void checkpoint(String owner, long transactionId) throws Exception {
+            throw new IOException("Participant checkpoint acknowledgement is unavailable");
+        }
+
         void discard(String owner, long transactionId) throws Exception;
     }
 
@@ -63,11 +67,12 @@ public final class DurableIngestCoordinator implements Closeable {
     private final long leaseMillis;
     private final int maxTransactions;
     private final int maxStreams;
+    private final long terminalRetentionMillis;
+    private final int maxTerminalTransactions;
     private final Object publisher = new Object();
     private final ScheduledExecutorService recovery;
     private CoordinatorSnapshot snapshot;
     private volatile boolean closed;
-    private final Set<String> cleaned = new HashSet<>();
 
     public DurableIngestCoordinator(
             AtomicStateFile store,
@@ -80,6 +85,23 @@ public final class DurableIngestCoordinator implements Closeable {
             int maxTransactions,
             int maxStreams)
             throws IOException {
+        this(store, tables, participants, ids, clock, baselineTimestamp, leaseMillis,
+                maxTransactions, maxStreams, 24L * 60 * 60 * 1000, 100000);
+    }
+
+    public DurableIngestCoordinator(
+            AtomicStateFile store,
+            Tables tables,
+            Participants participants,
+            LongSupplier ids,
+            Clock clock,
+            long baselineTimestamp,
+            long leaseMillis,
+            int maxTransactions,
+            int maxStreams,
+            long terminalRetentionMillis,
+            int maxTerminalTransactions)
+            throws IOException {
         this.store = store;
         this.tables = tables;
         this.participants = participants;
@@ -88,6 +110,11 @@ public final class DurableIngestCoordinator implements Closeable {
         this.leaseMillis = leaseMillis;
         this.maxTransactions = maxTransactions;
         this.maxStreams = maxStreams;
+        if (terminalRetentionMillis < leaseMillis || maxTerminalTransactions <= 0) {
+            throw new IllegalArgumentException("Invalid terminal transaction retention");
+        }
+        this.terminalRetentionMillis = terminalRetentionMillis;
+        this.maxTerminalTransactions = maxTerminalTransactions;
         byte[] bytes = store.read();
         if (bytes.length == 0) {
             snapshot =
@@ -141,6 +168,27 @@ public final class DurableIngestCoordinator implements Closeable {
                     throw new IOException("Unknown transaction state");
                 }
             }
+            for (TerminalTransaction terminal : snapshot.getTerminalTransactionsList()) {
+                if (!txIds.add(terminal.getTransactionId())
+                        || !requests.add(terminal.getRequestId())
+                        || terminal.getRequestId().isEmpty()
+                        || terminal.getTable().getTableId() <= 0
+                        || terminal.getRetiredAtMillis() <= 0
+                        || (terminal.getState() != TransactionState.PUBLISHED
+                                && terminal.getState() != TransactionState.ABORTED)) {
+                    throw new IOException("Invalid terminal transaction fence");
+                }
+                if (terminal.getState() == TransactionState.PUBLISHED
+                        && (terminal.getCommitTimestamp() <= 0
+                                || !commitTimes.add(terminal.getCommitTimestamp())
+                                || terminal.getCommitTimestamp() > snapshot.getPublishedTimestamp())) {
+                    throw new IOException("Invalid published terminal transaction fence");
+                }
+                if (terminal.getTransactionId()
+                        > snapshot.getRetiredTransactionIdHighWatermark()) {
+                    throw new IOException("Terminal fence exceeds retired transaction watermark");
+                }
+            }
         }
         recovery =
                 Executors.newSingleThreadScheduledExecutor(
@@ -158,9 +206,7 @@ public final class DurableIngestCoordinator implements Closeable {
                         return;
                     }
                     try {
-                        expire();
-                        drivePublication();
-                        cleanupTerminalReservations();
+                        reconcileOnce();
                     } catch (Exception e) {
                         LOG.warn("Ingest reconciliation will retry: {}", e.toString());
                     }
@@ -168,6 +214,13 @@ public final class DurableIngestCoordinator implements Closeable {
                 0,
                 1,
                 TimeUnit.SECONDS);
+    }
+
+    void reconcileOnce() throws Exception {
+        expire();
+        drivePublication();
+        cleanupTerminalReservations();
+        pruneTerminalFences();
     }
 
     private void checkOpen() throws IOException {
@@ -188,7 +241,7 @@ public final class DurableIngestCoordinator implements Closeable {
                 return i;
             }
         }
-        throw new IOException("Unknown ingest transaction " + id + "; absence is not ABORT");
+        throw new IOException("Active ingest transaction is absent: " + id);
     }
 
     private void replace(Transaction value) throws IOException {
@@ -209,11 +262,30 @@ public final class DurableIngestCoordinator implements Closeable {
     }
 
     public synchronized Transaction get(long id) throws IOException {
-        return snapshot.getTransactions(position(id));
+        checkOpen();
+        for (Transaction transaction : snapshot.getTransactionsList()) {
+            if (transaction.getTransactionId() == id) {
+                return transaction;
+            }
+        }
+        for (TerminalTransaction terminal : snapshot.getTerminalTransactionsList()) {
+            if (terminal.getTransactionId() == id) {
+                return terminalTransaction(terminal);
+            }
+        }
+        if (id <= snapshot.getRetiredTransactionIdHighWatermark()) {
+            throw new IOException("Retired ingest transaction " + id
+                    + "; terminal retry metadata is no longer retained");
+        }
+        throw new IOException("Unknown ingest transaction " + id + "; absence is not ABORT");
     }
 
     public synchronized long publishedTimestamp() {
         return snapshot.getPublishedTimestamp();
+    }
+
+    public synchronized long lastCommitTimestamp() {
+        return snapshot.getLastCommitTimestamp();
     }
 
     public Transaction begin(BeginWriteRequest request) throws Exception {
@@ -233,6 +305,17 @@ public final class DurableIngestCoordinator implements Closeable {
                     return existing;
                 }
             }
+            for (TerminalTransaction terminal : snapshot.getTerminalTransactionsList()) {
+                if (terminal.getRequestId().equals(request.getRequestId())) {
+                    Transaction existing = terminalTransaction(terminal);
+                    if (!existing.getTable().getSchemaName().equals(request.getSchemaName())
+                            || !existing.getTable().getTableName().equals(request.getTableName())
+                            || existing.getReadTimestamp() != request.getReadTimestamp()) {
+                        throw new IOException("Begin request identity reused with different arguments");
+                    }
+                    return existing;
+                }
+            }
             if (snapshot.getTransactionsCount() >= maxTransactions) {
                 throw new IOException("Transaction metadata capacity reached");
             }
@@ -242,6 +325,11 @@ public final class DurableIngestCoordinator implements Closeable {
             // Concurrent retransmissions must not allocate two transaction identities.
             for (Transaction existing : snapshot.getTransactionsList()) {
                 if (existing.getRequestId().equals(request.getRequestId())) {
+                    return begin(request);
+                }
+            }
+            for (TerminalTransaction terminal : snapshot.getTerminalTransactionsList()) {
+                if (terminal.getRequestId().equals(request.getRequestId())) {
                     return begin(request);
                 }
             }
@@ -262,6 +350,9 @@ public final class DurableIngestCoordinator implements Closeable {
                 if (old.getTransactionId() == tx.getTransactionId()) {
                     throw new IOException("Allocator reused transaction identity");
                 }
+            }
+            if (tx.getTransactionId() <= snapshot.getRetiredTransactionIdHighWatermark()) {
+                throw new IOException("Allocator reused a retired transaction identity");
             }
             if (snapshot.getTransactionsCount() >= maxTransactions) {
                 throw new IOException("Transaction metadata capacity reached");
@@ -402,6 +493,9 @@ public final class DurableIngestCoordinator implements Closeable {
             tx = get(request.getTransactionId());
             if (tx.getState() == TransactionState.ABORTED) {
                 throw new IOException("Transaction aborted");
+            }
+            if (IngestWire.committed(tx)) {
+                return tx;
             }
             if (tx.getState() != TransactionState.OPEN) {
                 if (!tx.getSealsList().equals(seals)) {
@@ -597,14 +691,83 @@ public final class DurableIngestCoordinator implements Closeable {
             if (tx.getState() == TransactionState.ABORTED
                     || tx.getState() == TransactionState.PUBLISHED) {
                 for (String owner : IngestWire.owners(tx)) {
-                    String identity = owner + ":" + tx.getTransactionId();
-                    if (!cleaned.contains(identity)) {
-                        participants.discard(owner, tx.getTransactionId());
-                        cleaned.add(identity);
+                    if (tx.getState() == TransactionState.PUBLISHED) {
+                        participants.checkpoint(owner, tx.getTransactionId());
+                    }
+                    participants.discard(owner, tx.getTransactionId());
+                }
+                synchronized (this) {
+                    int active = findActive(tx.getTransactionId());
+                    if (active >= 0 && snapshot.getTransactions(active).getState() == tx.getState()) {
+                        retire(active, tx);
                     }
                 }
             }
         }
+    }
+
+    private int findActive(long transactionId) {
+        for (int i = 0; i < snapshot.getTransactionsCount(); i++) {
+            if (snapshot.getTransactions(i).getTransactionId() == transactionId) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static Transaction terminalTransaction(TerminalTransaction terminal) {
+        return Transaction.newBuilder()
+                .setTransactionId(terminal.getTransactionId())
+                .setRequestId(terminal.getRequestId())
+                .setReadTimestamp(terminal.getReadTimestamp())
+                .setCommitTimestamp(terminal.getCommitTimestamp())
+                .setState(terminal.getState())
+                .setTable(terminal.getTable())
+                .build();
+    }
+
+    private void retire(int active, Transaction tx) throws IOException {
+        TerminalTransaction terminal = TerminalTransaction.newBuilder()
+                .setTransactionId(tx.getTransactionId())
+                .setRequestId(tx.getRequestId())
+                .setReadTimestamp(tx.getReadTimestamp())
+                .setCommitTimestamp(tx.getCommitTimestamp())
+                .setState(tx.getState())
+                .setTable(tx.getTable())
+                .setRetiredAtMillis(Math.max(1, clock.millis()))
+                .build();
+        CoordinatorSnapshot.Builder next = snapshot.toBuilder()
+                .removeTransactions(active)
+                .addTerminalTransactions(terminal)
+                .setRetiredTransactionIdHighWatermark(Math.max(
+                        snapshot.getRetiredTransactionIdHighWatermark(), tx.getTransactionId()));
+        compactTerminalFences(next);
+        save(next.build());
+    }
+
+    private synchronized void pruneTerminalFences() throws IOException {
+        CoordinatorSnapshot.Builder next = snapshot.toBuilder();
+        if (compactTerminalFences(next)) {
+            save(next.build());
+        }
+    }
+
+    private boolean compactTerminalFences(CoordinatorSnapshot.Builder next) {
+        List<TerminalTransaction> retained = new ArrayList<>(next.getTerminalTransactionsList());
+        retained.sort(Comparator.comparingLong(TerminalTransaction::getRetiredAtMillis)
+                .thenComparingLong(TerminalTransaction::getTransactionId));
+        long cutoff = clock.millis() - terminalRetentionMillis;
+        int originalSize = retained.size();
+        while (!retained.isEmpty()
+                && (retained.size() > maxTerminalTransactions
+                        || retained.get(0).getRetiredAtMillis() <= cutoff)) {
+            retained.remove(0);
+        }
+        if (retained.size() == originalSize) {
+            return false;
+        }
+        next.clearTerminalTransactions().addAllTerminalTransactions(retained);
+        return true;
     }
 
     @Override

@@ -644,6 +644,48 @@ public class LocalIndexService implements IndexService
     }
 
     @Override
+    public List<IndexProto.PrimaryIndexEntry> getMainIndexEntriesForFiles(
+            long tableId, Set<Long> fileIds) throws IndexException
+    {
+        try
+        {
+            return MainIndexFactory.Instance().getMainIndex(tableId).getEntriesForFiles(fileIds);
+        }
+        catch (MainIndexException e)
+        {
+            throw new IndexException("Failed to enumerate main index files for tableId=" + tableId, e);
+        }
+    }
+
+    @Override
+    public void relocateMainIndexEntries(long tableId, Set<Long> expectedOldFileIds,
+            List<IndexProto.PrimaryIndexEntry> entries) throws IndexException
+    {
+        try
+        {
+            MainIndexFactory.Instance().getMainIndex(tableId)
+                    .relocateEntries(expectedOldFileIds, entries);
+        }
+        catch (MainIndexException e)
+        {
+            throw new IndexException("Failed to relocate main index entries for tableId=" + tableId, e);
+        }
+    }
+
+    @Override
+    public void deleteMainIndexEntriesForFile(long tableId, long fileId) throws IndexException
+    {
+        try
+        {
+            MainIndexFactory.Instance().getMainIndex(tableId).deleteEntriesForFile(fileId);
+        }
+        catch (MainIndexException e)
+        {
+            throw new IndexException("Failed to delete retired main index entries for tableId=" + tableId, e);
+        }
+    }
+
+    @Override
     public void putPrimaryIndexEntriesOnly(long tableId, long indexId,
             List<IndexProto.PrimaryIndexEntry> entries, IndexOption indexOption) throws IndexException
     {

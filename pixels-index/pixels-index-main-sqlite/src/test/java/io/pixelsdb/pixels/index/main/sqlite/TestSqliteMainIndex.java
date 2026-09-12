@@ -44,6 +44,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -302,6 +303,50 @@ public class TestSqliteMainIndex
         Assertions.assertEquals(0, locations.get(0).getRgRowOffset());
         Assertions.assertEquals(2, locations.get(1).getRgRowOffset());
         Assertions.assertEquals(5, locations.get(2).getRgRowOffset());
+    }
+
+    @Test
+    public void testRelocateEntriesPreservesRowIdsAndSurvivesRestart() throws Exception
+    {
+        long oldFileId = 510L;
+        long newFileId = 511L;
+        putContiguousEntries(oldFileId, 0, 13100L, 13105L, 0);
+        Assertions.assertTrue(mainIndex.flushCache(oldFileId));
+
+        List<IndexProto.PrimaryIndexEntry> oldEntries = mainIndex.getEntriesForFiles(
+                new HashSet<>(Arrays.asList(oldFileId)));
+        Assertions.assertEquals(5, oldEntries.size());
+
+        List<IndexProto.PrimaryIndexEntry> relocated = Arrays.asList(
+                primaryEntry(13101L, newFileId, 0, 0),
+                primaryEntry(13103L, newFileId, 0, 1),
+                primaryEntry(13104L, newFileId, 1, 0));
+        mainIndex.relocateEntries(new HashSet<>(Arrays.asList(oldFileId)), relocated);
+        mainIndex.relocateEntries(new HashSet<>(Arrays.asList(oldFileId)), relocated);
+
+        assertLocation(13100L, oldFileId, 0, 0);
+        assertLocation(13101L, newFileId, 0, 0);
+        assertLocation(13102L, oldFileId, 0, 2);
+        assertLocation(13103L, newFileId, 0, 1);
+        assertLocation(13104L, newFileId, 1, 0);
+
+        Assertions.assertThrows(MainIndexException.class, () -> mainIndex.relocateEntries(
+                new HashSet<>(Arrays.asList(999L)),
+                Arrays.asList(primaryEntry(13100L, newFileId, 2, 0))));
+        assertLocation(13100L, oldFileId, 0, 0);
+
+        mainIndex.deleteEntriesForFile(oldFileId);
+        assertLocationMissing(13100L);
+        assertLocationMissing(13102L);
+        assertLocation(13101L, newFileId, 0, 0);
+        assertLocation(13103L, newFileId, 0, 1);
+        assertLocation(13104L, newFileId, 1, 0);
+
+        MainIndexFactory.Instance().closeIndex(tableId, false);
+        mainIndex = MainIndexFactory.Instance().getMainIndex(tableId);
+        assertLocationMissing(13100L);
+        assertLocation(13101L, newFileId, 0, 0);
+        assertLocation(13104L, newFileId, 1, 0);
     }
 
     @Test

@@ -26,6 +26,7 @@ import io.pixelsdb.pixels.index.IndexProto;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 
 /**
  * The main index of a table is the mapping from row id to the row offset in the data file.
@@ -118,6 +119,20 @@ public interface MainIndex extends Closeable
      * @return the row locations, empty if not found
      */
     List<IndexProto.RowLocation> getLocations(List<Long> rowIds) throws MainIndexException;
+
+    /** Enumerate durable row identities whose current locations belong to the files. */
+    List<IndexProto.PrimaryIndexEntry> getEntriesForFiles(Set<Long> fileIds)
+            throws MainIndexException;
+
+    /**
+     * Atomically move existing row identities to new physical locations. Repeating the
+     * same relocation is idempotent; any unrelated current location fails closed.
+     */
+    void relocateEntries(Set<Long> expectedOldFileIds,
+            List<IndexProto.PrimaryIndexEntry> entries) throws MainIndexException;
+
+    /** Delete only mappings that still point at the given retired file. */
+    void deleteEntriesForFile(long fileId) throws MainIndexException;
 
     /**
      * Put a single row id into the main index.

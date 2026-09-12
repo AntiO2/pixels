@@ -52,6 +52,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     private final MetadataService metadata;
     private final String owner;
     private final Map<String, BatchInstall> plans = new LinkedHashMap<>();
+    private final Map<Long, TransactionCheckpoint> checkpoints = new LinkedHashMap<>();
     private final Map<String, Long> keyIntents = new HashMap<>();
     private final Map<Long, Set<String>> transactionKeys = new HashMap<>();
     private final Map<Long, Long> reservedBytes = new HashMap<>();
@@ -77,7 +78,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
         byte[] bytes = state.read();
         if (bytes.length > 0) {
             InstallationSnapshot snapshot = InstallationSnapshot.parseFrom(bytes);
-            if (snapshot.getVersion() != 1) {
+            if (snapshot.getVersion() != 2) {
                 throw new IOException("Unknown installation plan version");
             }
             for (BatchInstall plan : snapshot.getBatchesList()) {
@@ -97,6 +98,25 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                     throw new IOException("Plan exceeds its batch");
                 }
             }
+            for (TransactionCheckpoint checkpoint : snapshot.getCheckpointsList()) {
+                if (checkpoint.getTransactionId() <= 0
+                        || checkpoint.getCommitTimestamp() <= 0
+                        || checkpoint.getTableId() <= 0
+                        || checkpoint.getTableFingerprint().isEmpty()
+                        || checkpoints.put(checkpoint.getTransactionId(), checkpoint) != null) {
+                    throw new IOException("Invalid or duplicate installation checkpoint");
+                }
+                Set<Long> fileIds = new HashSet<>(checkpoint.getFileIdsList());
+                if (fileIds.size() != checkpoint.getFileIdsCount() || fileIds.contains(0L)
+                        || checkpoint.getRowRangesCount() == 0) {
+                    throw new IOException("Invalid installation checkpoint coverage");
+                }
+                for (RowIdRange range : checkpoint.getRowRangesList()) {
+                    if (range.getRowIdStart() <= 0 || range.getRowCount() <= 0) {
+                        throw new IOException("Invalid installation checkpoint row range");
+                    }
+                }
+            }
             planBytes = bytes.length;
         }
     }
@@ -108,16 +128,22 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     private void save(BatchInstall value) throws IOException {
         Map<String, BatchInstall> next = new LinkedHashMap<>(plans);
         next.put(key(value), value);
-        byte[] bytes =
-                InstallationSnapshot.newBuilder()
-                        .setVersion(1)
-                        .addAllBatches(next.values())
-                        .build()
-                        .toByteArray();
+        byte[] bytes = snapshot(next, checkpoints);
         state.store(bytes);
         plans.clear();
         plans.putAll(next);
         planBytes = bytes.length;
+    }
+
+    private static byte[] snapshot(
+            Map<String, BatchInstall> plans,
+            Map<Long, TransactionCheckpoint> checkpoints) {
+        return InstallationSnapshot.newBuilder()
+                .setVersion(2)
+                .addAllBatches(plans.values())
+                .addAllCheckpoints(checkpoints.values())
+                .build()
+                .toByteArray();
     }
 
     private List<byte[][]> rows(Transaction tx, MutationBatch batch) throws IOException {
@@ -233,11 +259,41 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     public synchronized void initializeRecovery(List<Transaction> transactions) throws Exception {
         Set<Long> committed = new HashSet<>();
         Map<Long, Long> timestamps = new HashMap<>();
+        Map<Long, Transaction> authoritative = new HashMap<>();
         for (Transaction tx : transactions) {
             if (IngestWire.committed(tx)) {
                 committed.add(tx.getTransactionId());
                 timestamps.put(tx.getTransactionId(), tx.getCommitTimestamp());
+                authoritative.put(tx.getTransactionId(), tx);
             }
+        }
+        Set<Long> retiredCheckpoints = new HashSet<>();
+        for (TransactionCheckpoint checkpoint : checkpoints.values()) {
+            Transaction tx = authoritative.get(checkpoint.getTransactionId());
+            if (tx != null && (tx.getState() != TransactionState.PUBLISHED
+                    || tx.getCommitTimestamp() != checkpoint.getCommitTimestamp()
+                    || tx.getTable().getTableId() != checkpoint.getTableId()
+                    || !tx.getTable().getFingerprint().equals(checkpoint.getTableFingerprint()))) {
+                throw new IOException("Installation checkpoint lacks its authoritative PUBLISHED decision");
+            }
+            if (tx == null) {
+                // The coordinator removes a full PUBLISHED decision only after this participant
+                // acknowledged the checkpoint. Its absence is therefore the durable prune ack.
+                // Do not re-open checkpointed file identities here: a later storage-GC
+                // checkpoint may already have retired them and moved surviving stable rowIds.
+                retiredCheckpoints.add(checkpoint.getTransactionId());
+            } else {
+                verifyCheckpointRows(checkpoint);
+            }
+        }
+        if (!retiredCheckpoints.isEmpty()) {
+            Map<Long, TransactionCheckpoint> retained = new LinkedHashMap<>(checkpoints);
+            retiredCheckpoints.forEach(retained::remove);
+            byte[] compacted = snapshot(plans, retained);
+            state.store(compacted);
+            checkpoints.clear();
+            checkpoints.putAll(retained);
+            planBytes = compacted.length;
         }
         Set<Long> managedFiles = new HashSet<>();
         for (BatchInstall plan : plans.values()) {
@@ -265,6 +321,171 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             }
         }
         resources.initializeIngestBaseline(managedFiles);
+    }
+
+    @Override
+    public synchronized boolean recoveredByCheckpoint(Transaction tx) throws Exception {
+        TransactionCheckpoint checkpoint = checkpoints.get(tx.getTransactionId());
+        if (checkpoint == null) {
+            return false;
+        }
+        if (tx.getState() != TransactionState.PUBLISHED
+                || checkpoint.getCommitTimestamp() != tx.getCommitTimestamp()
+                || checkpoint.getTableId() != tx.getTable().getTableId()
+                || !checkpoint.getTableFingerprint().equals(tx.getTable().getFingerprint())) {
+            throw new IOException("Recovered transaction differs from installation checkpoint");
+        }
+        return true;
+    }
+
+    @Override
+    public synchronized boolean checkpoint(
+            Transaction tx, Iterable<MutationBatch> batches) throws Exception {
+        if (checkpoints.containsKey(tx.getTransactionId())) {
+            return true;
+        }
+        if (tx.getState() != TransactionState.PUBLISHED) {
+            return false;
+        }
+        List<BatchInstall> transactionPlans = new ArrayList<>();
+        Set<Long> coveredFiles = new HashSet<>();
+        for (MutationBatch batch : batches) {
+            BatchInstall plan = plans.get(
+                    IngestWire.batchKey(batch.getStreamId(), batch.getSequence()));
+            if (plan == null || plan.getStream().getTransactionId() != tx.getTransactionId()) {
+                throw new IOException("Published transaction is missing its installation plan");
+            }
+            if (!verifyMaterializedBatch(tx, batch, plan, coveredFiles)) {
+                return false;
+            }
+            transactionPlans.add(plan);
+        }
+        if (!resources.isIngestRecoveryCheckpointDurable(
+                tx.getCommitTimestamp(), coveredFiles)) {
+            return false;
+        }
+        TransactionCheckpoint.Builder checkpoint = TransactionCheckpoint.newBuilder()
+                .setTransactionId(tx.getTransactionId())
+                .setCommitTimestamp(tx.getCommitTimestamp())
+                .setTableId(tx.getTable().getTableId())
+                .setTableFingerprint(tx.getTable().getFingerprint())
+                .addAllFileIds(new TreeSet<>(coveredFiles));
+        for (BatchInstall plan : transactionPlans) {
+            checkpoint.addRowRanges(RowIdRange.newBuilder()
+                    .setRowIdStart(plan.getRowIdStart())
+                    .setRowCount(plan.getRowCount()));
+        }
+        Map<String, BatchInstall> nextPlans = new LinkedHashMap<>(plans);
+        nextPlans.values().removeIf(
+                plan -> plan.getStream().getTransactionId() == tx.getTransactionId());
+        Map<Long, TransactionCheckpoint> nextCheckpoints = new LinkedHashMap<>(checkpoints);
+        nextCheckpoints.put(tx.getTransactionId(), checkpoint.build());
+        byte[] bytes = snapshot(nextPlans, nextCheckpoints);
+        state.store(bytes);
+        plans.clear();
+        plans.putAll(nextPlans);
+        checkpoints.clear();
+        checkpoints.putAll(nextCheckpoints);
+        planBytes = bytes.length;
+        return true;
+    }
+
+    private boolean verifyMaterializedBatch(
+            Transaction tx,
+            MutationBatch batch,
+            BatchInstall plan,
+            Set<Long> coveredFiles) throws Exception {
+        if (plan.getRowCount() != batch.getRowCount()
+                || plan.getCommitTimestamp() != tx.getCommitTimestamp()
+                || !plan.getDigest().equals(ByteString.copyFrom(batch.getDigest()))) {
+            throw new IOException("Checkpoint batch identity mismatch");
+        }
+        List<byte[][]> decoded = rows(tx, batch);
+        int rowOffset = 0;
+        for (BufferSpan span : plan.getSpansList()) {
+            if (span.getRowIdStart() != plan.getRowIdStart() + rowOffset
+                    || rowOffset + span.getRowCount() > decoded.size()) {
+                throw new IOException("Checkpoint span is incomplete or misaligned");
+            }
+            List<Long> rowIds = new ArrayList<>(span.getRowCount());
+            for (int i = 0; i < span.getRowCount(); i++) {
+                rowIds.add(span.getRowIdStart() + i);
+            }
+            List<IndexProto.RowLocation> locations =
+                    indexes.lookupRowLocations(tx.getTable().getTableId(), rowIds);
+            if (locations.size() != rowIds.size()) {
+                throw new IOException("MainIndex checkpoint lookup lost positional alignment");
+            }
+            for (int i = 0; i < locations.size(); i++) {
+                IndexProto.RowLocation location = locations.get(i);
+                if (location == null) {
+                    throw new IOException("MainIndex row is missing at checkpoint");
+                }
+                File file = metadata.getFileById(location.getFileId());
+                if (file == null || file.getType() != File.Type.REGULAR) {
+                    return false;
+                }
+                coveredFiles.add(location.getFileId());
+                verifyBusinessIndexes(tx, decoded.get(rowOffset + i), rowIds.get(i), location);
+            }
+            rowOffset += span.getRowCount();
+        }
+        if (rowOffset != decoded.size()) {
+            throw new IOException("Installation plan is not complete enough to checkpoint");
+        }
+        return true;
+    }
+
+    private void verifyBusinessIndexes(
+            Transaction tx, byte[][] row, long rowId, IndexProto.RowLocation location)
+            throws Exception {
+        for (TableIndex index : tx.getTable().getIndexesList()) {
+            ByteString encoded = IngestRows.indexKey(index, row);
+            IndexProto.IndexKey key = IndexProto.IndexKey.newBuilder()
+                    .setTableId(tx.getTable().getTableId())
+                    .setIndexId(index.getId())
+                    .setKey(encoded)
+                    .setTimestamp(tx.getCommitTimestamp())
+                    .build();
+            IndexOption option = IndexOption.builder()
+                    .vNodeId(IndexUtils.getBucketIdFromByteBuffer(encoded)).build();
+            if (index.getPrimary()) {
+                if (!location.equals(indexes.lookupUniqueIndex(key, option))) {
+                    throw new IOException("Primary business index is not checkpoint-ready for row " + rowId);
+                }
+            } else {
+                List<IndexProto.RowLocation> members = indexes.lookupNonUniqueIndex(key, option);
+                if (members == null || !members.contains(location)) {
+                    throw new IOException("Secondary business index is not checkpoint-ready for row " + rowId);
+                }
+            }
+        }
+    }
+
+    private void verifyCheckpointRows(TransactionCheckpoint checkpoint) throws Exception {
+        Set<Long> files = new HashSet<>();
+        for (RowIdRange range : checkpoint.getRowRangesList()) {
+            List<Long> rowIds = new ArrayList<>(range.getRowCount());
+            for (int i = 0; i < range.getRowCount(); i++) {
+                rowIds.add(range.getRowIdStart() + i);
+            }
+            List<IndexProto.RowLocation> locations =
+                    indexes.lookupRowLocations(checkpoint.getTableId(), rowIds);
+            if (locations.size() != rowIds.size() || locations.contains(null)) {
+                throw new IOException("Checkpointed MainIndex rows are missing");
+            }
+            for (IndexProto.RowLocation location : locations) {
+                File file = metadata.getFileById(location.getFileId());
+                if (file == null || file.getType() != File.Type.REGULAR) {
+                    throw new IOException("Checkpointed row points outside REGULAR storage");
+                }
+                files.add(location.getFileId());
+            }
+        }
+        if (!resources.isIngestRecoveryCheckpointDurable(
+                checkpoint.getCommitTimestamp(), files)) {
+            throw new IOException("Published recovery checkpoint no longer covers installation checkpoint");
+        }
     }
 
     @Override

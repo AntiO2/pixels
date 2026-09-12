@@ -22,6 +22,7 @@ service IngestParticipantService {
   rpc Seal(StreamSeal) returns (StreamSeal);
   rpc Prepare(ParticipantRequest) returns (PrepareToken);
   rpc Install(ParticipantRequest) returns (google.protobuf.Empty);
+  rpc Checkpoint(TransactionId) returns (google.protobuf.Empty);
   rpc Discard(TransactionId) returns (google.protobuf.Empty);
   rpc PinRead(ReadPin) returns (ReadPin);
   rpc RenewRead(ReadPin) returns (ReadPin);
@@ -121,12 +122,23 @@ message ParticipantRequest { Transaction transaction = 1; string owner = 2; }
 message OwnerRequest { string owner = 1; }
 message TransactionList { repeated Transaction transactions = 1; uint64 published_timestamp = 2; }
 message Publication { uint64 published_timestamp = 1; repeated Route routes = 2; }
+message TerminalTransaction {
+  uint64 transaction_id = 1;
+  string request_id = 2;
+  uint64 read_timestamp = 3;
+  uint64 commit_timestamp = 4;
+  TransactionState state = 5;
+  TableSpec table = 6;
+  uint64 retired_at_millis = 7;
+}
 message CoordinatorSnapshot {
   uint32 version = 1;
   uint64 published_timestamp = 2;
   uint64 last_commit_timestamp = 3;
   repeated Transaction transactions = 4;
   repeated Route routes = 5;
+  repeated TerminalTransaction terminal_transactions = 6;
+  uint64 retired_transaction_id_high_watermark = 7;
 }
 message ReadPin {
   uint64 transaction_id = 1;
@@ -157,4 +169,20 @@ message BatchInstall {
   bytes digest = 6;
   repeated BufferSpan spans = 7;
 }
-message InstallationSnapshot { uint32 version = 1; repeated BatchInstall batches = 2; }
+message RowIdRange { uint64 row_id_start = 1; uint32 row_count = 2; }
+// Durable handoff after file, MainIndex, business indexes and visibility are recoverable
+// without the transaction-private payload or its per-batch installation plan.
+message TransactionCheckpoint {
+  uint64 transaction_id = 1;
+  uint64 commit_timestamp = 2;
+  uint64 table_id = 3;
+  bytes table_fingerprint = 4;
+  reserved 5; // v1 stored full BatchInstall messages here
+  repeated RowIdRange row_ranges = 6;
+  repeated uint64 file_ids = 7;
+}
+message InstallationSnapshot {
+  uint32 version = 1;
+  repeated BatchInstall batches = 2;
+  repeated TransactionCheckpoint checkpoints = 3;
+}

@@ -94,6 +94,21 @@ public final class IngestParticipantRpc
     }
 
     @Override
+    public void checkpoint(TransactionId r, StreamObserver<Empty> o) {
+        try {
+            target.checkpoint(r.getTransactionId());
+            o.onNext(Empty.getDefaultInstance());
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
     public void discard(TransactionId r, StreamObserver<Empty> o) {
         try {
             target.discard(r.getTransactionId());

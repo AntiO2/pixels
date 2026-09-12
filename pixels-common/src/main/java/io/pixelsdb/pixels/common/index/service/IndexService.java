@@ -27,6 +27,7 @@ import io.pixelsdb.pixels.index.IndexProto;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 public interface IndexService
 {
@@ -280,6 +281,26 @@ public interface IndexService
                 "putMainIndexEntriesOnly is not supported by this IndexService scheme");
     }
 
+    default List<IndexProto.PrimaryIndexEntry> getMainIndexEntriesForFiles(
+            long tableId, Set<Long> fileIds) throws IndexException
+    {
+        throw new UnsupportedOperationException(
+                "getMainIndexEntriesForFiles is not supported by this IndexService scheme");
+    }
+
+    default void relocateMainIndexEntries(long tableId, Set<Long> expectedOldFileIds,
+            List<IndexProto.PrimaryIndexEntry> entries) throws IndexException
+    {
+        throw new UnsupportedOperationException(
+                "relocateMainIndexEntries is not supported by this IndexService scheme");
+    }
+
+    default void deleteMainIndexEntriesForFile(long tableId, long fileId) throws IndexException
+    {
+        throw new UnsupportedOperationException(
+                "deleteMainIndexEntriesForFile is not supported by this IndexService scheme");
+    }
+
     /**
      * Write IndexKey -> rowId entries into the primary single point index.
      *
@@ -365,4 +386,3 @@ public interface IndexService
                 "deleteMainIndexRange is not supported by this IndexService scheme");
     }
 }
-

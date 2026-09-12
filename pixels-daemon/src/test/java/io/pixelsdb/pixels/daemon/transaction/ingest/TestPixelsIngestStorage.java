@@ -32,6 +32,7 @@ import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.core.*;
+import io.pixelsdb.pixels.core.encoding.EncodingLevel;
 import io.pixelsdb.pixels.core.ingest.IngestTables;
 import io.pixelsdb.pixels.core.reader.*;
 import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
@@ -95,19 +96,42 @@ public class TestPixelsIngestStorage {
                             .build();
         }
 
+        private MetadataProto.Table table() {
+            return MetadataProto.Table.newBuilder()
+                    .setId(73).setName("t").setType("user").setSchemaId(1)
+                    .setStorageScheme("file").build();
+        }
+
+        public void getSchemas(
+                MetadataProto.GetSchemasRequest r,
+                StreamObserver<MetadataProto.GetSchemasResponse> o) {
+            reply(o, MetadataProto.GetSchemasResponse.newBuilder()
+                    .setHeader(ok(r.getHeader()))
+                    .addSchemas(MetadataProto.Schema.newBuilder().setId(1).setName("s"))
+                    .build());
+        }
+
+        public void getTables(
+                MetadataProto.GetTablesRequest r,
+                StreamObserver<MetadataProto.GetTablesResponse> o) {
+            reply(o, MetadataProto.GetTablesResponse.newBuilder()
+                    .setHeader(ok(r.getHeader())).addTables(table()).build());
+        }
+
+        public void getLayouts(
+                MetadataProto.GetLayoutsRequest r,
+                StreamObserver<MetadataProto.GetLayoutsResponse> o) {
+            reply(o, MetadataProto.GetLayoutsResponse.newBuilder()
+                    .setHeader(ok(r.getHeader())).addLayouts(layout).build());
+        }
+
         public void getTable(
                 MetadataProto.GetTableRequest r, StreamObserver<MetadataProto.GetTableResponse> o) {
             reply(
                     o,
                     MetadataProto.GetTableResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .setTable(
-                                    MetadataProto.Table.newBuilder()
-                                            .setId(73)
-                                            .setName("t")
-                                            .setType("user")
-                                            .setSchemaId(1)
-                                            .setStorageScheme("file"))
+                            .setTable(table())
                             .addLayouts(layout)
                             .build());
         }
@@ -147,6 +171,18 @@ public class TestPixelsIngestStorage {
                     MetadataProto.GetSinglePointIndicesResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
                             .build());
+        }
+
+        public void getPrimaryIndex(
+                MetadataProto.GetPrimaryIndexRequest r,
+                StreamObserver<MetadataProto.GetPrimaryIndexResponse> o) {
+            reply(o, MetadataProto.GetPrimaryIndexResponse.newBuilder()
+                    .setHeader(MetadataProto.ResponseHeader.newBuilder()
+                            .setToken(r.getHeader().getToken())
+                            .setErrorCode(io.pixelsdb.pixels.common.error.ErrorCode
+                                    .METADATA_SINGLE_POINT_INDEX_NOT_FOUND)
+                            .setErrorMsg("keyless test table").build())
+                    .build());
         }
 
         public void addFiles(
@@ -233,6 +269,28 @@ public class TestPixelsIngestStorage {
                             .setHeader(ok(r.getHeader()))
                             .build());
         }
+
+        public void atomicSwapFiles(
+                MetadataProto.AtomicSwapFilesRequest r,
+                StreamObserver<MetadataProto.AtomicSwapFilesResponse> o) {
+            MetadataProto.File replacement = files.get(r.getNewFileId());
+            if (replacement == null || !r.hasCleanupAt()) {
+                o.onError(Status.FAILED_PRECONDITION.asRuntimeException());
+                return;
+            }
+            files.put(r.getNewFileId(), replacement.toBuilder()
+                    .setType(MetadataProto.File.Type.REGULAR).clearCleanupAt().build());
+            for (long oldFileId : r.getOldFileIdsList()) {
+                MetadataProto.File old = files.get(oldFileId);
+                if (old != null) {
+                    files.put(oldFileId, old.toBuilder()
+                            .setType(MetadataProto.File.Type.RETIRED)
+                            .setCleanupAt(r.getCleanupAt()).build());
+                }
+            }
+            reply(o, MetadataProto.AtomicSwapFilesResponse.newBuilder()
+                    .setHeader(ok(r.getHeader())).build());
+        }
     }
 
     @Test
@@ -250,6 +308,9 @@ public class TestPixelsIngestStorage {
         changes.put("retina.enable", "true");
         changes.put("retina.ingest.enabled", "true");
         changes.put("retina.ingest.auth.secret.file", secret.toString());
+        changes.put("retina.ingest.coordinator.state.dir", root.resolve("config-decisions").toString());
+        changes.put("retina.ingest.participant.plan.dir", root.resolve("config-plans").toString());
+        changes.put("retina.ingest.participant.wal.dir", root.resolve("config-wal").toString());
         changes.put("retina.storage.gc.enabled", "false");
         changes.put("retina.buffer.memTable.size", "64");
         changes.put("retina.buffer.flush.count", "2");
@@ -296,6 +357,7 @@ public class TestPixelsIngestStorage {
         config.addProperty("node.server.port", Integer.toString(nodes.getPort()));
         PixelsWriteBuffer buffer = null;
         PixelsIngestInstaller installer = null;
+        Path planDirectory = Files.createDirectory(root.resolve("plans"));
         try {
             RetinaResourceManager resources = RetinaResourceManager.Instance();
             resources.getIngestReadPins().ready();
@@ -349,7 +411,7 @@ public class TestPixelsIngestStorage {
             installer =
                     new PixelsIngestInstaller(
                             new AtomicStateFile(
-                                    Files.createDirectory(root.resolve("plans")), 16 * 1024 * 1024),
+                                    planDirectory, 16 * 1024 * 1024),
                             new IngestOptions(),
                             "127.0.0.1:18890",
                             resources,
@@ -471,6 +533,133 @@ public class TestPixelsIngestStorage {
             assertEquals(256, materialized);
             assertEquals(4, bufferedRows(buffer));
             assertEquals(260, materialized + bufferedRows(buffer));
+
+            List<RecoveryCheckpoint.VisibilityEntry> checkpointVisibility = new ArrayList<>();
+            for (MetadataProto.File file : regular) {
+                checkpointVisibility.add(new RecoveryCheckpoint.VisibilityEntry(
+                        file.getId(), 0, 1, 201, new long[0]));
+            }
+            resources.adoptRecoveryCheckpoint(
+                    RecoveryCheckpoint.Body.builder()
+                            .retinaNodeId("test")
+                            .writeTimeMs(System.currentTimeMillis())
+                            .checkpointAppliedTs(201)
+                            .virtualNodesPerNode(1)
+                            .rgEntries(checkpointVisibility)
+                            .build());
+            Transaction published = tx.toBuilder().setState(TransactionState.PUBLISHED).build();
+            assertTrue(installer.checkpoint(published, Collections.singletonList(batch)));
+            assertTrue(installer.recoveredByCheckpoint(published));
+
+            // Rewrite one real Pixels file from this INSERT. Stable rowIds move only in
+            // MainIndex; this keyless table has no business index to synthesize.
+            MetadataProto.File rewriteSource = regular.stream()
+                    .min(Comparator.comparingLong(MetadataProto.File::getId)).orElseThrow(AssertionError::new);
+            long sourceFileId = rewriteSource.getId();
+            String sourcePath = root.resolve("ordered").resolve(rewriteSource.getName()).toUri().toString();
+            Set<Long> originalRegularIds = new HashSet<>();
+            regular.forEach(f -> originalRegularIds.add(f.getId()));
+            List<IndexProto.PrimaryIndexEntry> sourceEntries =
+                    delegate.getMainIndexEntriesForFiles(73, Collections.singleton(sourceFileId));
+            assertFalse(sourceEntries.isEmpty());
+            int deleteCount = sourceEntries.size() / 2 + 1;
+            Map<String, long[]> gcBitmaps = new HashMap<>();
+            Set<Long> deletedRowIds = new HashSet<>();
+            for (int i = 0; i < deleteCount; i++) {
+                IndexProto.PrimaryIndexEntry entry = sourceEntries.get(i);
+                IndexProto.RowLocation location = entry.getRowLocation();
+                resources.deleteRecord(location, 202);
+                deletedRowIds.add(entry.getRowId());
+                String rgKey = io.pixelsdb.pixels.common.utils.RetinaUtils.buildRgKey(
+                        sourceFileId, location.getRgId());
+                long[] words = gcBitmaps.computeIfAbsent(rgKey,
+                        ignored -> new long[(sourceEntries.size() + 63) / 64]);
+                words[location.getRgRowOffset() >>> 6] |=
+                        1L << (location.getRgRowOffset() & 63);
+            }
+            Map<Long, long[]> fileStats = Collections.singletonMap(
+                    sourceFileId, new long[] {sourceEntries.size(), deleteCount});
+            StorageGcWal gcWal = new StorageGcWal();
+            Constructor<StorageGarbageCollector> gcConstructor =
+                    StorageGarbageCollector.class.getDeclaredConstructor(
+                            RetinaResourceManager.class, MetadataService.class, IndexService.class,
+                            double.class, long.class, int.class, int.class, int.class,
+                            EncodingLevel.class, long.class, StorageGcWal.class);
+            gcConstructor.setAccessible(true);
+            StorageGarbageCollector storageGc = gcConstructor.newInstance(
+                    resources, MetadataService.Instance(), delegate, 0.5, 134_217_728L,
+                    16, 10, 1_048_576, EncodingLevel.EL2, 0L, gcWal);
+            Method runStorageGc = StorageGarbageCollector.class.getDeclaredMethod(
+                    "runStorageGC", long.class, Map.class, Map.class);
+            runStorageGc.setAccessible(true);
+
+            ReadPin gcRead = resources.getIngestReadPins().pin(ReadPin.newBuilder()
+                    .setTransactionId(199).setReadTimestamp(201).build());
+            runStorageGc.invoke(storageGc, 202L, fileStats, copyBitmaps(gcBitmaps));
+            assertEquals(MetadataProto.File.Type.REGULAR, catalog.files.get(sourceFileId).getType(),
+                    "A fixed ReadView must prevent the file-set switch");
+            assertEquals(2, catalog.files.values().stream()
+                    .filter(f -> f.getType() == MetadataProto.File.Type.REGULAR).count());
+            resources.getIngestReadPins().release(gcRead);
+
+            runStorageGc.invoke(storageGc, 202L, fileStats, copyBitmaps(gcBitmaps));
+            assertEquals(MetadataProto.File.Type.RETIRED, catalog.files.get(sourceFileId).getType());
+            MetadataProto.File replacement = catalog.files.values().stream()
+                    .filter(f -> f.getType() == MetadataProto.File.Type.REGULAR)
+                    .filter(f -> !originalRegularIds.contains(f.getId()))
+                    .findFirst().orElseThrow(AssertionError::new);
+            long replacementId = replacement.getId();
+            String replacementPath = root.resolve("ordered")
+                    .resolve(replacement.getName()).toUri().toString();
+            assertEquals(sourceEntries.size() - deleteCount, countRows(replacementPath));
+            for (IndexProto.PrimaryIndexEntry entry : sourceEntries) {
+                IndexProto.RowLocation location = MainIndexFactory.Instance()
+                        .getMainIndex(73).getLocation(entry.getRowId());
+                assertNotNull(location);
+                if (!deletedRowIds.contains(entry.getRowId())) {
+                    assertEquals(replacementId, location.getFileId());
+                }
+            }
+
+            Set<Long> checkpointFiles = new HashSet<>();
+            catalog.files.values().stream()
+                    .filter(f -> f.getType() == MetadataProto.File.Type.REGULAR)
+                    .forEach(f -> checkpointFiles.add(f.getId()));
+            new StorageGcWal.RecoveryHandler(gcWal, MetadataService.Instance(), delegate)
+                    .recover(checkpointFiles);
+            Thread.sleep(2);
+            resources.processRetiredFiles();
+            assertFalse(catalog.files.containsKey(sourceFileId));
+            assertFalse(StorageFactory.Instance().getStorage(sourcePath).exists(sourcePath));
+            for (long deletedRowId : deletedRowIds) {
+                assertNull(MainIndexFactory.Instance().getMainIndex(73).getLocation(deletedRowId));
+            }
+            MainIndexFactory.Instance().closeIndex(73, false);
+            for (IndexProto.PrimaryIndexEntry entry : sourceEntries) {
+                IndexProto.RowLocation location = MainIndexFactory.Instance()
+                        .getMainIndex(73).getLocation(entry.getRowId());
+                if (deletedRowIds.contains(entry.getRowId())) {
+                    assertNull(location);
+                } else {
+                    assertNotNull(location);
+                    assertEquals(replacementId, location.getFileId());
+                }
+            }
+            List<String> terminalGcTasks = gcWal.listTerminalTasks().stream()
+                    .map(StorageGcWal.Task::getTaskId).collect(java.util.stream.Collectors.toList());
+            assertEquals(1, terminalGcTasks.size());
+            gcWal.deleteTerminalTasks(terminalGcTasks);
+            assertTrue(gcWal.listAllTasks().isEmpty(), "Checkpointed rewrite WAL must be removable");
+
+            installer.close();
+            installer = new PixelsIngestInstaller(
+                    new AtomicStateFile(planDirectory, 16 * 1024 * 1024),
+                    new IngestOptions(), "127.0.0.1:18890", resources, index,
+                    MetadataService.Instance());
+            Transaction publishedNext = next.toBuilder().setState(TransactionState.PUBLISHED).build();
+            installer.initializeRecovery(Collections.singletonList(publishedNext));
+            assertFalse(installer.recoveredByCheckpoint(published),
+                    "Coordinator absence is the durable acknowledgement that prunes this checkpoint");
         } finally {
             if (installer != null) {
                 installer.close();
@@ -487,6 +676,29 @@ public class TestPixelsIngestStorage {
                         }
                     });
         }
+    }
+
+    private static Map<String, long[]> copyBitmaps(Map<String, long[]> source) {
+        Map<String, long[]> copy = new HashMap<>();
+        source.forEach((key, value) -> copy.put(key, value.clone()));
+        return copy;
+    }
+
+    private static int countRows(String path) throws Exception {
+        int rows = 0;
+        try (PixelsReader reader = PixelsReaderImpl.newBuilder()
+                .setStorage(StorageFactory.Instance().getStorage(path))
+                .setPath(path).setPixelsFooterCache(new PixelsFooterCache()).build()) {
+            PixelsReaderOption option = new PixelsReaderOption();
+            option.includeCols(new String[] {"v"});
+            try (PixelsRecordReader records = reader.read(option)) {
+                VectorizedRowBatch batch;
+                while ((batch = records.readBatch()) != null && batch.size > 0) {
+                    rows += batch.size;
+                }
+            }
+        }
+        return rows;
     }
 
     static long readBuffered(RetinaResourceManager resources, Path root, long timestamp)

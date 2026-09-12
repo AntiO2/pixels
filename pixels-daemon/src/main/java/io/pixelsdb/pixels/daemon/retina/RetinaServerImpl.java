@@ -32,6 +32,7 @@ import io.pixelsdb.pixels.common.index.IndexOption;
 import io.pixelsdb.pixels.common.index.ResolvedPrimary;
 import io.pixelsdb.pixels.common.index.service.IndexService;
 import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
+import io.pixelsdb.pixels.common.ingest.rpc.IngestOptions;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.*;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
@@ -47,7 +48,6 @@ import io.pixelsdb.pixels.retina.RetinaProto;
 import io.pixelsdb.pixels.retina.RetinaProto.RetinaState;
 import io.pixelsdb.pixels.retina.RetinaResourceManager;
 import io.pixelsdb.pixels.retina.RetinaWorkerServiceGrpc;
-import io.pixelsdb.pixels.retina.StorageGcWal;
 import java.lang.management.ManagementFactory;
 import java.util.*;
 import java.util.concurrent.Executors;
@@ -71,6 +71,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     private final MetadataService metadataService;
     private final IndexService indexService;
     private final RetinaResourceManager retinaResourceManager;
+    private final boolean transactionalIngestEnabled;
     private final Striped<Lock> updateLocks = Striped.lock(1024);
     private volatile RetinaStatus status;
     private volatile Runnable readyListener;
@@ -92,6 +93,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         this.metadataService = requireNonNull(metadataService, "metadataService is null");
         this.indexService = requireNonNull(indexService, "indexService is null");
         this.retinaResourceManager = requireNonNull(retinaResourceManager, "retinaResourceManager is null");
+        this.transactionalIngestEnabled = new IngestOptions().enabled;
 
         int totalBuckets = Integer.parseInt(ConfigFactory.Instance().getProperty("index.bucket.num"));
         this.indexOptionPool = new IndexOption[totalBuckets];
@@ -105,6 +107,9 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         {
             RecoveryContext recoveryContext = prepareRecoveryContext();
             RecoveryResult recoveryResult = recoverRetinaState(recoveryContext);
+            this.retinaResourceManager.adoptRecoveryCheckpoint(
+                    recoveryContext.loadedCheckpoint == null
+                            ? null : recoveryContext.loadedCheckpoint.body);
             initializeRecoveredResources();
             publishStartupLifecycle(recoveryContext, recoveryResult);
             startRetinaMetricsLogThread();
@@ -163,14 +168,8 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             expectedVnodes.add(i);
         }
 
-        StorageGcWal storageGcWal = retinaResourceManager.getStorageGcWal();
-        StorageGcWal.RecoveryHandler storageGcWalRecoveryHandler = new StorageGcWal.RecoveryHandler(
-                storageGcWal, metadataService, indexService);
-
         return new RecoveryContext(
                 recoveryEpoch,
-                storageGcWal,
-                storageGcWalRecoveryHandler,
                 recoveryCheckpoint.load(),
                 expectedVnodes);
     }
@@ -180,7 +179,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         LoadedCheckpoint loaded = context.loadedCheckpoint;
         if (loaded == null)
         {
-            context.storageGcWalRecoveryHandler.recover(Collections.emptySet());
+            retinaResourceManager.recoverStorageGc(Collections.emptySet());
             try
             {
                 if (!metadataService.getFilesByType(EnumSet.of(File.Type.REGULAR)).isEmpty())
@@ -261,7 +260,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             recoverableFileIds.add(fileId);
         }
 
-        context.storageGcWalRecoveryHandler.recover(recoverableFileIds);
+        retinaResourceManager.recoverStorageGc(recoverableFileIds);
 
         for (VisibilityEntry ve : validRgEntries)
         {
@@ -278,7 +277,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         Set<Long> pendingJournalFileIds;
         try
         {
-            pendingJournalFileIds = context.storageGcWal.collectPendingFileIds();
+            pendingJournalFileIds = retinaResourceManager.getStorageGcRecoveryProtectedFiles();
         }
         catch (RuntimeException e)
         {
@@ -337,17 +336,11 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         // Clean up terminal tasks related to this checkpoint to prevent blocking future recoveries
         try
         {
-            List<StorageGcWal.Task> terminalTasks = context.storageGcWal.listTerminalTasks();
-            if (!terminalTasks.isEmpty())
+            int cleanedTasks = retinaResourceManager.cleanupTerminalStorageGcTasks();
+            if (cleanedTasks > 0)
             {
-                List<String> tasksToDelete = new ArrayList<>(terminalTasks.size());
-                for (StorageGcWal.Task task : terminalTasks)
-                {
-                    tasksToDelete.add(task.getTaskId());
-                }
-                context.storageGcWal.deleteTerminalTasks(tasksToDelete);
                 logger.info("Cleaned up {} terminal Storage GC WAL tasks after checkpoint ts={}",
-                        tasksToDelete.size(), body.getCheckpointAppliedTs());
+                        cleanedTasks, body.getCheckpointAppliedTs());
             }
         }
         catch (Exception e)
@@ -397,20 +390,14 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     private static final class RecoveryContext
     {
         final String recoveryEpoch;
-        final StorageGcWal storageGcWal;
-        final StorageGcWal.RecoveryHandler storageGcWalRecoveryHandler;
         final LoadedCheckpoint loadedCheckpoint;
         final Set<Integer> expectedVnodes;
 
         RecoveryContext(String recoveryEpoch,
-                        StorageGcWal storageGcWal,
-                        StorageGcWal.RecoveryHandler storageGcWalRecoveryHandler,
                         LoadedCheckpoint loadedCheckpoint,
                         Set<Integer> expectedVnodes)
         {
             this.recoveryEpoch = recoveryEpoch;
-            this.storageGcWal = storageGcWal;
-            this.storageGcWalRecoveryHandler = storageGcWalRecoveryHandler;
             this.loadedCheckpoint = loadedCheckpoint;
             this.expectedVnodes = expectedVnodes;
         }
@@ -953,6 +940,11 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
      */
     private void processUpdateRequest(RetinaProto.UpdateRecordRequest request) throws RetinaException, IndexException
     {
+        if (transactionalIngestEnabled)
+        {
+            throw new RetinaException(
+                    "Legacy Retina mutation RPC is disabled after transactional ingest cutover");
+        }
         String schemaName = request.getSchemaName();
         List<RetinaProto.TableUpdateData> tableUpdateDataList = request.getTableUpdateDataList();
         int virtualNodeId = request.getVirtualNodeId();

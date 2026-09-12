@@ -36,8 +36,18 @@ public final class IngestAuth {
         String path = IngestOptions.property("retina.ingest.auth.secret.file", "");
         if (path.isEmpty()) throw new IOException("Ingest credential file required");
         byte[] b = Files.readAllBytes(Paths.get(path));
-        if (b.length < 24 || b.length > 4096) throw new IOException("Invalid credential length");
-        return new String(b, StandardCharsets.UTF_8).trim();
+        String secret = new String(b, StandardCharsets.UTF_8).trim();
+        byte[] normalized = secret.getBytes(StandardCharsets.UTF_8);
+        if (normalized.length < 24 || normalized.length > 4096) {
+            throw new IOException("Invalid credential length after trimming whitespace");
+        }
+        for (int i = 0; i < secret.length(); i++) {
+            char c = secret.charAt(i);
+            if (c < 0x21 || c > 0x7e) {
+                throw new IOException("Ingest credential must contain visible ASCII characters only");
+            }
+        }
+        return secret;
     }
 
     public static ClientInterceptor client(String secret) {

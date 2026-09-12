@@ -27,9 +27,16 @@ import io.pixelsdb.pixels.ingest.IngestProto.*;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 /** Exact stream receipts, authoritative decisions, and private preparation around existing Retina storage. */
 public final class RetinaIngestParticipant implements Closeable {
+    private static final Logger LOG = LogManager.getLogger(RetinaIngestParticipant.class);
     public interface Decisions {
         Transaction get(long id) throws Exception;
 
@@ -47,6 +54,15 @@ public final class RetinaIngestParticipant implements Closeable {
         void release(long txId) throws Exception;
 
         void initializeRecovery(List<Transaction> transactions) throws Exception;
+
+        default boolean recoveredByCheckpoint(Transaction tx) throws Exception {
+            return false;
+        }
+
+        default boolean checkpoint(Transaction tx, Iterable<MutationBatch> batches)
+                throws Exception {
+            return false;
+        }
     }
 
     private final String owner;
@@ -58,6 +74,14 @@ public final class RetinaIngestParticipant implements Closeable {
     private final Set<Long> installed = new HashSet<>();
     private long lastInstalledTimestamp;
     private boolean ready;
+    private final ScheduledExecutorService checkpointWorker =
+            Executors.newSingleThreadScheduledExecutor(
+                    runnable -> {
+                        Thread thread = new Thread(runnable, "pixels-ingest-checkpoint");
+                        thread.setDaemon(true);
+                        return thread;
+                    });
+    private final AtomicBoolean checkpointWorkerStarted = new AtomicBoolean();
 
     public RetinaIngestParticipant(
             String owner,
@@ -203,6 +227,11 @@ public final class RetinaIngestParticipant implements Closeable {
         if (installed.contains(tx.getTransactionId())) {
             return;
         }
+        if (recovering && installer.recoveredByCheckpoint(tx)) {
+            installed.add(tx.getTransactionId());
+            lastInstalledTimestamp = Math.max(lastInstalledTimestamp, tx.getCommitTimestamp());
+            return;
+        }
         if (tx.getCommitTimestamp() < lastInstalledTimestamp) {
             throw new IOException("Commit installation order violation");
         }
@@ -260,6 +289,59 @@ public final class RetinaIngestParticipant implements Closeable {
         }
         ready = true;
         readPins.ready();
+        startCheckpointWorker();
+    }
+
+    private void startCheckpointWorker() {
+        if (!checkpointWorkerStarted.compareAndSet(false, true)) {
+            return;
+        }
+        checkpointWorker.scheduleWithFixedDelay(
+                () -> {
+                    try {
+                        checkpointPublishedTransactions();
+                    } catch (Exception e) {
+                        // File publication and RecoveryCheckpoint advancement are asynchronous.
+                        // The next pass retries without weakening recovery ownership.
+                        LOG.debug("Ingest checkpoint is not ready; retrying: {}", e.toString());
+                    }
+                }, 1, 1, TimeUnit.SECONDS);
+    }
+
+    synchronized void checkpointPublishedTransactions() throws Exception {
+        if (!ready) {
+            return;
+        }
+        List<Transaction> transactions = decisions.list(owner).getTransactionsList();
+        for (Transaction tx : transactions) {
+            if (tx.getState() != TransactionState.PUBLISHED
+                    || !installed.contains(tx.getTransactionId())) {
+                continue;
+            }
+            if (installer.recoveredByCheckpoint(tx)) {
+                journal.compactCheckpointedTransactions(
+                        Collections.singleton(tx.getTransactionId()));
+                continue;
+            }
+            if (installer.checkpoint(tx, batches(tx))) {
+                journal.compactCheckpointedTransactions(
+                        Collections.singleton(tx.getTransactionId()));
+            }
+        }
+    }
+
+    public synchronized void checkpoint(long transactionId) throws Exception {
+        serving();
+        Transaction tx = decisions.get(transactionId);
+        if (tx.getState() != TransactionState.PUBLISHED
+                || !installed.contains(transactionId)) {
+            throw new IOException("Transaction is not installed and PUBLISHED");
+        }
+        if (!installer.recoveredByCheckpoint(tx)
+                && !installer.checkpoint(tx, batches(tx))) {
+            throw new IOException("Transaction recovery checkpoint is not durable yet");
+        }
+        journal.compactCheckpointedTransactions(Collections.singleton(transactionId));
     }
 
     public synchronized ReadPin pinRead(ReadPin request) throws Exception {
@@ -281,6 +363,7 @@ public final class RetinaIngestParticipant implements Closeable {
     @Override
     public synchronized void close() throws IOException {
         ready = false;
+        checkpointWorker.shutdownNow();
         try {
             installer.close();
         } finally {

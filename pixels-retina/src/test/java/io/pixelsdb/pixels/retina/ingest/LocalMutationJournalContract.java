@@ -268,7 +268,7 @@ public final class LocalMutationJournalContract
                     journal.seal(seal(a));
                 }
             }
-            try (Stream<Path> files = Files.list(dir)) { check(files.count() == 2, "Created per-SQL staging files"); }
+            try (Stream<Path> files = Files.list(dir)) { check(files.filter(path -> path.getFileName().toString().endsWith(".wal")).count() == 1, "Created per-SQL staging WALs"); }
             try (LocalMutationJournal journal = open(dir))
             {
                 for (int tx = 20; tx < 84; tx++)

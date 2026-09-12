@@ -273,6 +273,9 @@ public final class SqlIngestFixture implements AutoCloseable {
         settings.put("retina.enable", "true");
         settings.put("retina.ingest.enabled", "true");
         settings.put("retina.ingest.auth.secret.file", secretFile.toString());
+        settings.put("retina.ingest.coordinator.state.dir", root.resolve("decisions").toString());
+        settings.put("retina.ingest.participant.plan.dir", root.resolve("plans").toString());
+        settings.put("retina.ingest.participant.wal.dir", root.resolve("wal").toString());
         settings.put("retina.storage.gc.enabled", "false");
         settings.put("retina.buffer.memTable.size", "64");
         settings.put("retina.buffer.flush.count", "2");
