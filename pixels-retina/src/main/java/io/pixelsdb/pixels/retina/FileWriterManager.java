@@ -270,12 +270,13 @@ public class FileWriterManager
                 ObjectStorageManager objectStorageManager = ObjectStorageManager.Instance();
                 for (long blockId = firstBlockId; blockId <= lastBlockId; ++blockId)
                 {
-                    /*
-                     * Issue-1083: Since we obtain a read-only ByteBuffer from the S3 Reader,
-                     * we cannot read a byte[]. Instead, we should return the ByteBuffer directly.
-                     */
+                    // ObjectStorageManager returns an owned buffer that remains valid after
+                    // its PhysicalReader closes, including LocalFS direct/mapped readers.
                     ByteBuffer data = objectStorageManager.read(this.tableId, virtualNodeId, blockId);
-                    this.writer.addRowBatch(VectorizedRowBatch.deserialize(data));
+                    try (VectorizedRowBatch batch = VectorizedRowBatch.deserialize(data))
+                    {
+                        this.writer.addRowBatch(batch);
+                    }
                 }
             }
             this.writer.close();

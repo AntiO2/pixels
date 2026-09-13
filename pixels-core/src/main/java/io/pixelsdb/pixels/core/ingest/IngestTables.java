@@ -79,7 +79,11 @@ public final class IngestTables {
                             .setName(column.getName())
                             .setType(column.getType()));
         }
-        for (SinglePointIndex index : m.getSinglePointIndices(table.getId())) {
+        List<SinglePointIndex> indexes = m.getSinglePointIndices(table.getId());
+        if (indexes == null) {
+            indexes = Collections.emptyList();
+        }
+        for (SinglePointIndex index : indexes) {
             TableIndex.Builder x =
                     TableIndex.newBuilder()
                             .setId(index.getId())

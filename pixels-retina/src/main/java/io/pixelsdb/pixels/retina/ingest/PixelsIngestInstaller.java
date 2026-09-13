@@ -502,58 +502,63 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                             tx.getTable().getSchemaName(),
                             tx.getTable().getTableName(),
                             route.getVirtualNodeId());
-            String batchKey = IngestWire.batchKey(batch.getStreamId(), batch.getSequence());
-            BatchInstall plan = plans.get(batchKey);
-            if (plan == null) {
-                IndexProto.RowIdBatch allocation =
-                        indexes.allocateRowIdBatch(tx.getTable().getTableId(), batch.getRowCount());
-                if (allocation == null
-                        || allocation.getLength() < batch.getRowCount()
-                        || allocation.getRowIdStart() < 0) {
-                    throw new IOException("Existing row allocator returned an insufficient range");
+            buffer.beginInstallation();
+            try {
+                String batchKey = IngestWire.batchKey(batch.getStreamId(), batch.getSequence());
+                BatchInstall plan = plans.get(batchKey);
+                if (plan == null) {
+                    IndexProto.RowIdBatch allocation =
+                            indexes.allocateRowIdBatch(tx.getTable().getTableId(), batch.getRowCount());
+                    if (allocation == null
+                            || allocation.getLength() < batch.getRowCount()
+                            || allocation.getRowIdStart() < 0) {
+                        throw new IOException("Existing row allocator returned an insufficient range");
+                    }
+                    Math.addExact(allocation.getRowIdStart(), batch.getRowCount() - 1L);
+                    plan =
+                            BatchInstall.newBuilder()
+                                    .setStream(IngestWire.encode(batch.getStreamId()))
+                                    .setSequence(batch.getSequence())
+                                    .setCommitTimestamp(tx.getCommitTimestamp())
+                                    .setRowIdStart(allocation.getRowIdStart())
+                                    .setRowCount(batch.getRowCount())
+                                    .setDigest(ByteString.copyFrom(batch.getDigest()))
+                                    .build();
+                    save(plan);
                 }
-                Math.addExact(allocation.getRowIdStart(), batch.getRowCount() - 1L);
-                plan =
-                        BatchInstall.newBuilder()
-                                .setStream(IngestWire.encode(batch.getStreamId()))
-                                .setSequence(batch.getSequence())
-                                .setCommitTimestamp(tx.getCommitTimestamp())
-                                .setRowIdStart(allocation.getRowIdStart())
-                                .setRowCount(batch.getRowCount())
-                                .setDigest(ByteString.copyFrom(batch.getDigest()))
-                                .build();
-                save(plan);
-            }
-            if (plan.getCommitTimestamp() != tx.getCommitTimestamp()
-                    || plan.getRowCount() != batch.getRowCount()
-                    || !plan.getDigest().equals(ByteString.copyFrom(batch.getDigest()))) {
-                throw new IOException("Batch installation identity mismatch");
-            }
-            int offset = 0;
-            for (BufferSpan span : plan.getSpansList()) {
-                installSpan(
-                        tx,
-                        route,
-                        buffer,
-                        span,
-                        rows.subList(offset, offset + span.getRowCount()),
-                        recovering);
-                offset += span.getRowCount();
-            }
-            while (offset < rows.size()) {
-                BufferSpan span =
-                        buffer.planSpan(
-                                rows.size() - offset, Math.addExact(plan.getRowIdStart(), offset));
-                plan = plan.toBuilder().addSpans(span).build();
-                save(plan); // Assignments are durable before any corresponding shared row appears.
-                installSpan(
-                        tx,
-                        route,
-                        buffer,
-                        span,
-                        rows.subList(offset, offset + span.getRowCount()),
-                        false);
-                offset += span.getRowCount();
+                if (plan.getCommitTimestamp() != tx.getCommitTimestamp()
+                        || plan.getRowCount() != batch.getRowCount()
+                        || !plan.getDigest().equals(ByteString.copyFrom(batch.getDigest()))) {
+                    throw new IOException("Batch installation identity mismatch");
+                }
+                int offset = 0;
+                for (BufferSpan span : plan.getSpansList()) {
+                    installSpan(
+                            tx,
+                            route,
+                            buffer,
+                            span,
+                            rows.subList(offset, offset + span.getRowCount()),
+                            recovering);
+                    offset += span.getRowCount();
+                }
+                while (offset < rows.size()) {
+                    BufferSpan span =
+                            buffer.planSpan(
+                                    rows.size() - offset, Math.addExact(plan.getRowIdStart(), offset));
+                    plan = plan.toBuilder().addSpans(span).build();
+                    save(plan); // Assignments are durable before any corresponding shared row appears.
+                    installSpan(
+                            tx,
+                            route,
+                            buffer,
+                            span,
+                            rows.subList(offset, offset + span.getRowCount()),
+                            false);
+                    offset += span.getRowCount();
+                }
+            } finally {
+                buffer.endInstallation();
             }
         }
     }

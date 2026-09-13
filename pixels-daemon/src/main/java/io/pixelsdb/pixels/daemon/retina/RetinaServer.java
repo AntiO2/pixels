@@ -29,6 +29,7 @@ import io.pixelsdb.pixels.common.ingest.rpc.IngestOptions;
 import io.pixelsdb.pixels.common.ingest.wire.IngestWire;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.server.Server;
+import io.pixelsdb.pixels.common.utils.NetUtils;
 import io.pixelsdb.pixels.daemon.heartbeat.HeartbeatWorker;
 import io.pixelsdb.pixels.daemon.heartbeat.NodeStatus;
 import io.pixelsdb.pixels.ingest.IngestProto.OwnerRequest;
@@ -135,6 +136,12 @@ public class RetinaServer implements Server
                 if (ownerHost.isEmpty())
                 {
                     throw new IOException("retina.server.host is required for ingest owner identity");
+                }
+                String heartbeatHost = NetUtils.getLocalHostName();
+                if (!ownerHost.equals(heartbeatHost))
+                {
+                    throw new IOException("retina.server.host=" + ownerHost
+                            + " must match the Retina heartbeat identity " + heartbeatHost);
                 }
                 String owner = ownerHost + ":" + port;
                 String secret = IngestAuth.configuredSecret();

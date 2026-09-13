@@ -459,6 +459,11 @@ public class RetinaResourceManager
         this.recovering = recovering;
     }
 
+    public boolean isRecovering()
+    {
+        return this.recovering;
+    }
+
     public void addVisibility(long fileId, int rgId, int recordNum, long timestamp,
                               long[] bitmap, boolean overwrite)
     {

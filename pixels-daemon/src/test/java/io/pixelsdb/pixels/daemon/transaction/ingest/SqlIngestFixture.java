@@ -34,6 +34,11 @@ import java.util.concurrent.atomic.*;
  * topology service, and etcd-backed identity sources are deterministic fixtures.
  */
 public final class SqlIngestFixture implements AutoCloseable {
+    private static String benchmarkSetting(String name, String fallback) {
+        String value = System.getenv(name);
+        return value == null || value.trim().isEmpty() ? fallback : value.trim();
+    }
+
     private static <T> void reply(StreamObserver<T> observer, T value) {
         observer.onNext(value);
         observer.onCompleted();
@@ -326,6 +331,7 @@ public final class SqlIngestFixture implements AutoCloseable {
     private final RetinaIngestParticipant participant;
     private final List<PixelsWriteBuffer> buffers = new ArrayList<>();
     private final String owner;
+    private final boolean recoveryCheckpointEnabled;
     private final Map<String, String> exportedSettings = new LinkedHashMap<>();
     public final AtomicLong appendRpcCount = new AtomicLong();
     public final AtomicLong acceptedRows = new AtomicLong();
@@ -345,6 +351,8 @@ public final class SqlIngestFixture implements AutoCloseable {
             retinaPort = socket.getLocalPort();
         }
         owner = host + ":" + retinaPort;
+        recoveryCheckpointEnabled = Boolean.parseBoolean(
+                benchmarkSetting("PIXELS_SQL_FIXTURE_RECOVERY_CHECKPOINT", "false"));
         ConfigFactory config = ConfigFactory.Instance();
         Map<String, String> settings = exportedSettings;
         settings.put("retina.enable", "true");
@@ -354,8 +362,22 @@ public final class SqlIngestFixture implements AutoCloseable {
         settings.put("retina.ingest.participant.plan.dir", root.resolve("plans").toString());
         settings.put("retina.ingest.participant.wal.dir", root.resolve("wal").toString());
         settings.put("retina.storage.gc.enabled", "false");
-        settings.put("retina.buffer.memTable.size", "64");
-        settings.put("retina.buffer.flush.count", "2");
+        if (recoveryCheckpointEnabled) {
+            settings.put("retina.gc.interval", "1");
+            settings.put("etcd.hosts", "127.0.0.1");
+            settings.put(
+                    "etcd.port",
+                    benchmarkSetting("PIXELS_SQL_FIXTURE_ETCD_PORT", "2379"));
+            settings.put(
+                    "retina.recovery.checkpoint.dir",
+                    root.resolve("recovery").toUri().toString());
+        }
+        settings.put(
+                "retina.buffer.memTable.size",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_MEMTABLE_ROWS", "64"));
+        settings.put(
+                "retina.buffer.flush.count",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_FLUSH_COUNT", "2"));
         settings.put("retina.buffer.flush.interval", "1");
         settings.put(
                 "retina.buffer.object.storage.folder", root.resolve("objects").toUri().toString());
@@ -374,8 +396,12 @@ public final class SqlIngestFixture implements AutoCloseable {
         settings.put("retina.buffer.split.enable", "true");
         settings.put("retina.server.host", host);
         settings.put("retina.server.port", Integer.toString(retinaPort));
-        settings.put("retina.ingest.max.batch.rows", "32");
-        settings.put("retina.ingest.max.batch.bytes", "4096");
+        settings.put(
+                "retina.ingest.max.batch.rows",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_MAX_BATCH_ROWS", "32"));
+        settings.put(
+                "retina.ingest.max.batch.bytes",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_MAX_BATCH_BYTES", "4096"));
         settings.forEach(config::addProperty);
         catalog = new Catalog(root);
         metadataServer = ServerBuilder.forPort(0).addService(catalog).build().start();
@@ -452,6 +478,10 @@ public final class SqlIngestFixture implements AutoCloseable {
                                                         .build());
                             }
 
+                            public void checkpoint(String o, long tx) {
+                                clients.get().participant(o).checkpoint(IngestWire.id(tx));
+                            }
+
                             public void discard(String o, long tx) {
                                 clients.get().participant(o).discard(IngestWire.id(tx));
                             }
@@ -490,6 +520,18 @@ public final class SqlIngestFixture implements AutoCloseable {
                             TransProto.RollbackTransRequest r,
                             StreamObserver<TransProto.RollbackTransResponse> o) {
                         reply(o, TransProto.RollbackTransResponse.getDefaultInstance());
+                    }
+
+                    @Override
+                    public void getSafeVisibilityFoldingTimestamp(
+                            TransProto.GetSafeVisibilityFoldingTimestampRequest r,
+                            StreamObserver<TransProto.GetSafeVisibilityFoldingTimestampResponse> o) {
+                        reply(
+                                o,
+                                TransProto.GetSafeVisibilityFoldingTimestampResponse.newBuilder()
+                                        .setErrorCode(ErrorCode.SUCCESS)
+                                        .setTimestamp(coordinator.publishedTimestamp())
+                                        .build());
                     }
                 };
         transactionServer =
@@ -668,6 +710,9 @@ public final class SqlIngestFixture implements AutoCloseable {
                         .start();
         participant.recover();
         coordinator.start();
+        if (recoveryCheckpointEnabled) {
+            resources.startBackgroundGc();
+        }
         for (String key :
                 Arrays.asList(
                         "metadata.server.host",
@@ -706,6 +751,9 @@ public final class SqlIngestFixture implements AutoCloseable {
         status.setProperty("dataRoot", root.toString());
         status.setProperty("pixelsFiles", Long.toString(catalog.publishedFileCount()));
         status.setProperty("abortedTransactions", Long.toString(abortedTransactions()));
+        status.setProperty(
+                "activeTransactions",
+                Integer.toString(coordinator.list(owner).getTransactionsCount()));
         status.setProperty("appendRPCs", Long.toString(appendRpcCount.get()));
         status.setProperty("acceptedRows", Long.toString(acceptedRows.get()));
         status.setProperty("bufferReadRPCs", Long.toString(bufferReadRpcCount.get()));
@@ -731,8 +779,12 @@ public final class SqlIngestFixture implements AutoCloseable {
     public void close() throws Exception {
         coordinator.close();
         participant.close();
-        for (PixelsWriteBuffer buffer : buffers) {
-            buffer.close();
+        if (recoveryCheckpointEnabled) {
+            resources.shutdown();
+        } else {
+            for (PixelsWriteBuffer buffer : buffers) {
+                buffer.close();
+            }
         }
         client.close();
         for (Server server :

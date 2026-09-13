@@ -129,6 +129,8 @@ public class PixelsWriteBuffer
     private final PriorityQueue<Long> outOfOrderFlushedIds;
     private final Object flushLock = new Object();
     private final Object rowLock = new Object();
+    // Prevent the timer from invalidating a placement between durable planning and installation.
+    private int activeInstallations;
 
     private String retinaHostName;
     private final int virtualNodeId;
@@ -228,6 +230,31 @@ public class PixelsWriteBuffer
         }
     }
 
+    /** Protects the durable planSpan -> installSpan handoff from timed buffer rotation. */
+    public void beginInstallation() throws RetinaException
+    {
+        synchronized (rowLock)
+        {
+            if (!transactional || installFailed)
+            {
+                throw new RetinaException("Buffer cannot begin a planned installation");
+            }
+            activeInstallations++;
+        }
+    }
+
+    public void endInstallation()
+    {
+        synchronized (rowLock)
+        {
+            if (activeInstallations <= 0)
+            {
+                throw new IllegalStateException("No planned installation is active");
+            }
+            activeInstallations--;
+        }
+    }
+
     /** Reuses persisted rowIds and placements. Partial live appends fail closed. */
     public void installSpan(io.pixelsdb.pixels.ingest.IngestProto.BufferSpan span,
                             List<byte[][]> rows, long timestamp) throws RetinaException
@@ -247,12 +274,23 @@ public class PixelsWriteBuffer
                 if (activeMemTable.getId() != span.getBlockId() && activeMemTable.isFull())
                 {
                     // Normal live rotation is planned first; this path restores a recorded next block.
-                    retireActiveMemTableLocked();
+                    retireActiveMemTableLocked(false,
+                            activeMemTable.getFileId() == span.getFileId() ? null : span);
                 }
                 if (activeMemTable.getFileId() != span.getFileId() || activeMemTable.getId() != span.getBlockId()
                         || activeMemTable.getStartIndex() != span.getBlockStartOffset()
                         || activeMemTable.getSize() != span.getOffsetInBlock() + done)
-                { throw new RetinaException("Recorded placement no longer matches the active buffer"); }
+                {
+                    throw new RetinaException("Recorded placement no longer matches the active buffer:"
+                            + " expectedFile=" + span.getFileId()
+                            + ", actualFile=" + activeMemTable.getFileId()
+                            + ", expectedBlock=" + span.getBlockId()
+                            + ", actualBlock=" + activeMemTable.getId()
+                            + ", expectedStart=" + span.getBlockStartOffset()
+                            + ", actualStart=" + activeMemTable.getStartIndex()
+                            + ", expectedSize=" + (span.getOffsetInBlock() + done)
+                            + ", actualSize=" + activeMemTable.getSize());
+                }
                 for (int i = done; i < rows.size(); i++)
                 {
                     int position;
@@ -363,7 +401,21 @@ public class PixelsWriteBuffer
     // Caller must hold versionLock.writeLock().
     private void retireActiveMemTableLocked() throws RetinaException
     {
-        if (this.currentMemTableCount >= this.maxMemTableCount)
+        retireActiveMemTableLocked(false, null);
+    }
+
+    // Caller must hold rowLock when forceFile is true, and versionLock.writeLock() in all cases.
+    private void retireActiveMemTableLocked(boolean forceFile) throws RetinaException
+    {
+        retireActiveMemTableLocked(forceFile, null);
+    }
+
+    // restoredNext is present only while replay crosses a persisted file boundary.
+    private void retireActiveMemTableLocked(boolean forceFile,
+                                            io.pixelsdb.pixels.ingest.IngestProto.BufferSpan restoredNext)
+            throws RetinaException
+    {
+        if (forceFile || this.currentMemTableCount >= this.maxMemTableCount)
         {
             this.currentMemTableCount = 0;
             this.currentFileWriterManager.setLastBlockId(this.activeMemTable.getId());
@@ -372,8 +424,10 @@ public class PixelsWriteBuffer
                     this.tableId, this.schema,
                     this.targetOrderedDirPath, this.targetOrderedStorage,
                     this.memTableSize, this.blockSize, this.replication,
-                    this.encodingLevel, this.nullsPadding, this.idCounter,
-                    this.memTableSize * this.maxMemTableCount, this.retinaHostName, virtualNodeId);
+                    this.encodingLevel, this.nullsPadding,
+                    restoredNext == null ? this.idCounter : restoredNext.getFirstBlockId(),
+                    this.memTableSize * this.maxMemTableCount, this.retinaHostName, virtualNodeId,
+                    restoredNext);
         }
             
         /*
@@ -450,6 +504,10 @@ public class PixelsWriteBuffer
 
                 // unref in the end
                 flushMemTable.unref();
+                if (!flushFileExecutor.isShutdown())
+                {
+                    flushFileExecutor.execute(this::flushReadyFilesSafely);
+                }
             } catch (Exception e)
             {
                 // TODO: Retry on failure.
@@ -522,7 +580,7 @@ public class PixelsWriteBuffer
         }
     }
 
-    private List<FileWriterManager> publishFinishedFile(FileWriterManager fileWriterManager) throws RetinaException
+    private void prepareFinishedFile(FileWriterManager fileWriterManager) throws RetinaException
     {
         try
         {
@@ -545,6 +603,11 @@ public class PixelsWriteBuffer
             throw new RetinaException("Failed to flush main index for ingest file "
                     + fileWriterManager.getFileId(), e);
         }
+    }
+
+    private List<FileWriterManager> publishFinishedFile(FileWriterManager fileWriterManager) throws RetinaException
+    {
+        prepareFinishedFile(fileWriterManager);
         return this.ingestFilePublisher.admitReady(fileWriterManager, this::publishPreparedFile);
     }
 
@@ -586,44 +649,85 @@ public class PixelsWriteBuffer
      * been written to Object. If it has been written, execute the file write
      * operation and delete the corresponding ObjectEntry in the unified view.
      */
+    private void flushIdleActiveMemTable()
+    {
+        synchronized (rowLock)
+        {
+            if (activeInstallations != 0 || installFailed
+                    || (transactional && RetinaResourceManager.Instance().isRecovering())
+                    || activeMemTable == null || activeMemTable.isEmpty())
+            {
+                return;
+            }
+            versionLock.writeLock().lock();
+            try
+            {
+                retireActiveMemTableLocked(true);
+            }
+            catch (Exception e)
+            {
+                installFailed = transactional;
+                logger.error("Failed to flush active memTable on the configured interval", e);
+            }
+            finally
+            {
+                versionLock.writeLock().unlock();
+            }
+        }
+    }
+
+    private void flushReadyFilesSafely()
+    {
+        try
+        {
+            Iterator<FileWriterManager> iterator = this.fileWriterManagers.iterator();
+            while (iterator.hasNext())
+            {
+                FileWriterManager fileWriterManager = iterator.next();
+                if (fileWriterManager.getLastBlockId() > this.continuousFlushedId.get())
+                {
+                    break;
+                }
+                if (transactional)
+                {
+                    // Physical Pixels writing and MainIndex flush may be expensive. They are
+                    // private preparation and do not require excluding pinned readers. Keep only
+                    // the short metadata visibility switch inside the read-pin publication lock.
+                    prepareFinishedFile(fileWriterManager);
+                    RetinaResourceManager.Instance().getIngestReadPins().publish(() -> {
+                        List<FileWriterManager> publishedFiles = this.ingestFilePublisher.admitReady(
+                                fileWriterManager, this::publishPreparedFile);
+                        for (FileWriterManager publishedFile : publishedFiles)
+                        {
+                            this.fileWriterManagers.remove(publishedFile);
+                            cleanupPublishedObjects(
+                                    publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
+                        }
+                    });
+                }
+                else
+                {
+                    List<FileWriterManager> publishedFiles = publishFinishedFile(fileWriterManager);
+                    for (FileWriterManager publishedFile : publishedFiles)
+                    {
+                        this.fileWriterManagers.remove(publishedFile);
+                        cleanupPublishedObjects(
+                                publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logger.error("Failed to flush data to disk", e);
+        }
+    }
+
     private void startFlushObjectToFileScheduler(long intervalSeconds)
     {
         this.flushFileFuture = this.flushFileExecutor.scheduleWithFixedDelay(() -> {
-            try
-            {
-                Iterator<FileWriterManager> iterator = this.fileWriterManagers.iterator();
-                while (iterator.hasNext())
-                {
-                    FileWriterManager fileWriterManager = iterator.next();
-                    if (fileWriterManager.getLastBlockId() > this.continuousFlushedId.get())
-                    {
-                        break;
-                    }
-                    if (transactional)
-                    {
-                        RetinaResourceManager.Instance().getIngestReadPins().publish(() -> {
-                    List<FileWriterManager> publishedFiles = publishFinishedFile(fileWriterManager);
-                    for (FileWriterManager publishedFile : publishedFiles)
-                    {
-                        this.fileWriterManagers.remove(publishedFile);
-                        cleanupPublishedObjects(publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
-                    }
-                        });
-                    }
-                    else
-                    {
-                    List<FileWriterManager> publishedFiles = publishFinishedFile(fileWriterManager);
-                    for (FileWriterManager publishedFile : publishedFiles)
-                    {
-                        this.fileWriterManagers.remove(publishedFile);
-                        cleanupPublishedObjects(publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
-                    }
-                    }
-                }
-            } catch (Exception e)
-            {
-                logger.error("Failed to flush data to disk", e);
-            }
+            flushIdleActiveMemTable();
+            flushReadyFilesSafely();
         }, 0, intervalSeconds, TimeUnit.SECONDS);
     }
 
