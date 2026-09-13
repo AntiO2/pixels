@@ -150,7 +150,11 @@ public final class NormalIngestDaemonMain
         setting(config, "retina.gc.interval", "1");
         setting(config, "retina.buffer.memTable.size", "64");
         setting(config, "retina.buffer.flush.count", "1");
-        setting(config, "retina.buffer.flush.interval", "1");
+        // The daemon lifecycle test checks immediate buffer visibility before
+        // shutdown and physical row preservation after shutdown. Keep the idle
+        // flush scheduler outside that short assertion window; the full SQL test
+        // independently exercises the configured buffer-to-file transition.
+        setting(config, "retina.buffer.flush.interval", "60");
         setting(config, "retina.buffer.object.storage.folder", root.resolve("objects").toUri().toString());
         setting(config, "retina.storage.gc.journal.dir", root.resolve("gc").toUri().toString());
         setting(config, "retina.offload.checkpoint.dir", root.resolve("offload").toUri().toString());
