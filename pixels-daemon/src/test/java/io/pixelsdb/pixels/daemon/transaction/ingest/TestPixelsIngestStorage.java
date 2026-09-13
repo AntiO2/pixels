@@ -322,7 +322,11 @@ public class TestPixelsIngestStorage {
         changes.put("retina.storage.gc.enabled", "false");
         changes.put("retina.buffer.memTable.size", "64");
         changes.put("retina.buffer.flush.count", "2");
-        changes.put("retina.buffer.flush.interval", "1");
+        // This test controls file rollover explicitly and asserts the intermediate
+        // two-file/one-active-MemTable layout before exercising rewrite GC. Keep
+        // the independent idle-flush scheduler outside that assertion window;
+        // slow CI hosts can otherwise flush the final four rows into a third file.
+        changes.put("retina.buffer.flush.interval", "60");
         changes.put(
                 "retina.buffer.object.storage.folder", root.resolve("objects").toUri().toString());
         changes.put("retina.storage.gc.journal.dir", root.resolve("gc").toUri().toString());
@@ -506,6 +510,10 @@ public class TestPixelsIngestStorage {
                     putCalls.get(),
                     "A catalog retry must not re-put already flushed MainIndex entries");
             catalog.rejectPublication.set(false);
+            Method flushReadyFiles = PixelsWriteBuffer.class
+                    .getDeclaredMethod("flushReadyFilesSafely");
+            flushReadyFiles.setAccessible(true);
+            flushReadyFiles.invoke(buffer);
             deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
             while (System.nanoTime() < deadline
                     && catalog.files.values().stream()
