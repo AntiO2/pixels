@@ -18,6 +18,7 @@ import io.pixelsdb.pixels.common.ingest.wire.IngestWire;
 import io.pixelsdb.pixels.ingest.IngestProto.PrepareToken;
 import io.pixelsdb.pixels.ingest.IngestProto.DecisionOutcome;
 import io.pixelsdb.pixels.ingest.IngestProto.PublicationProgress;
+import io.pixelsdb.pixels.ingest.IngestProto.ReadPin;
 import io.pixelsdb.pixels.ingest.IngestProto.Route;
 import io.pixelsdb.pixels.ingest.IngestProto.TableSpec;
 import io.pixelsdb.pixels.ingest.IngestProto.Transaction;
@@ -26,6 +27,11 @@ import io.pixelsdb.pixels.ingest.IngestProto.TransactionState;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
@@ -37,6 +43,10 @@ import static org.junit.Assert.fail;
 public class TestRetinaIngestParticipantCheckpoint
 {
     private static final long STATEMENT_ID = 1L;
+    private static final long READ_TRANSACTION_ID = 99L;
+    private static final long READ_PIN_LEASE_MILLIS = 10_000L;
+    private static final long CONCURRENCY_TIMEOUT_SECONDS = 5L;
+    private static final int CHECKPOINT_TEST_THREADS = 2;
 
     @Test
     public void testCheckpointThenWalReclaimSurvivesRestartWithoutReplay() throws Exception
@@ -76,6 +86,8 @@ public class TestRetinaIngestParticipantCheckpoint
         Decisions decisions = new Decisions(transaction);
         AtomicBoolean durableCheckpoint = new AtomicBoolean();
         AtomicInteger firstInstalls = new AtomicInteger();
+        CountDownLatch checkpointStarted = new CountDownLatch(1);
+        CountDownLatch releaseCheckpoint = new CountDownLatch(1);
 
         try
         {
@@ -85,10 +97,40 @@ public class TestRetinaIngestParticipantCheckpoint
                 journal.seal(seal);
                 RetinaIngestParticipant participant = new RetinaIngestParticipant(
                         owner, journal, decisions,
-                        new Installer(durableCheckpoint, firstInstalls), new IngestReadPins(10_000));
+                        new Installer(
+                                durableCheckpoint,
+                                firstInstalls,
+                                checkpointStarted,
+                                releaseCheckpoint),
+                        new IngestReadPins(READ_PIN_LEASE_MILLIS));
                 participant.recover();
                 assertEquals(1, firstInstalls.get());
-                participant.checkpointPublishedTransactions();
+                ExecutorService executor = Executors.newFixedThreadPool(CHECKPOINT_TEST_THREADS);
+                try
+                {
+                    Future<?> checkpoint = executor.submit(() ->
+                    {
+                        participant.checkpointPublishedTransactions();
+                        return null;
+                    });
+                    assertTrue(checkpointStarted.await(
+                            CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                    Future<ReadPin> read = executor.submit(() -> participant.pinRead(
+                            ReadPin.newBuilder()
+                                    .setTransactionId(READ_TRANSACTION_ID)
+                                    .setReadTimestamp(transaction.getCommitTimestamp())
+                                    .build()));
+                    ReadPin pin = read.get(
+                            CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    participant.readPins().release(pin);
+                    releaseCheckpoint.countDown();
+                    checkpoint.get(CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                }
+                finally
+                {
+                    releaseCheckpoint.countDown();
+                    executor.shutdownNow();
+                }
                 assertTrue(durableCheckpoint.get());
                 expectIo(() -> journal.readSealedBatch(stream, 0));
                 expectIo(() -> journal.append(batch));
@@ -100,7 +142,8 @@ public class TestRetinaIngestParticipantCheckpoint
             {
                 RetinaIngestParticipant restarted = new RetinaIngestParticipant(
                         owner, journal, decisions,
-                        new Installer(durableCheckpoint, restartInstalls), new IngestReadPins(10_000));
+                        new Installer(durableCheckpoint, restartInstalls),
+                        new IngestReadPins(READ_PIN_LEASE_MILLIS));
                 restarted.recover();
                 assertEquals("checkpointed transaction was replayed", 0, restartInstalls.get());
                 expectIo(() -> journal.readSealedBatch(stream, 0));
@@ -179,11 +222,24 @@ public class TestRetinaIngestParticipantCheckpoint
     {
         private final AtomicBoolean checkpoint;
         private final AtomicInteger installs;
+        private final CountDownLatch checkpointStarted;
+        private final CountDownLatch releaseCheckpoint;
 
         private Installer(AtomicBoolean checkpoint, AtomicInteger installs)
         {
+            this(checkpoint, installs, null, null);
+        }
+
+        private Installer(
+                AtomicBoolean checkpoint,
+                AtomicInteger installs,
+                CountDownLatch checkpointStarted,
+                CountDownLatch releaseCheckpoint)
+        {
             this.checkpoint = checkpoint;
             this.installs = installs;
+            this.checkpointStarted = checkpointStarted;
+            this.releaseCheckpoint = releaseCheckpoint;
         }
 
         @Override
@@ -218,7 +274,17 @@ public class TestRetinaIngestParticipantCheckpoint
 
         @Override
         public boolean checkpoint(Transaction tx, Iterable<MutationBatch> batches)
+                throws Exception
         {
+            if (checkpointStarted != null)
+            {
+                checkpointStarted.countDown();
+                if (!releaseCheckpoint.await(
+                        CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                {
+                    throw new IOException("Timed out waiting to release checkpoint");
+                }
+            }
             int count = 0;
             for (MutationBatch ignored : batches)
             {

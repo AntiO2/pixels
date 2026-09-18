@@ -395,6 +395,7 @@ public class TestPixelsIngestStorage {
                     allocationCalls = new AtomicLong(),
                     putCalls = new AtomicLong();
             AtomicBoolean failOnce = new AtomicBoolean(true);
+            AtomicBoolean rejectCheckpointFlush = new AtomicBoolean();
             IndexService delegate = LocalIndexService.Instance();
             IndexService index =
                     (IndexService)
@@ -409,6 +410,10 @@ public class TestPixelsIngestStorage {
                                                     .setRowIdStart(allocation.getAndAdd(count))
                                                     .setLength(count)
                                                     .build();
+                                        }
+                                        if (method.getName().equals("flushMainIndexOfFile")
+                                                && rejectCheckpointFlush.get()) {
+                                            return false;
                                         }
                                         try {
                                             Object result = method.invoke(delegate, args);
@@ -582,6 +587,10 @@ public class TestPixelsIngestStorage {
                             .build());
             Transaction published = tx.toBuilder().setState(TransactionState.PUBLISHED)
                     .setProgress(PublicationProgress.VISIBLE_NOW).build();
+            rejectCheckpointFlush.set(true);
+            assertFalse(installer.checkpoint(published, Collections.singletonList(batch)),
+                    "Failed MainIndex durability proof must retain the installation plan");
+            rejectCheckpointFlush.set(false);
             assertTrue(installer.checkpoint(published, Collections.singletonList(batch)));
             assertTrue(installer.recoveredByCheckpoint(published));
 

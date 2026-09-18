@@ -374,16 +374,21 @@ public final class RetinaIngestParticipant implements Closeable {
                 }, 1, 1, TimeUnit.SECONDS);
     }
 
-    synchronized void checkpointPublishedTransactions() throws Exception {
-        if (!ready) {
-            return;
-        }
-        List<Transaction> transactions = decisions.list(owner).getTransactionsList();
-        for (Transaction tx : transactions) {
-            if (tx.getState() != TransactionState.PUBLISHED
-                    || !installed.contains(tx.getTransactionId())) {
-                continue;
+    void checkpointPublishedTransactions() throws Exception {
+        List<Transaction> transactions;
+        synchronized (this) {
+            if (!ready) {
+                return;
             }
+            transactions = new ArrayList<>();
+            for (Transaction tx : decisions.list(owner).getTransactionsList()) {
+                if (tx.getState() == TransactionState.PUBLISHED
+                        && installed.contains(tx.getTransactionId())) {
+                    transactions.add(tx);
+                }
+            }
+        }
+        for (Transaction tx : transactions) {
             if (installer.recoveredByCheckpoint(tx)) {
                 journal.compactCheckpointedTransactions(
                         Collections.singleton(tx.getTransactionId()));
@@ -396,12 +401,16 @@ public final class RetinaIngestParticipant implements Closeable {
         }
     }
 
-    public synchronized void checkpoint(long transactionId) throws Exception {
-        serving();
-        Transaction tx = decisions.get(transactionId);
-        if (tx.getState() != TransactionState.PUBLISHED
-                || !installed.contains(transactionId)) {
-            throw new IOException("Transaction is not installed and PUBLISHED");
+    public void checkpoint(long transactionId) throws Exception {
+        Transaction tx;
+        synchronized (this) {
+            serving();
+            tx = decisions.get(transactionId);
+            if (tx.getState() != TransactionState.PUBLISHED
+                    || !installed.contains(transactionId)) {
+                throw new IOException(
+                        "Transaction is not installed and PUBLISHED");
+            }
         }
         if (!installer.recoveredByCheckpoint(tx)
                 && !installer.checkpoint(tx, batches(tx))) {

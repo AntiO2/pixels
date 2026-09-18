@@ -150,6 +150,16 @@ public class RetinaResourceManager
                 && durableRecoveryCheckpointFiles.containsAll(fileIds);
     }
 
+    /**
+     * Whether the recovered storage baseline includes all publications through the
+     * supplied timestamp. File membership is checked while creating the ingestion
+     * checkpoint; later storage GC may legitimately replace those file identities.
+     */
+    public boolean isIngestRecoveryCheckpointDurable(long commitTimestamp)
+    {
+        return durableRecoveryCheckpointTimestamp >= commitTimestamp;
+    }
+
     private volatile long latestGcTimestamp = -1;
     private final int totalVirtualNodeNum;
 

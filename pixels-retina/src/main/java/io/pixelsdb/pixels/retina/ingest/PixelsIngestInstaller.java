@@ -322,7 +322,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                 // checkpoint may already have retired them and moved surviving stable rowIds.
                 retiredCheckpoints.add(checkpoint.getTransactionId());
             } else {
-                verifyCheckpointRows(checkpoint);
+                verifyCheckpointBaseline(checkpoint);
             }
         }
         if (!retiredCheckpoints.isEmpty()) {
@@ -375,24 +375,37 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     }
 
     @Override
-    public synchronized boolean checkpoint(
+    public boolean checkpoint(
             Transaction tx, Iterable<MutationBatch> batches) throws Exception {
-        if (checkpoints.containsKey(tx.getTransactionId())) {
-            return true;
-        }
         if (tx.getState() != TransactionState.PUBLISHED) {
             return false;
         }
-        List<BatchInstall> transactionPlans = new ArrayList<>();
+        List<MutationBatch> transactionBatches = new ArrayList<>();
+        batches.forEach(transactionBatches::add);
+        Map<String, BatchInstall> planSnapshot = new LinkedHashMap<>();
+        synchronized (this) {
+            if (checkpoints.containsKey(tx.getTransactionId())) {
+                return true;
+            }
+            for (MutationBatch batch : transactionBatches) {
+                String batchKey = IngestWire.batchKey(
+                        batch.getStreamId(), batch.getSequence());
+                BatchInstall plan = plans.get(batchKey);
+                if (plan == null
+                        || plan.getStream().getTransactionId()
+                                != tx.getTransactionId()) {
+                    throw new IOException(
+                            "Published transaction is missing its installation plan");
+                }
+                planSnapshot.put(batchKey, plan);
+            }
+        }
         Set<Long> coveredFiles = new HashSet<>();
         Map<Long, List<RowIdRange>> rowRanges = new TreeMap<>();
         Map<Long, Set<Long>> tableFiles = new TreeMap<>();
-        for (MutationBatch batch : batches) {
-            BatchInstall plan = plans.get(
-                    IngestWire.batchKey(batch.getStreamId(), batch.getSequence()));
-            if (plan == null || plan.getStream().getTransactionId() != tx.getTransactionId()) {
-                throw new IOException("Published transaction is missing its installation plan");
-            }
+        for (MutationBatch batch : transactionBatches) {
+            BatchInstall plan = planSnapshot.get(IngestWire.batchKey(
+                    batch.getStreamId(), batch.getSequence()));
             TableSpec table = IngestWire.table(tx, batch.getStreamId().getTableId());
             Set<Long> files = tableFiles.computeIfAbsent(table.getTableId(), ignored -> new TreeSet<>());
             if (!verifyMaterializedBatch(tx, table, batch, plan, files)) {
@@ -404,7 +417,6 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                             .setRowIdStart(plan.getRowIdStart())
                             .setRowCount(plan.getRowCount())
                             .build());
-            transactionPlans.add(plan);
         }
         if (!resources.isIngestRecoveryCheckpointDurable(
                 tx.getCommitTimestamp(), coveredFiles)) {
@@ -421,18 +433,31 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                     .addAllRowRanges(entry.getValue())
                     .addAllFileIds(tableFiles.get(table.getTableId())));
         }
-        Map<String, BatchInstall> nextPlans = new LinkedHashMap<>(plans);
-        nextPlans.values().removeIf(
-                plan -> plan.getStream().getTransactionId() == tx.getTransactionId());
-        Map<Long, TransactionCheckpoint> nextCheckpoints = new LinkedHashMap<>(checkpoints);
-        nextCheckpoints.put(tx.getTransactionId(), checkpoint.build());
-        byte[] bytes = snapshot(nextPlans, nextCheckpoints);
-        state.store(bytes);
-        plans.clear();
-        plans.putAll(nextPlans);
-        checkpoints.clear();
-        checkpoints.putAll(nextCheckpoints);
-        planBytes = bytes.length;
+        synchronized (this) {
+            if (checkpoints.containsKey(tx.getTransactionId())) {
+                return true;
+            }
+            for (Map.Entry<String, BatchInstall> entry : planSnapshot.entrySet()) {
+                if (!entry.getValue().equals(plans.get(entry.getKey()))) {
+                    throw new IOException(
+                            "Installation plan changed while checkpointing");
+                }
+            }
+            Map<String, BatchInstall> nextPlans = new LinkedHashMap<>(plans);
+            nextPlans.values().removeIf(
+                    plan -> plan.getStream().getTransactionId()
+                            == tx.getTransactionId());
+            Map<Long, TransactionCheckpoint> nextCheckpoints =
+                    new LinkedHashMap<>(checkpoints);
+            nextCheckpoints.put(tx.getTransactionId(), checkpoint.build());
+            byte[] bytes = snapshot(nextPlans, nextCheckpoints);
+            state.store(bytes);
+            plans.clear();
+            plans.putAll(nextPlans);
+            checkpoints.clear();
+            checkpoints.putAll(nextCheckpoints);
+            planBytes = bytes.length;
+        }
         return true;
     }
 
@@ -447,94 +472,42 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                 || !plan.getDigest().equals(ByteString.copyFrom(batch.getDigest()))) {
             throw new IOException("Checkpoint batch identity mismatch");
         }
-        List<byte[][]> decoded = rows(tx, batch);
         int rowOffset = 0;
         for (BufferSpan span : plan.getSpansList()) {
             if (span.getRowIdStart() != plan.getRowIdStart() + rowOffset
-                    || rowOffset + span.getRowCount() > decoded.size()) {
+                    || rowOffset + span.getRowCount() > plan.getRowCount()) {
                 throw new IOException("Checkpoint span is incomplete or misaligned");
             }
-            List<Long> rowIds = new ArrayList<>(span.getRowCount());
-            for (int i = 0; i < span.getRowCount(); i++) {
-                rowIds.add(span.getRowIdStart() + i);
+            File file = metadata.getFileById(span.getFileId());
+            if (file == null
+                    || file.getPathId() != span.getPathId()
+                    || !file.getName().equals(span.getFileName())) {
+                throw new IOException("Checkpoint installation file identity is missing or changed");
             }
-            List<IndexProto.RowLocation> locations =
-                    indexes.lookupRowLocations(table.getTableId(), rowIds);
-            if (locations.size() != rowIds.size()) {
-                throw new IOException("MainIndex checkpoint lookup lost positional alignment");
+            if (file.getType() != File.Type.REGULAR) {
+                return false;
             }
-            for (int i = 0; i < locations.size(); i++) {
-                IndexProto.RowLocation location = locations.get(i);
-                if (location == null) {
-                    throw new IOException("MainIndex row is missing at checkpoint");
-                }
-                File file = metadata.getFileById(location.getFileId());
-                if (file == null || file.getType() != File.Type.REGULAR) {
-                    return false;
-                }
-                coveredFiles.add(location.getFileId());
-                verifyBusinessIndexes(tx, table, decoded.get(rowOffset + i), rowIds.get(i), location);
+            if (!coveredFiles.add(span.getFileId())) {
+                rowOffset += span.getRowCount();
+                continue;
+            }
+            // MainIndex's per-file flush marker is the durable proof for the exact
+            // mappings installed from this immutable plan. SinglePointIndex writes
+            // are already durable in the existing index service contract.
+            if (!indexes.flushMainIndexOfFile(table.getTableId(), span.getFileId())) {
+                return false;
             }
             rowOffset += span.getRowCount();
         }
-        if (rowOffset != decoded.size()) {
+        if (rowOffset != plan.getRowCount()) {
             throw new IOException("Installation plan is not complete enough to checkpoint");
         }
         return true;
     }
 
-    private void verifyBusinessIndexes(
-            Transaction tx, TableSpec table, byte[][] row, long rowId,
-            IndexProto.RowLocation location)
-            throws Exception {
-        for (TableIndex index : table.getIndexesList()) {
-            ByteString encoded = IngestRows.indexKey(index, row);
-            IndexProto.IndexKey key = IndexProto.IndexKey.newBuilder()
-                    .setTableId(table.getTableId())
-                    .setIndexId(index.getId())
-                    .setKey(encoded)
-                    .setTimestamp(tx.getCommitTimestamp())
-                    .build();
-            IndexOption option = IndexOption.builder()
-                    .vNodeId(IndexUtils.getBucketIdFromByteBuffer(encoded)).build();
-            if (index.getPrimary()) {
-                if (!location.equals(indexes.lookupUniqueIndex(key, option))) {
-                    throw new IOException("Primary business index is not checkpoint-ready for row " + rowId);
-                }
-            } else {
-                List<IndexProto.RowLocation> members = indexes.lookupNonUniqueIndex(key, option);
-                if (members == null || !members.contains(location)) {
-                    throw new IOException("Secondary business index is not checkpoint-ready for row " + rowId);
-                }
-            }
-        }
-    }
-
-    private void verifyCheckpointRows(TransactionCheckpoint checkpoint) throws Exception {
-        Set<Long> files = new HashSet<>();
-        for (TableCheckpointCoverage table : checkpoint.getTablesList()) {
-            for (RowIdRange range : table.getRowRangesList()) {
-                List<Long> rowIds = new ArrayList<>(range.getRowCount());
-                for (int i = 0; i < range.getRowCount(); i++) {
-                    rowIds.add(range.getRowIdStart() + i);
-                }
-                List<IndexProto.RowLocation> locations =
-                        indexes.lookupRowLocations(table.getTableId(), rowIds);
-                if (locations.size() != rowIds.size() || locations.contains(null)) {
-                    throw new IOException("Checkpointed MainIndex rows are missing");
-                }
-                for (IndexProto.RowLocation location : locations) {
-                    File file = metadata.getFileById(location.getFileId());
-                    if (file == null || file.getType() != File.Type.REGULAR) {
-                        throw new IOException("Checkpointed row points outside REGULAR storage");
-                    }
-                    files.add(location.getFileId());
-                }
-            }
-        }
-        if (!resources.isIngestRecoveryCheckpointDurable(
-                checkpoint.getCommitTimestamp(), files)) {
-            throw new IOException("Published recovery checkpoint no longer covers installation checkpoint");
+    private void verifyCheckpointBaseline(TransactionCheckpoint checkpoint) throws IOException {
+        if (!resources.isIngestRecoveryCheckpointDurable(checkpoint.getCommitTimestamp())) {
+            throw new IOException("Published recovery baseline predates installation checkpoint");
         }
     }
 
