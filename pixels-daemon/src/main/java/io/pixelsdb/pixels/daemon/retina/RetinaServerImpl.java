@@ -72,6 +72,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
     private final IndexService indexService;
     private final RetinaResourceManager retinaResourceManager;
     private final CheckpointSource checkpointSource;
+    private final Set<Long> bootstrapRecoveryFileIds;
     private final boolean transactionalIngestEnabled;
     private final Striped<Lock> updateLocks = Striped.lock(1024);
     private volatile RetinaStatus status;
@@ -96,12 +97,32 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
 
     RetinaServerImpl(MetadataService metadataService, IndexService indexService,
                      RetinaResourceManager retinaResourceManager,
+                     Set<Long> bootstrapRecoveryFileIds)
+    {
+        this(metadataService, indexService, retinaResourceManager,
+                new ConfiguredCheckpointSource(), bootstrapRecoveryFileIds);
+    }
+
+    RetinaServerImpl(MetadataService metadataService, IndexService indexService,
+                     RetinaResourceManager retinaResourceManager,
                      CheckpointSource checkpointSource)
+    {
+        this(metadataService, indexService, retinaResourceManager, checkpointSource,
+                Collections.emptySet());
+    }
+
+    RetinaServerImpl(MetadataService metadataService, IndexService indexService,
+                     RetinaResourceManager retinaResourceManager,
+                     CheckpointSource checkpointSource,
+                     Set<Long> bootstrapRecoveryFileIds)
     {
         this.metadataService = requireNonNull(metadataService, "metadataService is null");
         this.indexService = requireNonNull(indexService, "indexService is null");
         this.retinaResourceManager = requireNonNull(retinaResourceManager, "retinaResourceManager is null");
         this.checkpointSource = requireNonNull(checkpointSource, "checkpointSource is null");
+        this.bootstrapRecoveryFileIds = Collections.unmodifiableSet(
+                new HashSet<>(requireNonNull(
+                        bootstrapRecoveryFileIds, "bootstrapRecoveryFileIds is null")));
         this.transactionalIngestEnabled = new IngestOptions().enabled;
 
         int totalBuckets = Integer.parseInt(ConfigFactory.Instance().getProperty("index.bucket.num"));
@@ -252,18 +273,34 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         if (loaded == null)
         {
             retinaResourceManager.recoverStorageGc(Collections.emptySet());
+            List<File> regularFiles;
             try
             {
-                if (!metadataService.getFilesByType(EnumSet.of(File.Type.REGULAR)).isEmpty())
+                regularFiles = metadataService.getFilesByType(
+                        EnumSet.of(File.Type.REGULAR));
+                Set<Long> uncoveredFiles = regularFiles.stream()
+                        .map(File::getId)
+                        .filter(fileId -> !bootstrapRecoveryFileIds.contains(fileId))
+                        .collect(Collectors.toSet());
+                if (!uncoveredFiles.isEmpty())
                 {
-                    throw new RetinaException("Recovery aborted: no checkpoint body found but catalog has REGULAR files");
+                    throw new RetinaException(
+                            "Recovery aborted: no checkpoint body or transaction plan covers REGULAR files "
+                                    + uncoveredFiles);
+                }
+                if (!regularFiles.isEmpty())
+                {
+                    logger.info("Recovery: no checkpoint body; {} REGULAR files are covered by retained transaction plans",
+                            regularFiles.size());
                 }
             }
             catch (MetadataException e)
             {
                 throw new RetinaException("Recovery catalog probe failed", e);
             }
-            return new RecoveryResult(true, computeReplay(0L, Collections.emptyList(), context.expectedVnodes));
+            return new RecoveryResult(
+                    regularFiles.isEmpty(),
+                    computeReplay(0L, Collections.emptyList(), context.expectedVnodes));
         }
 
         Body body = loaded.body;

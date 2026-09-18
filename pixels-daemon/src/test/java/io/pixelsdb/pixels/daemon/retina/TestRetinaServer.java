@@ -29,6 +29,7 @@ import io.pixelsdb.pixels.common.index.ResolvedPrimary;
 import io.pixelsdb.pixels.common.index.service.IndexService;
 import io.pixelsdb.pixels.common.index.service.LocalIndexService;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
+import io.pixelsdb.pixels.common.metadata.domain.File;
 import io.pixelsdb.pixels.common.metadata.domain.Schema;
 import io.pixelsdb.pixels.common.metadata.domain.Table;
 import io.pixelsdb.pixels.daemon.ServerContainer;
@@ -639,6 +640,55 @@ public class TestRetinaServer
         verify(rm).startBackgroundGc();
     }
 
+    @Test
+    public void testRecoveryRejectsRegularFileWithoutCheckpointOrTransactionPlan()
+            throws Exception
+    {
+        MetadataService metadata = mock(MetadataService.class);
+        IndexService indexes = mock(IndexService.class);
+        RetinaResourceManager resources = mock(RetinaResourceManager.class);
+        prepareRecoveryMocks(metadata, resources);
+        when(metadata.getFilesByType(ArgumentMatchers.anySet()))
+                .thenReturn(Collections.singletonList(regularFile(41L)));
+
+        try
+        {
+            newServer(metadata, indexes, resources, Collections.emptySet());
+            fail("Uncovered REGULAR file must keep recovery fail-closed");
+        }
+        catch (IllegalStateException expected)
+        {
+            assertTrue(expected.getCause().getMessage().contains("REGULAR files [41]"));
+        }
+    }
+
+    @Test
+    public void testRecoveryDefersReadyForRegularFileCoveredByTransactionPlan()
+            throws Exception
+    {
+        MetadataService metadata = mock(MetadataService.class);
+        IndexService indexes = mock(IndexService.class);
+        RetinaResourceManager resources = mock(RetinaResourceManager.class);
+        prepareRecoveryMocks(metadata, resources);
+        when(metadata.getSchemas()).thenReturn(Collections.emptyList());
+        when(metadata.getFilesByType(ArgumentMatchers.anySet()))
+                .thenReturn(Collections.singletonList(regularFile(42L)));
+
+        RetinaServerImpl server = newServer(
+                metadata, indexes, resources, Collections.singleton(42L));
+
+        assertTrue(server.isRecovering());
+        verify(resources, never()).startBackgroundGc();
+    }
+
+    private static File regularFile(long fileId)
+    {
+        File file = new File();
+        file.setId(fileId);
+        file.setType(File.Type.REGULAR);
+        return file;
+    }
+
     private static void prepareRecoveryMocks(
             MetadataService metadataService, RetinaResourceManager resourceManager)
             throws Exception
@@ -652,6 +702,14 @@ public class TestRetinaServer
     private static RetinaServerImpl newServer(
             MetadataService metadataService, IndexService indexService,
             RetinaResourceManager resourceManager)
+    {
+        return newServer(
+                metadataService, indexService, resourceManager, Collections.emptySet());
+    }
+
+    private static RetinaServerImpl newServer(
+            MetadataService metadataService, IndexService indexService,
+            RetinaResourceManager resourceManager, java.util.Set<Long> bootstrapRecoveryFileIds)
     {
         return new RetinaServerImpl(metadataService, indexService, resourceManager,
                 new RetinaServerImpl.CheckpointSource()
@@ -667,6 +725,6 @@ public class TestRetinaServer
                     {
                         return null;
                     }
-                });
+                }, bootstrapRecoveryFileIds);
     }
 }

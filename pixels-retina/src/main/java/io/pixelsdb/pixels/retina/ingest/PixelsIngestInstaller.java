@@ -133,6 +133,25 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
         return IngestWire.batchKey(IngestWire.decode(plan.getStream()), plan.getSequence());
     }
 
+    /** Files whose exact row locations can be reconstructed from retained batch plans. */
+    public static Set<Long> recoveryFileIds(AtomicStateFile state) throws IOException {
+        byte[] bytes = state.read();
+        if (bytes.length == 0) {
+            return Collections.emptySet();
+        }
+        InstallationSnapshot snapshot = InstallationSnapshot.parseFrom(bytes);
+        if (snapshot.getVersion() != INSTALLATION_SNAPSHOT_VERSION) {
+            throw new IOException("Unknown installation plan version");
+        }
+        Set<Long> fileIds = new HashSet<>();
+        for (BatchInstall plan : snapshot.getBatchesList()) {
+            for (BufferSpan span : plan.getSpansList()) {
+                fileIds.add(span.getFileId());
+            }
+        }
+        return Collections.unmodifiableSet(fileIds);
+    }
+
     private synchronized void save(BatchInstall value) throws IOException {
         Map<String, BatchInstall> next = new LinkedHashMap<>(plans);
         next.put(key(value), value);

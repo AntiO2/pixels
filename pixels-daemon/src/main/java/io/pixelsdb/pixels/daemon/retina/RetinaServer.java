@@ -46,6 +46,8 @@ import org.apache.logging.log4j.Logger;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.Collections;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -124,11 +126,27 @@ public class RetinaServer implements Server
     @Override
     public void run()
     {
+        AtomicStateFile installationState = null;
         try
         {
             HeartbeatWorker.setCurrentStatus(NodeStatus.INIT);
-            RetinaServerImpl service = new RetinaServerImpl();
             IngestOptions options = new IngestOptions();
+            RetinaResourceManager resources = RetinaResourceManager.Instance();
+            Set<Long> bootstrapRecoveryFileIds = Collections.emptySet();
+            if (options.enabled)
+            {
+                installationState = new AtomicStateFile(
+                        Paths.get(options.participantPlanDirectory), options.maxStateBytes);
+                bootstrapRecoveryFileIds = PixelsIngestInstaller.recoveryFileIds(
+                        installationState);
+            }
+            RetinaServerImpl service = options.enabled
+                    ? new RetinaServerImpl(
+                            MetadataService.Instance(),
+                            IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local),
+                            resources,
+                            bootstrapRecoveryFileIds)
+                    : new RetinaServerImpl();
             ServerBuilder<?> builder = ServerBuilder.forPort(port).addService(service);
             if (options.enabled)
             {
@@ -146,18 +164,17 @@ public class RetinaServer implements Server
                 String owner = ownerHost + ":" + port;
                 String secret = IngestAuth.configuredSecret();
                 IngestClient client = IngestClient.fromConfig();
-                RetinaResourceManager resources = RetinaResourceManager.Instance();
                 this.retinaResources = resources;
                 PixelsIngestInstaller installer = null;
                 LocalMutationJournal journal = null;
                 try
                 {
                     installer = new PixelsIngestInstaller(
-                            new AtomicStateFile(Paths.get(options.participantPlanDirectory),
-                                    options.maxStateBytes),
+                            installationState,
                             options, owner, resources,
                             IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local),
                             MetadataService.Instance());
+                    installationState = null;
                     journal = new LocalMutationJournal(
                             Files.createDirectories(Paths.get(options.participantWalDirectory)),
                             options.walSegmentBytes,
@@ -226,6 +243,11 @@ public class RetinaServer implements Server
             }
         } catch (Throwable e)
         {
+            if (installationState != null)
+            {
+                try { installationState.close(); }
+                catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            }
             HeartbeatWorker.setCurrentStatus(NodeStatus.EXIT);
             if (e instanceof InterruptedException)
             {
