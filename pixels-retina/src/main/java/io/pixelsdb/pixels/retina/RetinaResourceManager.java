@@ -83,6 +83,23 @@ public class RetinaResourceManager
         return checkPixelsWriteBuffer(schema, table, vnode);
     }
 
+    /**
+     * Returns the private FILE-representation builder. It deliberately is not registered in
+     * {@link #pixelsWriteBufferMap}, so regular buffer PageSources cannot expose its rows before
+     * the resulting Pixels file is atomically published.
+     */
+    public synchronized PixelsWriteBuffer getIngestFileBuffer(
+            String schema, String table, int vnode) throws RetinaException
+    {
+        String key = RetinaUtils.buildWriteBufferKey(schema, table);
+        Map<Integer, PixelsWriteBuffer> existing = ingestFileBufferMap.get(key);
+        if (existing == null || !existing.containsKey(vnode))
+        {
+            addWriteBuffers(schema, table, ingestFileBufferMap, ingestFileTargetRows, false);
+        }
+        return checkPixelsWriteBuffer(ingestFileBufferMap, schema, table, vnode);
+    }
+
     /** Verify that every in-flight installation file is present in recovered visibility. */
     public void initializeIngestBaseline(Set<Long> managedFiles) throws RetinaException
     {
@@ -94,6 +111,8 @@ public class RetinaResourceManager
     }
 
     private final Map<String, Map<Integer, PixelsWriteBuffer>> pixelsWriteBufferMap;
+    private final Map<String, Map<Integer, PixelsWriteBuffer>> ingestFileBufferMap;
+    private final int ingestFileTargetRows;
     private String retinaHostName;
 
     // GC related fields
@@ -209,8 +228,11 @@ public class RetinaResourceManager
         this.indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local);
         this.rgVisibilityMap = new ConcurrentHashMap<>();
         this.pixelsWriteBufferMap = new ConcurrentHashMap<>();
+        this.ingestFileBufferMap = new ConcurrentHashMap<>();
 
         ConfigFactory config = ConfigFactory.Instance();
+        this.ingestFileTargetRows =
+                new io.pixelsdb.pixels.common.ingest.rpc.IngestOptions().fileTargetRows;
 
         this.gcExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "retina-gc-thread");
@@ -424,6 +446,10 @@ public class RetinaResourceManager
         {
             buffers.addAll(perTable.values());
         }
+        for (Map<Integer, PixelsWriteBuffer> perTable : ingestFileBufferMap.values())
+        {
+            buffers.addAll(perTable.values());
+        }
         for (PixelsWriteBuffer buffer : buffers)
         {
             try
@@ -437,6 +463,7 @@ public class RetinaResourceManager
             }
         }
         pixelsWriteBufferMap.clear();
+        ingestFileBufferMap.clear();
 
         for (RGVisibility visibility : rgVisibilityMap.values())
         {
@@ -847,6 +874,16 @@ public class RetinaResourceManager
 
     public synchronized void addWriteBuffer(String schemaName, String tableName) throws RetinaException
     {
+        addWriteBuffers(schemaName, tableName, pixelsWriteBufferMap, 0, true);
+    }
+
+    private void addWriteBuffers(
+            String schemaName,
+            String tableName,
+            Map<String, Map<Integer, PixelsWriteBuffer>> buffers,
+            int minimumFileRows,
+            boolean automaticTailFlush) throws RetinaException
+    {
         try
         {
             /*
@@ -882,14 +919,16 @@ public class RetinaResourceManager
             TypeDescription schema = TypeDescription.createSchemaFromStrings(columnNames, columnTypes);
 
             String writeBufferKey = RetinaUtils.buildWriteBufferKey(schemaName, tableName);
-            Map<Integer, PixelsWriteBuffer> nodeBuffers = pixelsWriteBufferMap.computeIfAbsent(
+            Map<Integer, PixelsWriteBuffer> nodeBuffers = buffers.computeIfAbsent(
                     writeBufferKey, k -> new ConcurrentHashMap<>());
 
             for (int i = 0; i < totalVirtualNodeNum; i++)
             {
                 if (nodeBuffers.containsKey(i)) { continue; }
-                PixelsWriteBuffer pixelsWriteBuffer = new PixelsWriteBuffer(latestLayout.getTableId(),
-                        schema, orderMapping, orderedPaths.get(0), compactPaths.get(0), retinaHostName, i);
+                PixelsWriteBuffer pixelsWriteBuffer = new PixelsWriteBuffer(
+                        latestLayout.getTableId(), schema, orderMapping,
+                        orderedPaths.get(0), compactPaths.get(0), retinaHostName, i,
+                        minimumFileRows, automaticTailFlush);
                 nodeBuffers.put(i, pixelsWriteBuffer);
             }
         } catch (Exception e)
@@ -1079,8 +1118,22 @@ public class RetinaResourceManager
      */
     private PixelsWriteBuffer checkPixelsWriteBuffer(String schema, String table, int vNodeId) throws RetinaException
     {
+        return checkPixelsWriteBuffer(pixelsWriteBufferMap, schema, table, vNodeId);
+    }
+
+    private PixelsWriteBuffer checkPixelsWriteBuffer(
+            Map<String, Map<Integer, PixelsWriteBuffer>> buffers,
+            String schema,
+            String table,
+            int vNodeId) throws RetinaException
+    {
         String writeBufferKey = RetinaUtils.buildWriteBufferKey(schema, table);
-        Map<Integer, PixelsWriteBuffer> nodeBuffers = this.pixelsWriteBufferMap.get(writeBufferKey);
+        Map<Integer, PixelsWriteBuffer> nodeBuffers = buffers.get(writeBufferKey);
+        if (nodeBuffers == null)
+        {
+            throw new RetinaException(String.format(
+                    "Writer buffer not found for table: %s.%s", schema, table));
+        }
         PixelsWriteBuffer writeBuffer = nodeBuffers.get(vNodeId);
         if (writeBuffer == null)
         {
@@ -1207,6 +1260,17 @@ public class RetinaResourceManager
                 // omitted: the scope contributes nothing to recovery replay.
                 List<PendingSegmentEntry> segments = new ArrayList<>();
                 for (Map<Integer, PixelsWriteBuffer> perTable : this.pixelsWriteBufferMap.values())
+                {
+                    for (PixelsWriteBuffer buffer : perTable.values())
+                    {
+                        long ts = buffer.getEarliestPendingMinTs();
+                        if (ts != Long.MAX_VALUE)
+                        {
+                            segments.add(new PendingSegmentEntry(buffer.getVirtualNodeId(), ts));
+                        }
+                    }
+                }
+                for (Map<Integer, PixelsWriteBuffer> perTable : this.ingestFileBufferMap.values())
                 {
                     for (PixelsWriteBuffer buffer : perTable.values())
                     {

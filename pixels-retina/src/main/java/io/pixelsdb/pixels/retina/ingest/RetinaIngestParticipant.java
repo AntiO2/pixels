@@ -36,6 +36,9 @@ import org.apache.logging.log4j.Logger;
 
 /** Exact stream receipts, authoritative decisions, and private preparation around existing Retina storage. */
 public final class RetinaIngestParticipant implements Closeable {
+    private static final long DEFAULT_INSTALL_POLL_MILLIS = 25L;
+    private static final int DEFAULT_PRIVATE_READ_MAX_BATCHES = 128;
+    private static final int DEFAULT_PRIVATE_READ_MAX_BYTES = 4 * 1024 * 1024;
     private static final Logger LOG = LogManager.getLogger(RetinaIngestParticipant.class);
     public interface Decisions {
         Transaction get(long id) throws Exception;
@@ -48,8 +51,16 @@ public final class RetinaIngestParticipant implements Closeable {
     public interface Installer extends Closeable {
         void prepare(Transaction tx, Iterable<MutationBatch> batches) throws Exception;
 
-        void install(Transaction tx, Iterable<MutationBatch> batches, boolean recovering)
+        boolean install(
+                Transaction tx,
+                Iterable<MutationBatch> batches,
+                boolean recovering,
+                boolean forceFileTail)
                 throws Exception;
+
+        default long installPollMillis() {
+            return DEFAULT_INSTALL_POLL_MILLIS;
+        }
 
         void release(long txId) throws Exception;
 
@@ -70,8 +81,11 @@ public final class RetinaIngestParticipant implements Closeable {
     private final Decisions decisions;
     private final Installer installer;
     private final IngestReadPins readPins;
+    private final int privateReadMaxBatches;
+    private final int privateReadMaxBytes;
     private final Map<Long, ByteString> prepared = new HashMap<>();
     private final Set<Long> installed = new HashSet<>();
+    private final Set<Long> installing = new HashSet<>();
     private long lastInstalledTimestamp;
     private boolean ready;
     private final ScheduledExecutorService checkpointWorker =
@@ -89,11 +103,28 @@ public final class RetinaIngestParticipant implements Closeable {
             Decisions decisions,
             Installer installer,
             IngestReadPins readPins) {
+        this(owner, journal, decisions, installer, readPins,
+                DEFAULT_PRIVATE_READ_MAX_BATCHES, DEFAULT_PRIVATE_READ_MAX_BYTES);
+    }
+
+    public RetinaIngestParticipant(
+            String owner,
+            LocalMutationJournal journal,
+            Decisions decisions,
+            Installer installer,
+            IngestReadPins readPins,
+            int privateReadMaxBatches,
+            int privateReadMaxBytes) {
+        if (privateReadMaxBatches <= 0 || privateReadMaxBytes <= 0) {
+            throw new IllegalArgumentException("Private-read limits must be positive");
+        }
         this.owner = owner;
         this.journal = journal;
         this.decisions = decisions;
         this.installer = installer;
         this.readPins = readPins;
+        this.privateReadMaxBatches = privateReadMaxBatches;
+        this.privateReadMaxBytes = privateReadMaxBytes;
     }
 
     private void serving() throws IOException {
@@ -103,9 +134,9 @@ public final class RetinaIngestParticipant implements Closeable {
     }
 
     private void owns(Transaction tx, MutationStreamId stream) throws IOException {
+        TableSpec table = IngestWire.table(tx, stream.getTableId());
         if (stream.getTransactionId() != tx.getTransactionId()
-                || stream.getTableId() != tx.getTable().getTableId()
-                || !IngestWire.owner(IngestWire.route(tx.getTable(), stream.getShardId()))
+                || !IngestWire.owner(IngestWire.route(table, stream.getShardId()))
                         .equals(owner)
                 || !tx.getStreamsList().contains(IngestWire.encode(stream))) {
             throw new IOException("Unregistered or incorrectly routed stream");
@@ -119,7 +150,8 @@ public final class RetinaIngestParticipant implements Closeable {
         if (tx.getState() != TransactionState.OPEN) {
             throw new IOException("Transaction no longer accepts input");
         }
-        if (batch.getSchemaVersion() != tx.getTable().getSchemaVersion()
+        TableSpec table = IngestWire.table(tx, batch.getStreamId().getTableId());
+        if (batch.getSchemaVersion() != table.getSchemaVersion()
                 || batch.getPayloadFormat()
                         != io.pixelsdb.pixels.common.ingest.wire.ColumnBatchCodec.FORMAT
                 || batch.getStreamId().getKind() != MutationStreamId.Kind.APPEND_ROWS) {
@@ -142,6 +174,10 @@ public final class RetinaIngestParticipant implements Closeable {
     private Transaction authoritative(Transaction requested) throws Exception {
         Transaction current = decisions.get(requested.getTransactionId());
         if (!current.getTable().equals(requested.getTable())
+                || !current.getEnlistedTablesList().equals(requested.getEnlistedTablesList())
+                || !current.getStatementsList().equals(requested.getStatementsList())
+                || current.getRepresentation() != requested.getRepresentation()
+                || current.getAckMode() != requested.getAckMode()
                 || !current.getSealsList().equals(requested.getSealsList())) {
             throw new IOException("Participant manifest differs from authoritative transaction");
         }
@@ -215,15 +251,39 @@ public final class RetinaIngestParticipant implements Closeable {
         return PrepareToken.newBuilder().setOwner(owner).setDigest(digest).build();
     }
 
-    public synchronized void install(Transaction request) throws Exception {
-        serving();
-        installAuthorized(authoritative(request), false);
+    public boolean install(Transaction request, boolean forceFileTail) throws Exception {
+        Transaction tx;
+        synchronized (this) {
+            serving();
+            tx = authoritative(request);
+            while (installing.contains(tx.getTransactionId())) {
+                wait();
+            }
+            if (installed.contains(tx.getTransactionId())) {
+                return true;
+            }
+            validateInstallation(tx);
+            installing.add(tx.getTransactionId());
+        }
+        boolean readyForPublication = false;
+        try {
+            readyForPublication = installer.install(
+                    tx, batches(tx), false, forceFileTail);
+            return readyForPublication;
+        } finally {
+            synchronized (this) {
+                installing.remove(tx.getTransactionId());
+                if (readyForPublication) {
+                    installed.add(tx.getTransactionId());
+                    lastInstalledTimestamp =
+                            Math.max(lastInstalledTimestamp, tx.getCommitTimestamp());
+                }
+                notifyAll();
+            }
+        }
     }
 
     private void installAuthorized(Transaction tx, boolean recovering) throws Exception {
-        if (!IngestWire.committed(tx)) {
-            throw new IOException("Installation requires authoritative COMMIT");
-        }
         if (installed.contains(tx.getTransactionId())) {
             return;
         }
@@ -232,8 +292,17 @@ public final class RetinaIngestParticipant implements Closeable {
             lastInstalledTimestamp = Math.max(lastInstalledTimestamp, tx.getCommitTimestamp());
             return;
         }
-        if (tx.getCommitTimestamp() < lastInstalledTimestamp) {
-            throw new IOException("Commit installation order violation");
+        validateInstallation(tx);
+        while (!installer.install(tx, batches(tx), recovering, false)) {
+            Thread.sleep(installer.installPollMillis());
+        }
+        installed.add(tx.getTransactionId());
+        lastInstalledTimestamp = Math.max(lastInstalledTimestamp, tx.getCommitTimestamp());
+    }
+
+    private void validateInstallation(Transaction tx) throws IOException {
+        if (!IngestWire.committed(tx)) {
+            throw new IOException("Installation requires authoritative COMMIT");
         }
         boolean validToken = false;
         for (PrepareToken token : tx.getTokensList()) {
@@ -246,9 +315,6 @@ public final class RetinaIngestParticipant implements Closeable {
         if (!validToken) {
             throw new IOException("Committed transaction lacks the participant prepare token");
         }
-        installer.install(tx, batches(tx), recovering);
-        installed.add(tx.getTransactionId());
-        lastInstalledTimestamp = tx.getCommitTimestamp();
     }
 
     public synchronized void discard(long id) throws Exception {
@@ -350,6 +416,100 @@ public final class RetinaIngestParticipant implements Closeable {
             throw new IOException("Cannot pin an unpublished read timestamp");
         }
         return readPins.pin(request);
+    }
+
+    public synchronized PrivateReadPage readPrivate(PrivateReadRequest request) throws Exception {
+        serving();
+        if (request.getMaxBatches() == 0
+                || request.getMaxBatches() > privateReadMaxBatches
+                || request.getMaxBytes() == 0
+                || request.getMaxBytes() > privateReadMaxBytes) {
+            throw new IOException("Private-read page exceeds configured limits");
+        }
+        Transaction tx = decisions.get(request.getTransactionId());
+        if (tx.getState() != TransactionState.OPEN || tx.getRollbackOnly()) {
+            throw new IOException("Private reads require an open transaction");
+        }
+        readPins.validate(request.getReadPinToken(), tx.getReadTimestamp(),
+                tx.getTransactionId());
+        StatementManifest reader = null;
+        for (StatementManifest statement : tx.getStatementsList()) {
+            if (statement.getStatementId() == request.getReaderStatementId()) {
+                reader = statement;
+                break;
+            }
+        }
+        if (reader == null
+                || reader.getState() != StatementState.STATEMENT_OPEN
+                || reader.getReadOwnThroughOrdinal() != request.getReadOwnThroughOrdinal()
+                || !reader.getReadTableIdsList().contains(request.getTableId())) {
+            throw new IOException("Private-read frontier does not match the open statement");
+        }
+        IngestWire.table(tx, request.getTableId());
+        List<StreamSeal> seals = new ArrayList<>();
+        for (StatementManifest statement : tx.getStatementsList()) {
+            if (statement.getState() != StatementState.STATEMENT_COMPLETE
+                    || statement.getOrdinal() > request.getReadOwnThroughOrdinal()
+                    || statement.getTableId() != request.getTableId()) {
+                continue;
+            }
+            for (StreamSeal seal : statement.getSealsList()) {
+                TableSpec table = IngestWire.table(tx, seal.getStream().getTableId());
+                if (IngestWire.owner(IngestWire.route(
+                        table, seal.getStream().getShardId())).equals(owner)) {
+                    seals.add(seal);
+                }
+            }
+        }
+        seals.sort(Comparator
+                .comparingLong((StreamSeal seal) -> seal.getStream().getStatementId())
+                .thenComparingLong(seal -> seal.getStream().getWriterId())
+                .thenComparingInt(seal -> seal.getStream().getShardId())
+                .thenComparingInt(seal -> seal.getStream().getKindValue()));
+
+        long totalBatches = 0;
+        for (StreamSeal seal : seals) {
+            totalBatches = Math.addExact(totalBatches, seal.getBatchCount());
+        }
+        if (request.getBatchOffset() > totalBatches) {
+            throw new IOException("Private-read offset exceeds the exact manifest");
+        }
+
+        PrivateReadPage.Builder page = PrivateReadPage.newBuilder()
+                .setManifestDigest(ByteString.copyFrom(IngestWire.privateReadDigest(
+                        tx, request.getReaderStatementId(), request.getTableId(),
+                        request.getReadOwnThroughOrdinal())));
+        long logicalOffset = 0;
+        int pageBytes = 0;
+        for (StreamSeal seal : seals) {
+            MutationStreamId stream = IngestWire.decode(seal.getStream());
+            MutationStreamSeal durableSeal = journal.getSeal(stream)
+                    .orElseThrow(() -> new IOException("Missing private stream seal"));
+            if (!durableSeal.equals(IngestWire.decode(seal))) {
+                throw new IOException("Private stream seal differs from exact manifest");
+            }
+            for (long sequence = 0; sequence < seal.getBatchCount(); sequence++) {
+                if (logicalOffset++ < request.getBatchOffset()) {
+                    continue;
+                }
+                AppendRequest batch = IngestWire.encode(journal.readSealedBatch(stream, sequence));
+                int nextBytes = Math.addExact(pageBytes, batch.getSerializedSize());
+                if (page.getBatchesCount() >= request.getMaxBatches()
+                        || nextBytes > request.getMaxBytes()) {
+                    if (page.getBatchesCount() == 0) {
+                        throw new IOException(
+                                "Private batch exceeds the requested page byte limit");
+                    }
+                    return page.setNextBatchOffset(
+                            request.getBatchOffset() + page.getBatchesCount())
+                            .setEndOfInput(false)
+                            .build();
+                }
+                page.addBatches(batch);
+                pageBytes = nextBytes;
+            }
+        }
+        return page.setNextBatchOffset(totalBatches).setEndOfInput(true).build();
     }
 
     public IngestReadPins readPins() {

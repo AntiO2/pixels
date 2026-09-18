@@ -32,6 +32,8 @@ import java.util.stream.Stream;
 /** The same contract cases run under JUnit or directly with a JDK. */
 public final class LocalMutationJournalContract
 {
+    private static final long STATEMENT_ID = 1L;
+
     private LocalMutationJournalContract() {}
 
     public static void roundTripAndStreamIsolation() throws Exception
@@ -297,7 +299,9 @@ public final class LocalMutationJournalContract
     {
         withDirectory(dir -> {
             MutationBatch a = batch(id(91, 1), 0, 1, new byte[]{1});
-            MutationBatch d = batch(new MutationStreamId(91, 1, 1, 0, MutationStreamId.Kind.DELETE_ROWS), 0, 1, new byte[]{1});
+            MutationBatch d = batch(new MutationStreamId(
+                    91, STATEMENT_ID, 1, 1, 0, MutationStreamId.Kind.DELETE_ROWS),
+                    0, 1, new byte[]{1});
             try (LocalMutationJournal journal = open(dir))
             {
                 journal.append(a); journal.append(d);
@@ -340,7 +344,8 @@ public final class LocalMutationJournalContract
 
     private static MutationStreamId id(long tx, long writer)
     {
-        return new MutationStreamId(tx, writer, 1, 0, MutationStreamId.Kind.APPEND_ROWS);
+        return new MutationStreamId(
+                tx, STATEMENT_ID, writer, 1, 0, MutationStreamId.Kind.APPEND_ROWS);
     }
 
     private static MutationBatch batch(MutationStreamId id, long sequence, int rows, byte[] payload)

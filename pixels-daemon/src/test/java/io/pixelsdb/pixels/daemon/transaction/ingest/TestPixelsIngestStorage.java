@@ -54,6 +54,8 @@ import java.util.concurrent.atomic.*;
  * Catalog/node RPCs and the etcd-backed allocation source are isolated test doubles.
  */
 public class TestPixelsIngestStorage {
+    private static final long STATEMENT_ID = 1L;
+
     private static <T> void reply(StreamObserver<T> out, T value) {
         out.onNext(value);
         out.onCompleted();
@@ -385,6 +387,10 @@ public class TestPixelsIngestStorage {
             assertEquals(0, table.getIndexesCount());
             resources.addWriteBuffer("s", "t");
             buffer = resources.getIngestBuffer("s", "t", 0);
+            assertNotSame(
+                    buffer,
+                    resources.getIngestFileBuffer("s", "t", 0),
+                    "FILE installation must not reuse the query-visible BUFFERED instance");
             AtomicLong allocation = new AtomicLong(1000),
                     allocationCalls = new AtomicLong(),
                     putCalls = new AtomicLong();
@@ -433,7 +439,9 @@ public class TestPixelsIngestStorage {
             byte[] payload = ColumnBatchCodec.encode(rows, 1, 1024 * 1024);
             MutationBatch batch =
                     new MutationBatch(
-                            new MutationStreamId(100, 1, 73, 0, MutationStreamId.Kind.APPEND_ROWS),
+                            new MutationStreamId(
+                                    100, STATEMENT_ID, 1, 73, 0,
+                                    MutationStreamId.Kind.APPEND_ROWS),
                             0,
                             table.getSchemaVersion(),
                             ColumnBatchCodec.FORMAT,
@@ -443,17 +451,25 @@ public class TestPixelsIngestStorage {
                     Transaction.newBuilder()
                             .setTransactionId(100)
                             .setTable(table)
+                            .addEnlistedTables(table)
                             .setCommitTimestamp(200)
                             .setState(TransactionState.COMMIT_DECIDED)
+                            .setOutcome(DecisionOutcome.COMMIT)
+                            .setProgress(PublicationProgress.INSTALLING)
+                            .setCommitToken("storage-test-100")
                             .build();
+            // Hold catalog publication at the intended fault boundary. The object and
+            // MainIndex flushes remain real, while buffer-read assertions no longer race the
+            // asynchronous publisher that this test later resumes explicitly.
+            catalog.rejectPublication.set(true);
             installer.prepare(tx, Collections.singletonList(batch));
             assertEquals(0, catalog.files.size());
             PixelsIngestInstaller target = installer;
             assertThrows(
                     io.pixelsdb.pixels.common.exception.IndexException.class,
-                    () -> target.install(tx, Collections.singletonList(batch), false));
-            installer.install(tx, Collections.singletonList(batch), false);
-            installer.install(tx, Collections.singletonList(batch), false);
+                    () -> target.install(tx, Collections.singletonList(batch), false, false));
+            installer.install(tx, Collections.singletonList(batch), false, false);
+            installer.install(tx, Collections.singletonList(batch), false, false);
             assertEquals(
                     1, allocationCalls.get(), "Replay must reuse the recorded allocator result");
             for (long id = 1000; id < 1250; id++) {
@@ -470,7 +486,9 @@ public class TestPixelsIngestStorage {
             // A second transaction fills the last block and starts the next generation.
             MutationBatch second =
                     new MutationBatch(
-                            new MutationStreamId(101, 1, 73, 0, MutationStreamId.Kind.APPEND_ROWS),
+                            new MutationStreamId(
+                                    101, STATEMENT_ID, 1, 73, 0,
+                                    MutationStreamId.Kind.APPEND_ROWS),
                             0,
                             table.getSchemaVersion(),
                             ColumnBatchCodec.FORMAT,
@@ -481,7 +499,7 @@ public class TestPixelsIngestStorage {
                                     1024 * 1024));
             Transaction next = tx.toBuilder().setTransactionId(101).setCommitTimestamp(201).build();
             installer.prepare(next, Collections.singletonList(second));
-            installer.install(next, Collections.singletonList(second), false);
+            installer.install(next, Collections.singletonList(second), false, false);
             assertEquals(260, bufferedRows(buffer));
             assertEquals(2, allocationCalls.get());
             // Query the real read overlay before files exist. Use bitmap identities
@@ -494,7 +512,6 @@ public class TestPixelsIngestStorage {
             assertEquals(259, readBuffered(resources, root, 201));
             assertEquals(0, readBuffered(resources, root, 199));
             long priorPuts = putCalls.get();
-            catalog.rejectPublication.set(true);
             resources.getIngestReadPins().release(pin);
             // Wait until the actual SQLite flush is durable, while metadata publication fails.
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
@@ -504,7 +521,7 @@ public class TestPixelsIngestStorage {
             assertTrue(
                     hasFlushedFile(root.resolve("sqlite")),
                     "MainIndex per-file marker must be persisted");
-            installer.install(tx, Collections.singletonList(batch), false);
+            installer.install(tx, Collections.singletonList(batch), false, false);
             assertEquals(
                     priorPuts,
                     putCalls.get(),
@@ -563,7 +580,8 @@ public class TestPixelsIngestStorage {
                             .virtualNodesPerNode(1)
                             .rgEntries(checkpointVisibility)
                             .build());
-            Transaction published = tx.toBuilder().setState(TransactionState.PUBLISHED).build();
+            Transaction published = tx.toBuilder().setState(TransactionState.PUBLISHED)
+                    .setProgress(PublicationProgress.VISIBLE_NOW).build();
             assertTrue(installer.checkpoint(published, Collections.singletonList(batch)));
             assertTrue(installer.recoveredByCheckpoint(published));
 
@@ -672,7 +690,9 @@ public class TestPixelsIngestStorage {
                     new AtomicStateFile(planDirectory, 16 * 1024 * 1024),
                     new IngestOptions(), "127.0.0.1:18890", resources, index,
                     MetadataService.Instance());
-            Transaction publishedNext = next.toBuilder().setState(TransactionState.PUBLISHED).build();
+            Transaction publishedNext = next.toBuilder().setState(TransactionState.PUBLISHED)
+                    .setProgress(PublicationProgress.VISIBLE_NOW)
+                    .setCommitToken("storage-test-101").build();
             installer.initializeRecovery(Collections.singletonList(publishedNext));
             assertFalse(installer.recoveredByCheckpoint(published),
                     "Coordinator absence is the durable acknowledgement that prunes this checkpoint");

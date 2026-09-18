@@ -34,6 +34,8 @@ import java.util.concurrent.atomic.*;
  * topology service, and etcd-backed identity sources are deterministic fixtures.
  */
 public final class SqlIngestFixture implements AutoCloseable {
+    private static final long SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5L;
+
     private static String benchmarkSetting(String name, String fallback) {
         String value = System.getenv(name);
         return value == null || value.trim().isEmpty() ? fallback : value.trim();
@@ -53,27 +55,76 @@ public final class SqlIngestFixture implements AutoCloseable {
         private static final int CATALOG_MAGIC = 0x50464331;
         private static final int CATALOG_VERSION = 1;
         private static final int MAX_CATALOG_BYTES = 16 * 1024 * 1024;
+        private static final long SCHEMA_ID = 1L;
+        private static final long TABLE_T_ID = 73L;
+        private static final long TABLE_A_ID = 74L;
+        private static final long TABLE_B_ID = 75L;
+        private static final long TABLE_T_LAYOUT_ID = 1L;
+        private static final long TABLE_A_LAYOUT_ID = 2L;
+        private static final long TABLE_B_LAYOUT_ID = 3L;
+        private static final long TABLE_T_ORDERED_PATH_ID = 1L;
+        private static final long TABLE_T_COMPACT_PATH_ID = 2L;
+        private static final long TABLE_A_ORDERED_PATH_ID = 3L;
+        private static final long TABLE_A_COMPACT_PATH_ID = 4L;
+        private static final long TABLE_B_ORDERED_PATH_ID = 5L;
+        private static final long TABLE_B_COMPACT_PATH_ID = 6L;
+        private static final long ID_COLUMN_ID = 1L;
+        private static final long LABEL_COLUMN_ID = 2L;
+        private static final long INITIAL_CATALOG_ID = 100L;
+        private static final int MAX_CATALOG_FILE_COUNT = 100_000;
+        private static final String SCHEMA_NAME = "s";
+        private static final String TABLE_T_NAME = "t";
+        private static final String TABLE_A_NAME = "a";
+        private static final String TABLE_B_NAME = "b";
 
         private final AtomicStateFile catalogState;
-        private final MetadataProto.Layout sqlLayout;
-        private final MetadataProto.Table table =
-                MetadataProto.Table.newBuilder()
-                        .setId(73)
-                        .setSchemaId(1)
-                        .setName("t")
-                        .setType("user")
-                        .setStorageScheme("file")
-                        .build();
+        private final Map<String, MetadataProto.Table> tables = new LinkedHashMap<>();
+        private final Map<String, MetadataProto.Layout> layouts = new LinkedHashMap<>();
 
         Catalog(Path root) throws Exception {
             super(root);
             catalogState = new AtomicStateFile(root.resolve("fixture-catalog"), MAX_CATALOG_BYTES);
             restoreCatalog(catalogState.read());
-            sqlLayout =
-                    layout.toBuilder()
-                            .setOrdered("{\"columnOrder\":[\"id\",\"label\"]}")
-                            .setSplits("{\"numRowGroupInFile\":1,\"splitPatterns\":[]}")
-                            .build();
+            registerTable(root, TABLE_T_NAME, TABLE_T_ID, TABLE_T_LAYOUT_ID,
+                    TABLE_T_ORDERED_PATH_ID, TABLE_T_COMPACT_PATH_ID);
+            registerTable(root.resolve(TABLE_A_NAME), TABLE_A_NAME, TABLE_A_ID, TABLE_A_LAYOUT_ID,
+                    TABLE_A_ORDERED_PATH_ID, TABLE_A_COMPACT_PATH_ID);
+            registerTable(root.resolve(TABLE_B_NAME), TABLE_B_NAME, TABLE_B_ID, TABLE_B_LAYOUT_ID,
+                    TABLE_B_ORDERED_PATH_ID, TABLE_B_COMPACT_PATH_ID);
+        }
+
+        private void registerTable(
+                Path root, String name, long tableId, long layoutId,
+                long orderedPathId, long compactPathId) throws IOException {
+            Path ordered = Files.createDirectories(root.resolve("ordered"));
+            Path compact = Files.createDirectories(root.resolve("compact"));
+            MetadataProto.Table table = MetadataProto.Table.newBuilder()
+                    .setId(tableId)
+                    .setSchemaId(SCHEMA_ID)
+                    .setName(name)
+                    .setType("user")
+                    .setStorageScheme("file")
+                    .build();
+            MetadataProto.Layout tableLayout = layout.toBuilder()
+                    .setId(layoutId)
+                    .setTableId(tableId)
+                    .clearOrderedPaths()
+                    .clearCompactPaths()
+                    .addOrderedPaths(MetadataProto.Path.newBuilder()
+                            .setId(orderedPathId)
+                            .setLayoutId(layoutId)
+                            .setUri(ordered.toUri().toString())
+                            .setType(MetadataProto.Path.Type.ORDERED))
+                    .addCompactPaths(MetadataProto.Path.newBuilder()
+                            .setId(compactPathId)
+                            .setLayoutId(layoutId)
+                            .setUri(compact.toUri().toString())
+                            .setType(MetadataProto.Path.Type.COMPACT))
+                    .setOrdered("{\"columnOrder\":[\"id\",\"label\"]}")
+                    .setSplits("{\"numRowGroupInFile\":1,\"splitPatterns\":[]}")
+                    .build();
+            tables.put(name, table);
+            layouts.put(name, tableLayout);
         }
 
         private void restoreCatalog(byte[] snapshot) throws Exception {
@@ -88,10 +139,12 @@ public final class SqlIngestFixture implements AutoCloseable {
                 }
                 long restoredId = input.readLong();
                 int count = input.readInt();
-                if (restoredId < 100 || count < 0 || count > 100000) {
+                if (restoredId < INITIAL_CATALOG_ID
+                        || count < 0
+                        || count > MAX_CATALOG_FILE_COUNT) {
                     throw new IOException("Invalid fixture catalog state bounds");
                 }
-                long maximumId = 100;
+                long maximumId = INITIAL_CATALOG_ID;
                 for (int i = 0; i < count; i++) {
                     int length = input.readInt();
                     if (length <= 0 || length > MAX_CATALOG_BYTES || length > input.available()) {
@@ -147,12 +200,13 @@ public final class SqlIngestFixture implements AutoCloseable {
         @Override
         public void getTable(
                 MetadataProto.GetTableRequest r, StreamObserver<MetadataProto.GetTableResponse> o) {
+            MetadataProto.Table table = requireTable(r.getTableName());
             reply(
                     o,
                     MetadataProto.GetTableResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
                             .setTable(table)
-                            .addLayouts(sqlLayout)
+                            .addLayouts(layouts.get(table.getName()))
                             .build());
         }
 
@@ -160,20 +214,21 @@ public final class SqlIngestFixture implements AutoCloseable {
         public void getColumns(
                 MetadataProto.GetColumnsRequest r,
                 StreamObserver<MetadataProto.GetColumnsResponse> o) {
+            MetadataProto.Table table = requireTable(r.getTableName());
             reply(
                     o,
                     MetadataProto.GetColumnsResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
                             .addColumns(
                                     MetadataProto.Column.newBuilder()
-                                            .setId(1)
-                                            .setTableId(73)
+                                            .setId(ID_COLUMN_ID)
+                                            .setTableId(table.getId())
                                             .setName("id")
                                             .setType("bigint"))
                             .addColumns(
                                     MetadataProto.Column.newBuilder()
-                                            .setId(2)
-                                            .setTableId(73)
+                                            .setId(LABEL_COLUMN_ID)
+                                            .setTableId(table.getId())
                                             .setName("label")
                                             .setType("varchar"))
                             .build());
@@ -187,7 +242,7 @@ public final class SqlIngestFixture implements AutoCloseable {
                     o,
                     MetadataProto.GetLayoutResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .setLayout(sqlLayout)
+                            .setLayout(requireLayout(r.getTableName()))
                             .build());
         }
 
@@ -199,7 +254,7 @@ public final class SqlIngestFixture implements AutoCloseable {
                     o,
                     MetadataProto.GetLayoutsResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .addLayouts(sqlLayout)
+                            .addLayouts(requireLayout(r.getTableName()))
                             .build());
         }
 
@@ -211,7 +266,8 @@ public final class SqlIngestFixture implements AutoCloseable {
                     o,
                     MetadataProto.GetSchemasResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .addSchemas(MetadataProto.Schema.newBuilder().setId(1).setName("s"))
+                            .addSchemas(MetadataProto.Schema.newBuilder()
+                                    .setId(SCHEMA_ID).setName(SCHEMA_NAME))
                             .build());
         }
 
@@ -223,7 +279,7 @@ public final class SqlIngestFixture implements AutoCloseable {
                     o,
                     MetadataProto.GetTablesResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .addTables(table)
+                            .addAllTables(tables.values())
                             .build());
         }
 
@@ -235,7 +291,7 @@ public final class SqlIngestFixture implements AutoCloseable {
                     o,
                     MetadataProto.ExistSchemaResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .setExists(r.getSchemaName().equals("s"))
+                            .setExists(r.getSchemaName().equals(SCHEMA_NAME))
                             .build());
         }
 
@@ -247,8 +303,8 @@ public final class SqlIngestFixture implements AutoCloseable {
                     o,
                     MetadataProto.ExistTableResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
-                            .setExists(
-                                    r.getSchemaName().equals("s") && r.getTableName().equals("t"))
+                            .setExists(r.getSchemaName().equals(SCHEMA_NAME)
+                                    && tables.containsKey(r.getTableName()))
                             .build());
         }
 
@@ -256,12 +312,32 @@ public final class SqlIngestFixture implements AutoCloseable {
         public void getTableById(
                 MetadataProto.GetTableByIdRequest r,
                 StreamObserver<MetadataProto.GetTableByIdResponse> o) {
+            MetadataProto.Table table = tables.values().stream()
+                    .filter(value -> value.getId() == r.getTableId())
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("Unknown fixture table id"));
             reply(
                     o,
                     MetadataProto.GetTableByIdResponse.newBuilder()
                             .setHeader(ok(r.getHeader()))
                             .setTable(table)
                             .build());
+        }
+
+        private MetadataProto.Table requireTable(String name) {
+            MetadataProto.Table table = tables.get(name);
+            if (table == null) {
+                throw new IllegalArgumentException("Unknown fixture table: " + name);
+            }
+            return table;
+        }
+
+        private MetadataProto.Layout requireLayout(String name) {
+            MetadataProto.Layout tableLayout = layouts.get(name);
+            if (tableLayout == null) {
+                throw new IllegalArgumentException("Unknown fixture table layout: " + name);
+            }
+            return tableLayout;
         }
 
         @Override
@@ -320,6 +396,17 @@ public final class SqlIngestFixture implements AutoCloseable {
                     .filter(f -> f.getType() == MetadataProto.File.Type.REGULAR)
                     .count();
         }
+
+        public long publishedFileCount(String tableName) {
+            MetadataProto.Layout tableLayout = requireLayout(tableName);
+            Set<Long> pathIds = new HashSet<>();
+            tableLayout.getOrderedPathsList().forEach(path -> pathIds.add(path.getId()));
+            tableLayout.getCompactPathsList().forEach(path -> pathIds.add(path.getId()));
+            return files.values().stream()
+                    .filter(file -> file.getType() == MetadataProto.File.Type.REGULAR)
+                    .filter(file -> pathIds.contains(file.getPathId()))
+                    .count();
+        }
     }
 
     public final Path root;
@@ -329,7 +416,6 @@ public final class SqlIngestFixture implements AutoCloseable {
     public final IngestClient client;
     private final Server metadataServer, nodeServer, transactionServer, retinaServer;
     private final RetinaIngestParticipant participant;
-    private final List<PixelsWriteBuffer> buffers = new ArrayList<>();
     private final String owner;
     private final boolean recoveryCheckpointEnabled;
     private final Map<String, String> exportedSettings = new LinkedHashMap<>();
@@ -361,6 +447,24 @@ public final class SqlIngestFixture implements AutoCloseable {
         settings.put("retina.ingest.coordinator.state.dir", root.resolve("decisions").toString());
         settings.put("retina.ingest.participant.plan.dir", root.resolve("plans").toString());
         settings.put("retina.ingest.participant.wal.dir", root.resolve("wal").toString());
+        settings.put(
+                "retina.ingest.commit.ack",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_COMMIT_ACK", "VISIBLE"));
+        settings.put(
+                "retina.ingest.write.representation",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_REPRESENTATION", "BUFFERED"));
+        settings.put(
+                "retina.ingest.file.target.rows",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_FILE_TARGET_ROWS", "1000000"));
+        settings.put(
+                "retina.ingest.file.max.bytes",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_FILE_MAX_BYTES", "536870912"));
+        settings.put(
+                "retina.ingest.file.max.delay.ms",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_FILE_MAX_DELAY_MS", "30000"));
+        settings.put(
+                "retina.ingest.file.poll.ms",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_FILE_POLL_MS", "25"));
         settings.put("retina.storage.gc.enabled", "false");
         if (recoveryCheckpointEnabled) {
             settings.put("retina.gc.interval", "1");
@@ -378,7 +482,9 @@ public final class SqlIngestFixture implements AutoCloseable {
         settings.put(
                 "retina.buffer.flush.count",
                 benchmarkSetting("PIXELS_SQL_FIXTURE_FLUSH_COUNT", "2"));
-        settings.put("retina.buffer.flush.interval", "1");
+        settings.put(
+                "retina.buffer.flush.interval",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_FLUSH_INTERVAL_SECONDS", "1"));
         settings.put(
                 "retina.buffer.object.storage.folder", root.resolve("objects").toUri().toString());
         settings.put("retina.storage.gc.journal.dir", root.resolve("gc").toUri().toString());
@@ -402,6 +508,9 @@ public final class SqlIngestFixture implements AutoCloseable {
         settings.put(
                 "retina.ingest.max.batch.bytes",
                 benchmarkSetting("PIXELS_SQL_FIXTURE_MAX_BATCH_BYTES", "4096"));
+        settings.put(
+                "retina.ingest.max.state.bytes",
+                benchmarkSetting("PIXELS_SQL_FIXTURE_MAX_STATE_BYTES", "67108864"));
         settings.forEach(config::addProperty);
         catalog = new Catalog(root);
         metadataServer = ServerBuilder.forPort(0).addService(catalog).build().start();
@@ -444,10 +553,11 @@ public final class SqlIngestFixture implements AutoCloseable {
         config.addProperty("node.server.host", "127.0.0.1");
         config.addProperty("node.server.port", Integer.toString(nodeServer.getPort()));
         AtomicLong identities = new AtomicLong(10000);
+        IngestOptions ingestOptions = new IngestOptions();
         AtomicReference<IngestClient> clients = new AtomicReference<>();
         coordinator =
                 new DurableIngestCoordinator(
-                        new AtomicStateFile(root.resolve("decisions"), 64 * 1024 * 1024),
+                        new AtomicStateFile(root.resolve("decisions"), ingestOptions.maxStateBytes),
                         new DurableIngestCoordinator.Tables() {
                             public TableSpec load(String s, String t) throws Exception {
                                 return IngestTables.load(s, t);
@@ -468,14 +578,17 @@ public final class SqlIngestFixture implements AutoCloseable {
                                                         .build());
                             }
 
-                            public void install(String o, Transaction tx) {
-                                clients.get()
+                            public boolean install(
+                                    String o, Transaction tx, boolean forceFileTail) {
+                                return clients.get()
                                         .participant(o)
                                         .install(
                                                 ParticipantRequest.newBuilder()
                                                         .setOwner(o)
                                                         .setTransaction(tx)
-                                                        .build());
+                                                        .setForceFileTail(forceFileTail)
+                                                        .build())
+                                        .getReady();
                             }
 
                             public void checkpoint(String o, long tx) {
@@ -489,9 +602,12 @@ public final class SqlIngestFixture implements AutoCloseable {
                         identities::incrementAndGet,
                         Clock.systemUTC(),
                         0,
-                        300000,
-                        10000,
-                        4096);
+                        ingestOptions.transactionLeaseMillis,
+                        ingestOptions.maxTransactions,
+                        ingestOptions.maxStreams,
+                        ingestOptions.terminalRetentionMillis,
+                        ingestOptions.maxTerminalTransactions,
+                        ingestOptions.installationThreads);
         // Only the existing read-ID service is a fixture. Write outcomes use the real durable
         // coordinator above.
         TransServiceGrpc.TransServiceImplBase readTransactions =
@@ -550,11 +666,18 @@ public final class SqlIngestFixture implements AutoCloseable {
                 "retina.ingest.coordinator.port", Integer.toString(transactionServer.getPort()));
         client =
                 new IngestClient(
-                        "127.0.0.1", transactionServer.getPort(), secret, 64 * 1024 * 1024, 30000);
+                        "127.0.0.1",
+                        transactionServer.getPort(),
+                        secret,
+                        ingestOptions.maxStateBytes,
+                        ingestOptions.transactionLeaseMillis);
         clients.set(client);
         resources = RetinaResourceManager.Instance();
-        resources.addWriteBuffer("s", "t");
-        buffers.add(resources.getIngestBuffer("s", "t", 0));
+        for (String tableName : Arrays.asList(
+                Catalog.TABLE_T_NAME, Catalog.TABLE_A_NAME, Catalog.TABLE_B_NAME)) {
+            resources.addWriteBuffer(Catalog.SCHEMA_NAME, tableName);
+            resources.getIngestBuffer(Catalog.SCHEMA_NAME, tableName, 0);
+        }
         AtomicLong rowIds = new AtomicLong(1000);
         IndexService actualIndexes = LocalIndexService.Instance();
         IndexService index =
@@ -578,8 +701,8 @@ public final class SqlIngestFixture implements AutoCloseable {
                                 });
         PixelsIngestInstaller installer =
                 new PixelsIngestInstaller(
-                        new AtomicStateFile(root.resolve("plans"), 64 * 1024 * 1024),
-                        new IngestOptions(),
+                        new AtomicStateFile(root.resolve("plans"), ingestOptions.maxStateBytes),
+                        ingestOptions,
                         owner,
                         resources,
                         index,
@@ -750,6 +873,8 @@ public final class SqlIngestFixture implements AutoCloseable {
         Properties status = new Properties();
         status.setProperty("dataRoot", root.toString());
         status.setProperty("pixelsFiles", Long.toString(catalog.publishedFileCount()));
+        status.setProperty("primaryTablePixelsFiles",
+                Long.toString(catalog.publishedFileCount(Catalog.TABLE_T_NAME)));
         status.setProperty("abortedTransactions", Long.toString(abortedTransactions()));
         status.setProperty(
                 "activeTransactions",
@@ -779,17 +904,18 @@ public final class SqlIngestFixture implements AutoCloseable {
     public void close() throws Exception {
         coordinator.close();
         participant.close();
-        if (recoveryCheckpointEnabled) {
-            resources.shutdown();
-        } else {
-            for (PixelsWriteBuffer buffer : buffers) {
-                buffer.close();
-            }
-        }
+        // The resource manager owns both public BUFFERED buffers and the isolated FILE buffers
+        // created on demand. Closing only the buffers known during fixture bootstrap would leave
+        // FILE writers running after the SQL client exits.
+        resources.shutdown();
         client.close();
-        for (Server server :
-                Arrays.asList(retinaServer, transactionServer, nodeServer, metadataServer)) {
-            server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+        List<Server> servers =
+                Arrays.asList(retinaServer, transactionServer, nodeServer, metadataServer);
+        for (Server server : servers) {
+            server.shutdownNow();
+        }
+        for (Server server : servers) {
+            server.awaitTermination(SERVER_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
         catalog.close();
     }

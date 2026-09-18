@@ -16,6 +16,8 @@ import io.pixelsdb.pixels.common.ingest.MutationStreamId;
 import io.pixelsdb.pixels.common.ingest.MutationStreamSeal;
 import io.pixelsdb.pixels.common.ingest.wire.IngestWire;
 import io.pixelsdb.pixels.ingest.IngestProto.PrepareToken;
+import io.pixelsdb.pixels.ingest.IngestProto.DecisionOutcome;
+import io.pixelsdb.pixels.ingest.IngestProto.PublicationProgress;
 import io.pixelsdb.pixels.ingest.IngestProto.Route;
 import io.pixelsdb.pixels.ingest.IngestProto.TableSpec;
 import io.pixelsdb.pixels.ingest.IngestProto.Transaction;
@@ -34,13 +36,15 @@ import static org.junit.Assert.fail;
 
 public class TestRetinaIngestParticipantCheckpoint
 {
+    private static final long STATEMENT_ID = 1L;
+
     @Test
     public void testCheckpointThenWalReclaimSurvivesRestartWithoutReplay() throws Exception
     {
         Path directory = Files.createTempDirectory("pixels-participant-checkpoint-");
         String owner = "127.0.0.1:18889";
         MutationStreamId stream = new MutationStreamId(
-                41, 7, 13, 0, MutationStreamId.Kind.APPEND_ROWS);
+                41, STATEMENT_ID, 7, 13, 0, MutationStreamId.Kind.APPEND_ROWS);
         MutationBatch batch = new MutationBatch(stream, 0, 3, 1, 2, new byte[] {4, 1});
         MutationStreamSeal seal = new MutationStreamSeal(
                 stream, 1, 2, batch.getPayloadBytes(),
@@ -57,6 +61,10 @@ public class TestRetinaIngestParticipantCheckpoint
                 .setCommitTimestamp(52)
                 .setState(TransactionState.PUBLISHED)
                 .setTable(table)
+                .addEnlistedTables(table)
+                .setOutcome(DecisionOutcome.COMMIT)
+                .setProgress(PublicationProgress.VISIBLE_NOW)
+                .setCommitToken("checkpoint-test-token")
                 .addStreams(IngestWire.encode(stream))
                 .addSeals(IngestWire.encode(seal))
                 .build();
@@ -182,13 +190,18 @@ public class TestRetinaIngestParticipantCheckpoint
         public void prepare(Transaction tx, Iterable<MutationBatch> batches) {}
 
         @Override
-        public void install(Transaction tx, Iterable<MutationBatch> batches, boolean recovering)
+        public boolean install(
+                Transaction tx,
+                Iterable<MutationBatch> batches,
+                boolean recovering,
+                boolean forceFileTail)
         {
             for (MutationBatch ignored : batches)
             {
                 // Force the recovery path to consume the WAL before it is checkpointed.
             }
             installs.incrementAndGet();
+            return true;
         }
 
         @Override

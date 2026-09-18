@@ -56,19 +56,22 @@ public final class MutationStreamId
     }
 
     private final long transactionId;
+    private final long statementId;
     private final long writerId;
     private final long tableId;
     private final int shardId;
     private final Kind kind;
 
-    public MutationStreamId(long transactionId, long writerId, long tableId,
+    public MutationStreamId(long transactionId, long statementId, long writerId, long tableId,
                             int shardId, Kind kind)
     {
-        if (transactionId < 0 || writerId < 0 || tableId < 0 || shardId < 0)
+        if (transactionId < 0 || statementId <= 0 || writerId < 0 || tableId < 0 || shardId < 0)
         {
-            throw new IllegalArgumentException("Stream identifiers must be non-negative");
+            throw new IllegalArgumentException(
+                    "Stream identifiers must be non-negative and statementId must be positive");
         }
         this.transactionId = transactionId;
+        this.statementId = statementId;
         this.writerId = writerId;
         this.tableId = tableId;
         this.shardId = shardId;
@@ -76,6 +79,7 @@ public final class MutationStreamId
     }
 
     public long getTransactionId() { return transactionId; }
+    public long getStatementId() { return statementId; }
     public long getWriterId() { return writerId; }
     public long getTableId() { return tableId; }
     public int getShardId() { return shardId; }
@@ -87,19 +91,19 @@ public final class MutationStreamId
         if (this == other) { return true; }
         if (!(other instanceof MutationStreamId)) { return false; }
         MutationStreamId that = (MutationStreamId) other;
-        return transactionId == that.transactionId && writerId == that.writerId
+        return transactionId == that.transactionId && statementId == that.statementId && writerId == that.writerId
                 && tableId == that.tableId && shardId == that.shardId && kind == that.kind;
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(transactionId, writerId, tableId, shardId, kind);
+        return Objects.hash(transactionId, statementId, writerId, tableId, shardId, kind);
     }
 
     @Override
     public String toString()
     {
-        return transactionId + ":" + writerId + ":" + tableId + ":" + shardId + ":" + kind;
+        return transactionId + ":" + statementId + ":" + writerId + ":" + tableId + ":" + shardId + ":" + kind;
     }
 }

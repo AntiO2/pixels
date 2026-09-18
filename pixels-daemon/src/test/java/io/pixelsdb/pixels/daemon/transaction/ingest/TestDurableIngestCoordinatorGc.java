@@ -32,6 +32,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 public class TestDurableIngestCoordinatorGc
 {
+    private static final long STATEMENT_ID = 1L;
+    private static final long FIRST_STATEMENT_ORDINAL = 1L;
+
     @TempDir Path directory;
     private final AtomicLong ids = new AtomicLong(100);
     private final AtomicInteger checkpoints = new AtomicInteger();
@@ -50,20 +53,21 @@ public class TestDurableIngestCoordinatorGc
     public void testPublishedCheckpointBecomesCompactFenceAndSurvivesRestart() throws Exception
     {
         long transactionId;
-        BeginWriteRequest begin = BeginWriteRequest.newBuilder()
-                .setRequestId("stable-request").setSchemaName("s").setTableName("t")
-                .setReadTimestamp(0).build();
+        BeginWriteRequest begin = beginRequest("stable-request");
         try (DurableIngestCoordinator coordinator = open())
         {
             Transaction tx = coordinator.begin(begin);
             transactionId = tx.getTransactionId();
             MutationStreamId local = new MutationStreamId(
-                    transactionId, 1, 73, 0, MutationStreamId.Kind.APPEND_ROWS);
+                    transactionId, STATEMENT_ID, 1, 73, 0, MutationStreamId.Kind.APPEND_ROWS);
             coordinator.register(IngestWire.encode(local));
             MutationStreamSeal receipt = new MutationStreamSeal(
                     local, 1, 1, 1, MutationStreamSeal.emptyDigest());
+            coordinator.completeStatement(CompleteStatementRequest.newBuilder()
+                    .setTransactionId(transactionId).setStatementId(STATEMENT_ID)
+                    .addSeals(IngestWire.encode(receipt)).build());
             coordinator.prepare(PrepareWriteRequest.newBuilder()
-                    .setTransactionId(transactionId).addSeals(IngestWire.encode(receipt)).build());
+                    .setTransactionId(transactionId).build());
             assertEquals(TransactionState.PUBLISHED,
                     coordinator.commit(transactionId).getState());
 
@@ -91,9 +95,7 @@ public class TestDurableIngestCoordinatorGc
     public void testExpiredFenceIsPrunedWithoutForgettingRetiredTransactionId() throws Exception
     {
         long transactionId;
-        BeginWriteRequest begin = BeginWriteRequest.newBuilder()
-                .setRequestId("expired-request").setSchemaName("s").setTableName("t")
-                .setReadTimestamp(0).build();
+        BeginWriteRequest begin = beginRequest("expired-request");
         try (DurableIngestCoordinator coordinator = open(CLOCK))
         {
             transactionId = coordinator.begin(begin).getTransactionId();
@@ -116,6 +118,22 @@ public class TestDurableIngestCoordinatorGc
         return open(CLOCK);
     }
 
+    private static BeginWriteRequest beginRequest(String requestId)
+    {
+        return BeginWriteRequest.newBuilder()
+                .setRequestId(requestId)
+                .setSchemaName("s")
+                .setTableName("t")
+                .setReadTimestamp(0)
+                .setStatementId(STATEMENT_ID)
+                .setQueryId(requestId + "-query")
+                .setStatementOrdinal(FIRST_STATEMENT_ORDINAL)
+                .setScope(TransactionScope.AUTOCOMMIT)
+                .setRepresentation(WriteRepresentation.BUFFERED)
+                .setAckMode(CommitAckMode.VISIBLE)
+                .build();
+    }
+
     private DurableIngestCoordinator open(Clock clock) throws IOException
     {
         return new DurableIngestCoordinator(
@@ -133,7 +151,8 @@ public class TestDurableIngestCoordinatorGc
                                 .setDigest(ByteString.copyFrom(IngestWire.prepareDigest(tx, owner)))
                                 .build();
                     }
-                    public void install(String owner, Transaction tx) {}
+                    public boolean install(
+                            String owner, Transaction tx, boolean forceFileTail) { return true; }
                     public void checkpoint(String owner, long txId) { checkpoints.incrementAndGet(); }
                     public void discard(String owner, long txId) {}
                 },

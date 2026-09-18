@@ -79,10 +79,12 @@ public final class IngestParticipantRpc
     }
 
     @Override
-    public void install(ParticipantRequest r, StreamObserver<Empty> o) {
+    public void install(ParticipantRequest r, StreamObserver<InstallResult> o) {
         try {
-            target.install(r.getTransaction());
-            o.onNext(Empty.getDefaultInstance());
+            o.onNext(InstallResult.newBuilder()
+                    .setReady(target.install(
+                            r.getTransaction(), r.getForceFileTail()))
+                    .build());
             o.onCompleted();
         } catch (Exception e) {
             o.onError(
@@ -156,6 +158,20 @@ public final class IngestParticipantRpc
         try {
             target.readPins().release(r);
             o.onNext(Empty.getDefaultInstance());
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
+    public void readPrivate(PrivateReadRequest r, StreamObserver<PrivateReadPage> o) {
+        try {
+            o.onNext(target.readPrivate(r));
             o.onCompleted();
         } catch (Exception e) {
             o.onError(

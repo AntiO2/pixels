@@ -86,9 +86,15 @@ public final class IngestReadPins {
     }
 
     public synchronized void validate(String token, long timestamp) throws IOException {
+        validate(token, timestamp, null);
+    }
+
+    public synchronized void validate(String token, long timestamp, Long transactionId)
+            throws IOException {
         expire();
         ReadPin p = pins.get(token);
-        if (!ready || p == null || p.getReadTimestamp() != timestamp)
+        if (!ready || p == null || p.getReadTimestamp() != timestamp
+                || (transactionId != null && p.getTransactionId() != transactionId))
             throw new IOException("Expired or inconsistent read view");
     }
 

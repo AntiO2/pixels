@@ -84,8 +84,8 @@ run_phase() {
 
 run_phase write 2>&1 | tee "$WORK/daemon.log"
 run_phase recover 2>&1 | tee -a "$WORK/daemon.log"
-grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PHASE1_PASS rows=65 ' "$WORK/daemon.log"
-grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PASS rows=65 .* checkpointRestart=2$' "$WORK/daemon.log"
+grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PHASE1_PASS rows=73 sharedFileTransactions=2 ' "$WORK/daemon.log"
+grep -q '^PIXELS_NORMAL_INGEST_DAEMON_PASS rows=73 pixelsFiles=3 services=TransServer,RetinaServer checkpointRestart=2 sharedFileTransactions=2$' "$WORK/daemon.log"
 
 # A committed decision is recovery authority. A checksum failure must stop the transaction
 # server; it must never be treated as an empty coordinator on a fresh deployment.
@@ -132,6 +132,6 @@ grep -Eq 'reading the checkpoint body failed|No such file' \
 mv "${checkpoint_bodies[0]}.missing" "${checkpoint_bodies[0]}"
 
 run_phase cutover 2>&1 | tee -a "$WORK/daemon.log"
-grep -Eq '^PIXELS_NORMAL_INGEST_CUTOVER_PASS oldRows=65 totalRows=66 baseline=1000000000 commitTimestamp=[0-9]+ legacyFence=1$' \
+grep -Eq '^PIXELS_NORMAL_INGEST_CUTOVER_PASS oldRows=73 totalRows=74 baseline=1000000000 commitTimestamp=[0-9]+ legacyFence=1$' \
     "$WORK/daemon.log"
 echo 'PIXELS_NORMAL_INGEST_FAIL_CLOSED_PASS corruptDecision=1 missingCheckpoint=1 allocatorFloor=1'

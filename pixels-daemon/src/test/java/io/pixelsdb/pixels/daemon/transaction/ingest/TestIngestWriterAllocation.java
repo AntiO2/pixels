@@ -25,6 +25,8 @@ public class TestIngestWriterAllocation {
     private static final Clock CLOCK =
             Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC);
     private static final long TASK_ID = 1L << 32;
+    private static final long STATEMENT_ID = 1L;
+    private static final long FIRST_STATEMENT_ORDINAL = 1L;
     private static final Route ROUTE =
             Route.newBuilder().setShardId(0).setHost("127.0.0.1").setPort(10000).build();
     private static final TableSpec TABLE =
@@ -46,25 +48,33 @@ public class TestIngestWriterAllocation {
                                 .setDigest(ByteString.copyFrom(IngestWire.prepareDigest(tx, owner)))
                                 .build();
                     }
-                    public void install(String owner, Transaction tx) {}
+                    public boolean install(
+                            String owner, Transaction tx, boolean forceFileTail) { return true; }
                     public void discard(String owner, long txId) {}
                 },
                 ids::incrementAndGet, CLOCK, 0, 60000, 100, limit);
     }
 
     private Transaction begin(DurableIngestCoordinator coordinator) throws Exception {
-        return coordinator.begin(BeginWriteRequest.newBuilder().setRequestId(UUID.randomUUID().toString())
-                .setSchemaName("s").setTableName("t").setReadTimestamp(0).build());
+        String requestId = UUID.randomUUID().toString();
+        return coordinator.begin(BeginWriteRequest.newBuilder().setRequestId(requestId)
+                .setSchemaName("s").setTableName("t").setReadTimestamp(0)
+                .setStatementId(STATEMENT_ID).setQueryId(requestId + "-query")
+                .setStatementOrdinal(FIRST_STATEMENT_ORDINAL)
+                .setScope(TransactionScope.AUTOCOMMIT)
+                .setRepresentation(WriteRepresentation.BUFFERED)
+                .setAckMode(CommitAckMode.VISIBLE).build());
     }
 
     private static AllocateWriterRequest request(long txId, String requestId) {
         return AllocateWriterRequest.newBuilder().setTransactionId(txId).setTaskId(TASK_ID)
-                .setRequestId(requestId).build();
+                .setRequestId(requestId).setStatementId(STATEMENT_ID).build();
     }
 
     private static StreamId stream(long txId, long writerId) {
         return StreamId.newBuilder().setTransactionId(txId).setWriterId(writerId)
-                .setTableId(73).setShardId(0).setKind(MutationKind.APPEND_ROWS).build();
+                .setTableId(73).setShardId(0).setKind(MutationKind.APPEND_ROWS)
+                .setStatementId(STATEMENT_ID).build();
     }
 
     @Test
@@ -114,6 +124,9 @@ public class TestIngestWriterAllocation {
         try (DurableIngestCoordinator coordinator = open(64)) {
             AllocateWriterRequest request = request(begin(coordinator).getTransactionId(), "request");
             WriterAssignment assignment = coordinator.allocateWriter(request);
+            coordinator.completeStatement(CompleteStatementRequest.newBuilder()
+                    .setTransactionId(request.getTransactionId())
+                    .setStatementId(STATEMENT_ID).build());
             coordinator.prepare(PrepareWriteRequest.newBuilder().setTransactionId(request.getTransactionId()).build());
             assertEquals(assignment, coordinator.allocateWriter(request));
             assertThrows(IOException.class,

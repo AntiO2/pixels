@@ -61,6 +61,12 @@ import java.util.zip.CRC32;
  * directory force and atomic replacement support. There is one exclusive local
  * owner. This is not replication or distributed epoch fencing.
  *
+ * <p>The LOCAL implementation uses Java NIO directly because its durability
+ * contract depends on an operating-system file lock, {@link FileChannel#force(boolean)},
+ * atomic replacement, and directory sync. The records are transaction WAL frames,
+ * not Pixels data files. A pixels-io-backed implementation should preserve these
+ * primitives behind an equivalent local durable-file abstraction.
+ *
  * <p>This class never updates a MemTable, index, row allocator, or transaction
  * outcome. discardAbortedTransaction must only be invoked after the caller has
  * verified an authoritative ABORT decision. Payloads remain on disk; only batch
@@ -76,13 +82,11 @@ public final class LocalMutationJournal implements Closeable
 {
     static final int MAGIC = 0x50494D4A;
     static final int MARKER_MAGIC = 0x50494D44;
-    static final int VERSION = 1;
+    static final int VERSION = 2;
     static final int HEADER_BYTES = 8;
     static final String WAL_NAME = "mutations.wal";
     static final String MARKER_NAME = "durable.offset";
-    private static final int MARKER_BYTES = 20;
     private static final int GENERATION_MARKER_BYTES = 28;
-    private static final int GENERATION_MARKER_VERSION = 2;
     private static final String LOCK_NAME = "journal.lock";
     private static final int MAX_FIXED_BODY_BYTES = 96;
     private static final int APPEND = 1;
@@ -96,7 +100,6 @@ public final class LocalMutationJournal implements Closeable
     private final long maxJournalBytes;
     private final int maxRecords;
     private FileChannel channel;
-    private FileLock walLock;
     private final FileChannel lockChannel;
     private final FileLock lock;
     private long generation;
@@ -152,10 +155,6 @@ public final class LocalMutationJournal implements Closeable
             { throw new IOException("Durable marker exists but WAL is missing"); }
             this.channel = FileChannel.open(walPath, StandardOpenOption.CREATE,
                     StandardOpenOption.READ, StandardOpenOption.WRITE);
-            // Also fence a pre-generation implementation which only locks the WAL.
-            try { this.walLock = channel.tryLock(); }
-            catch (OverlappingFileLockException e) { throw new IOException("WAL already has an owner", e); }
-            if (this.walLock == null) { throw new IOException("WAL already has an owner"); }
             if (channel.size() == 0 && !Files.exists(markerPath))
             {
                 // A missing pointer with generation files is not a fresh database.
@@ -322,16 +321,14 @@ public final class LocalMutationJournal implements Closeable
     private void readMarker() throws IOException
     {
         long size = Files.exists(markerPath) ? Files.size(markerPath) : -1;
-        if (size != MARKER_BYTES && size != GENERATION_MARKER_BYTES)
+        if (size != GENERATION_MARKER_BYTES)
         { throw new IOException("Missing or malformed durable-prefix marker"); }
         byte[] bytes = Files.readAllBytes(markerPath);
         ByteBuffer marker = ByteBuffer.wrap(bytes);
         if (marker.getInt() != MARKER_MAGIC) { throw new IOException("Invalid durable-prefix marker magic"); }
         int version = marker.getInt();
-        if (version == VERSION && size == MARKER_BYTES) { generation = 0; }
-        else if (version == GENERATION_MARKER_VERSION && size == GENERATION_MARKER_BYTES)
-        { generation = marker.getLong(); }
-        else { throw new IOException("Unsupported durable-prefix marker"); }
+        if (version != VERSION) { throw new IOException("Unsupported durable-prefix marker"); }
+        generation = marker.getLong();
         durableOffset = marker.getLong();
         if (marker.getInt() != checksum(bytes, 0, bytes.length - 4)
                 || generation < 0 || durableOffset < HEADER_BYTES || durableOffset > maxJournalBytes)
@@ -429,12 +426,13 @@ public final class LocalMutationJournal implements Closeable
 
     private void storeMarker(long targetGeneration, long end) throws IOException
     {
-        // Keep the original marker representation until the first compaction.
-        int length = targetGeneration == 0 ? MARKER_BYTES : GENERATION_MARKER_BYTES;
-        ByteBuffer marker = ByteBuffer.allocate(length);
-        marker.putInt(MARKER_MAGIC).putInt(targetGeneration == 0 ? VERSION : GENERATION_MARKER_VERSION);
-        if (targetGeneration != 0) { marker.putLong(targetGeneration); }
-        marker.putLong(end).putInt(checksum(marker.array(), 0, length - 4)).flip();
+        ByteBuffer marker = ByteBuffer.allocate(GENERATION_MARKER_BYTES);
+        marker.putInt(MARKER_MAGIC)
+                .putInt(VERSION)
+                .putLong(targetGeneration)
+                .putLong(end)
+                .putInt(checksum(marker.array(), 0, GENERATION_MARKER_BYTES - Integer.BYTES))
+                .flip();
         Path temporary = directory.resolve("durable.offset.tmp");
         try (FileChannel output = FileChannel.open(temporary, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE))
@@ -487,7 +485,6 @@ public final class LocalMutationJournal implements Closeable
         { if (covered.contains(id.getTransactionId()) || abortedTransactions.contains(id.getTransactionId())) { hasGarbage = true; } }
         if (!hasGarbage) { return 0; }
         FileChannel replacement = null;
-        FileLock replacementLock;
         try
         {
             persistDurablePrefix(); // Retain also accepted, not-yet-sealed live batches.
@@ -496,8 +493,6 @@ public final class LocalMutationJournal implements Closeable
             while (Files.exists(walPath(nextGeneration))) { nextGeneration = Math.addExact(nextGeneration, 1L); }
             replacement = FileChannel.open(walPath(nextGeneration), StandardOpenOption.CREATE_NEW,
                     StandardOpenOption.READ, StandardOpenOption.WRITE);
-            replacementLock = replacement.tryLock();
-            if (replacementLock == null) { throw new IOException("Replacement WAL unexpectedly locked"); }
             writeHeader(replacement);
             Set<Long> checkpointFences = new TreeSet<>(checkpointedTransactions);
             checkpointFences.addAll(covered);
@@ -532,7 +527,6 @@ public final class LocalMutationJournal implements Closeable
             faults.at(GcPhase.AFTER_POINTER);
             FileChannel old = channel;
             channel = replacement;
-            walLock = replacementLock;
             replacement = null;
             generation = nextGeneration;
             old.close();
@@ -697,6 +691,7 @@ public final class LocalMutationJournal implements Closeable
     private static void writeId(DataOutputStream out, MutationStreamId id) throws IOException
     {
         out.writeLong(id.getTransactionId());
+        out.writeLong(id.getStatementId());
         out.writeLong(id.getWriterId());
         out.writeLong(id.getTableId());
         out.writeInt(id.getShardId());
@@ -705,7 +700,7 @@ public final class LocalMutationJournal implements Closeable
 
     private static MutationStreamId readId(DataInputStream in) throws IOException
     {
-        return new MutationStreamId(in.readLong(), in.readLong(), in.readLong(),
+        return new MutationStreamId(in.readLong(), in.readLong(), in.readLong(), in.readLong(),
                 in.readInt(), MutationStreamId.Kind.fromCode(in.readInt()));
     }
 

@@ -80,7 +80,7 @@ public class PixelsWriteBuffer
     private final short replication;
     private final EncodingLevel encodingLevel;
     private final boolean nullsPadding;
-    private final int maxMemTableCount;  // threshold number of memTable to be dumped to file
+    private int maxMemTableCount;  // threshold number of memTable to be dumped to file
     private final Path targetOrderedDirPath;
     private final Path targetCompactDirPath;
     private final Storage targetOrderedStorage;
@@ -140,6 +140,21 @@ public class PixelsWriteBuffer
                              Path targetOrderedDirPath, Path targetCompactDirPath,
                              String retinaHostName, int virtualNode) throws RetinaException
     {
+        this(tableId, schema, orderMapping, targetOrderedDirPath, targetCompactDirPath,
+                retinaHostName, virtualNode, 0, true);
+    }
+
+    /**
+     * Creates a transactional file-building buffer with an independent file-size floor.
+     * Small MemTables still bound encoding memory, while several of them may contribute to one
+     * Pixels file. Disabling the generic idle scheduler leaves tail closure to the ingest
+     * rows/bytes/delay policy and visibility barriers.
+     */
+    public PixelsWriteBuffer(long tableId, TypeDescription schema, int[] orderMapping,
+                             Path targetOrderedDirPath, Path targetCompactDirPath,
+                             String retinaHostName, int virtualNode,
+                             int minimumFileRows, boolean automaticTailFlush) throws RetinaException
+    {
         this.tableId = tableId;
         this.schema = schema;
         this.orderMapping = orderMapping;
@@ -165,7 +180,20 @@ public class PixelsWriteBuffer
         this.replication = Short.parseShort(configFactory.getProperty("block.replication"));
         this.encodingLevel = EncodingLevel.from(Integer.parseInt(configFactory.getProperty("retina.buffer.flush.encodingLevel")));
         this.nullsPadding = Boolean.parseBoolean(configFactory.getProperty("retina.buffer.flush.nullsPadding"));
-        this.maxMemTableCount = Integer.parseInt(configFactory.getProperty("retina.buffer.flush.count"));
+        int configuredMemTableCount =
+                Integer.parseInt(configFactory.getProperty("retina.buffer.flush.count"));
+        if (minimumFileRows > 0)
+        {
+            long requiredMemTables = (minimumFileRows + (long) memTableSize - 1L) / memTableSize;
+            checkArgument(requiredMemTables <= Integer.MAX_VALUE,
+                    "Requested file row capacity is too large");
+            this.maxMemTableCount = Math.max(
+                    configuredMemTableCount, (int) requiredMemTables);
+        }
+        else
+        {
+            this.maxMemTableCount = configuredMemTableCount;
+        }
 
         this.immutableMemTables = new ArrayList<>();
         this.objectEntries = new ArrayList<>();
@@ -186,7 +214,11 @@ public class PixelsWriteBuffer
         else { this.currentVersion = new SuperVersion(null, immutableMemTables, objectEntries); }
         this.rowIdAllocator = new RowIdAllocator(tableId, this.memTableSize, IndexServiceProvider.ServiceMode.local);
 
-        startFlushObjectToFileScheduler(Long.parseLong(configFactory.getProperty("retina.buffer.flush.interval")));
+        if (automaticTailFlush)
+        {
+            startFlushObjectToFileScheduler(
+                    Long.parseLong(configFactory.getProperty("retina.buffer.flush.interval")));
+        }
     }
 
     private void initializeActive(io.pixelsdb.pixels.ingest.IngestProto.BufferSpan restored) throws RetinaException
@@ -264,8 +296,17 @@ public class PixelsWriteBuffer
             versionLock.writeLock().lock();
             try
             {
+                if (activeMemTable == null && span.getMemtableSize() == memTableSize
+                        && span.getFileCapacity() >= memTableSize
+                        && span.getFileCapacity() % memTableSize == 0)
+                {
+                    // A persisted placement is authoritative during recovery. This also keeps an
+                    // in-flight file stable if operators change future file sizing while drained.
+                    maxMemTableCount = span.getFileCapacity() / memTableSize;
+                }
                 if (!transactional || installFailed || span.getRowCount() != rows.size()
-                        || span.getMemtableSize() != memTableSize || span.getFileCapacity() != memTableSize * maxMemTableCount)
+                        || span.getMemtableSize() != memTableSize
+                        || span.getFileCapacity() != memTableSize * maxMemTableCount)
                 { throw new RetinaException("Invalid installation placement"); }
                 String key = span.getFileId() + ":" + span.getBlockId() + ":" + span.getOffsetInBlock();
                 int done = installedSpanRows.getOrDefault(key, 0);
@@ -649,7 +690,7 @@ public class PixelsWriteBuffer
      * been written to Object. If it has been written, execute the file write
      * operation and delete the corresponding ObjectEntry in the unified view.
      */
-    private void flushIdleActiveMemTable()
+    private boolean flushIdleActiveMemTable()
     {
         synchronized (rowLock)
         {
@@ -657,23 +698,41 @@ public class PixelsWriteBuffer
                     || (transactional && RetinaResourceManager.Instance().isRecovering())
                     || activeMemTable == null || activeMemTable.isEmpty())
             {
-                return;
+                return false;
             }
             versionLock.writeLock().lock();
             try
             {
                 retireActiveMemTableLocked(true);
+                return true;
             }
             catch (Exception e)
             {
                 installFailed = transactional;
                 logger.error("Failed to flush active memTable on the configured interval", e);
+                return false;
             }
             finally
             {
                 versionLock.writeLock().unlock();
             }
         }
+    }
+
+    /**
+     * Closes the current transactional tail for a visibility barrier or a FILE
+     * aggregation threshold. Object upload, Pixels encoding, MainIndex flush,
+     * and catalog publication continue through the existing flush pipeline.
+     */
+    public boolean requestIngestTailFlush()
+    {
+        if (!transactional)
+        {
+            throw new IllegalStateException("Tail flush is available only for transactional ingestion");
+        }
+        boolean retired = flushIdleActiveMemTable();
+        flushReadyFilesSafely();
+        return retired;
     }
 
     private void flushReadyFilesSafely()
@@ -690,20 +749,19 @@ public class PixelsWriteBuffer
                 }
                 if (transactional)
                 {
-                    // Physical Pixels writing and MainIndex flush may be expensive. They are
-                    // private preparation and do not require excluding pinned readers. Keep only
-                    // the short metadata visibility switch inside the read-pin publication lock.
+                    // This is append-only publication: the new file contains only future
+                    // commit timestamps for older ReadViews and replaces no existing coverage.
+                    // Waiting for pinned readers here would deadlock FILE+VISIBLE against its
+                    // own transaction pin. Rewrite/retirement publication remains pin-protected.
                     prepareFinishedFile(fileWriterManager);
-                    RetinaResourceManager.Instance().getIngestReadPins().publish(() -> {
-                        List<FileWriterManager> publishedFiles = this.ingestFilePublisher.admitReady(
-                                fileWriterManager, this::publishPreparedFile);
-                        for (FileWriterManager publishedFile : publishedFiles)
-                        {
-                            this.fileWriterManagers.remove(publishedFile);
-                            cleanupPublishedObjects(
-                                    publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
-                        }
-                    });
+                    List<FileWriterManager> publishedFiles = this.ingestFilePublisher.admitReady(
+                            fileWriterManager, this::publishPreparedFile);
+                    for (FileWriterManager publishedFile : publishedFiles)
+                    {
+                        this.fileWriterManagers.remove(publishedFile);
+                        cleanupPublishedObjects(
+                                publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
+                    }
                 }
                 else
                 {

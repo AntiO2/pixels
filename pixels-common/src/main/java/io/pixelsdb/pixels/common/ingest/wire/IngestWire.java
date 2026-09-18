@@ -29,11 +29,14 @@ import java.util.*;
 
 /** Wire conversions preserve identities and verify digests before accepting input. */
 public final class IngestWire {
+    private static final int LENGTH_PREFIX_BYTES = Integer.BYTES;
+
     private IngestWire() {}
 
     public static StreamId encode(MutationStreamId s) {
         return StreamId.newBuilder()
                 .setTransactionId(s.getTransactionId())
+                .setStatementId(s.getStatementId())
                 .setWriterId(s.getWriterId())
                 .setTableId(s.getTableId())
                 .setShardId(s.getShardId())
@@ -44,6 +47,7 @@ public final class IngestWire {
     public static MutationStreamId decode(StreamId s) {
         return new MutationStreamId(
                 s.getTransactionId(),
+                s.getStatementId(),
                 s.getWriterId(),
                 s.getTableId(),
                 s.getShardId(),
@@ -108,16 +112,31 @@ public final class IngestWire {
         throw new IOException("Unmapped shard " + shard);
     }
 
+    public static List<TableSpec> tables(Transaction transaction) {
+        if (transaction.getEnlistedTablesCount() == 0) {
+            throw new IllegalArgumentException("Transaction has no enlisted tables");
+        }
+        return transaction.getEnlistedTablesList();
+    }
+
+    public static TableSpec table(Transaction transaction, long tableId) throws IOException {
+        for (TableSpec table : tables(transaction)) {
+            if (table.getTableId() == tableId) {
+                return table;
+            }
+        }
+        throw new IOException("Transaction has not enlisted table " + tableId);
+    }
+
     public static boolean committed(Transaction t) {
-        return t.getState() == TransactionState.COMMIT_DECIDED
-                || t.getState() == TransactionState.PUBLISHED;
+        return t.getOutcome() == DecisionOutcome.COMMIT;
     }
 
     public static Set<String> owners(Transaction t) {
         Set<String> out = new TreeSet<>();
         for (StreamId s : t.getStreamsList()) {
             try {
-                out.add(owner(route(t.getTable(), s.getShardId())));
+                out.add(owner(route(table(t, s.getTableId()), s.getShardId())));
             } catch (IOException e) {
                 throw new IllegalArgumentException(e);
             }
@@ -128,18 +147,31 @@ public final class IngestWire {
     public static List<StreamSeal> localSeals(Transaction t, String owner) throws IOException {
         List<StreamSeal> out = new ArrayList<>();
         for (StreamSeal s : t.getSealsList())
-            if (owner(route(t.getTable(), s.getStream().getShardId())).equals(owner)) out.add(s);
+            if (owner(route(table(t, s.getStream().getTableId()),
+                    s.getStream().getShardId())).equals(owner)) out.add(s);
         return out;
     }
 
     public static byte[] prepareDigest(Transaction t, String owner) throws IOException {
         try {
             MessageDigest d = MessageDigest.getInstance("SHA-256");
-            d.update(t.getTable().toByteArray());
+            d.update("PIXELS-INGEST-PREPARE-2".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            d.update(java.nio.ByteBuffer.allocate(Integer.BYTES * 3)
+                    .putInt(t.getScopeValue())
+                    .putInt(t.getRepresentationValue())
+                    .putInt(t.getAckModeValue()).array());
+            List<TableSpec> tables = new ArrayList<>(t.getEnlistedTablesList());
+            tables.sort(Comparator.comparingLong(TableSpec::getTableId));
+            for (TableSpec table : tables) {
+                updateLengthPrefixed(d, table.toByteArray());
+            }
+            List<StatementManifest> statements = new ArrayList<>(t.getStatementsList());
+            statements.sort(Comparator.comparingLong(StatementManifest::getOrdinal));
+            for (StatementManifest statement : statements) {
+                updateLengthPrefixed(d, statement.toByteArray());
+            }
             for (StreamSeal s : localSeals(t, owner)) {
-                byte[] b = s.toByteArray();
-                d.update(java.nio.ByteBuffer.allocate(4).putInt(b.length).array());
-                d.update(b);
+                updateLengthPrefixed(d, s.toByteArray());
             }
             return d.digest();
         } catch (NoSuchAlgorithmException e) {
@@ -147,8 +179,59 @@ public final class IngestWire {
         }
     }
 
+    public static byte[] statementDigest(StatementManifest statement) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            StatementManifest canonical = statement.toBuilder().clearDigest().build();
+            digest.update(canonical.toByteArray());
+            return digest.digest();
+        }
+        catch (NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    public static byte[] privateReadDigest(
+            Transaction transaction, long readerStatementId, long tableId, long frontier) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update("PIXELS-INGEST-PRIVATE-READ-1"
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            digest.update(java.nio.ByteBuffer.allocate(Long.BYTES * 4)
+                    .putLong(transaction.getTransactionId())
+                    .putLong(readerStatementId)
+                    .putLong(tableId)
+                    .putLong(frontier)
+                    .array());
+            List<StatementManifest> statements = new ArrayList<>();
+            for (StatementManifest statement : transaction.getStatementsList()) {
+                if (statement.getState() == StatementState.STATEMENT_COMPLETE
+                        && statement.getOrdinal() <= frontier
+                        && statement.getTableId() == tableId) {
+                    statements.add(statement);
+                }
+            }
+            statements.sort(Comparator.comparingLong(StatementManifest::getOrdinal));
+            for (StatementManifest statement : statements) {
+                updateLengthPrefixed(digest, statement.toByteArray());
+            }
+            return digest.digest();
+        }
+        catch (NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static void updateLengthPrefixed(MessageDigest digest, byte[] value) {
+        digest.update(java.nio.ByteBuffer.allocate(LENGTH_PREFIX_BYTES)
+                .putInt(value.length).array());
+        digest.update(value);
+    }
+
     public static String batchKey(MutationStreamId s, long seq) {
         return s.getTransactionId()
+                + ":"
+                + s.getStatementId()
                 + ":"
                 + s.getWriterId()
                 + ":"

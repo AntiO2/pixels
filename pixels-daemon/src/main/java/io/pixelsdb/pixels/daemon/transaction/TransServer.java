@@ -53,6 +53,7 @@ import io.pixelsdb.pixels.ingest.IngestProto.Transaction;
  */
 public class TransServer implements Server
 {
+    private static final int MAX_TCP_PORT = 65_535;
     private static final Logger log = LogManager.getLogger(TransServer.class);
 
     private volatile boolean running = false;
@@ -63,7 +64,10 @@ public class TransServer implements Server
 
     public TransServer(int port) throws Exception
     {
-        assert (port > 0 && port <= 65535);
+        if (port <= 0 || port > MAX_TCP_PORT)
+        {
+            throw new IllegalArgumentException("Invalid transaction service port: " + port);
+        }
         IngestOptions options = new IngestOptions();
         TransServiceImpl transService = new TransServiceImpl();
         if (!options.enabled)
@@ -114,11 +118,16 @@ public class TransServer implements Server
                         }
 
                         @Override
-                        public void install(String owner, Transaction transaction)
+                        public boolean install(
+                                String owner, Transaction transaction, boolean forceFileTail)
                         {
-                            client.participant(owner).install(
+                            return client.participant(owner).install(
                                     ParticipantRequest.newBuilder()
-                                            .setOwner(owner).setTransaction(transaction).build());
+                                            .setOwner(owner)
+                                            .setTransaction(transaction)
+                                            .setForceFileTail(forceFileTail)
+                                            .build())
+                                    .getReady();
                         }
 
                         @Override
@@ -149,8 +158,9 @@ public class TransServer implements Server
                         }
                     },
                     Clock.systemUTC(), options.cutoverBaselineTimestamp,
-                    options.transactionLeaseMillis, 10000, options.maxStreams,
-                    options.terminalRetentionMillis, options.maxTerminalTransactions);
+                    options.transactionLeaseMillis, options.maxTransactions, options.maxStreams,
+                    options.terminalRetentionMillis, options.maxTerminalTransactions,
+                    options.installationThreads);
             long first = firstId.get();
             long floor = Math.max(options.cutoverBaselineTimestamp, coordinator.lastCommitTimestamp());
             if (first <= floor)

@@ -188,7 +188,8 @@ public class RetinaServer implements Server
                                     return client.coordinator().listWrites(
                                             OwnerRequest.newBuilder().setOwner(owner).build());
                                 }
-                            }, installer, resources.getIngestReadPins());
+                            }, installer, resources.getIngestReadPins(),
+                            options.privateReadMaxBatches, options.privateReadMaxBytes);
                     this.ingestClient = client;
                     this.ingestParticipant = participant;
                     builder.maxInboundMessageSize(options.maxStateBytes)

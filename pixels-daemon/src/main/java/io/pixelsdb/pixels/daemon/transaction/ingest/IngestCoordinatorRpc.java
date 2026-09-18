@@ -49,6 +49,20 @@ public final class IngestCoordinatorRpc
     }
 
     @Override
+    public void beginStatement(BeginStatementRequest r, StreamObserver<Transaction> o) {
+        try {
+            o.onNext(target.beginStatement(r));
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
     public void allocateWriter(AllocateWriterRequest r, StreamObserver<WriterAssignment> o) {
         try {
             o.onNext(target.allocateWriter(r));
@@ -66,6 +80,20 @@ public final class IngestCoordinatorRpc
     public void registerStream(RegisterStreamRequest r, StreamObserver<Transaction> o) {
         try {
             o.onNext(target.register(r.getStream()));
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
+    public void completeStatement(CompleteStatementRequest r, StreamObserver<Transaction> o) {
+        try {
+            o.onNext(target.completeStatement(r));
             o.onCompleted();
         } catch (Exception e) {
             o.onError(
@@ -164,6 +192,35 @@ public final class IngestCoordinatorRpc
     public void getPublication(Empty r, StreamObserver<Publication> o) {
         try {
             o.onNext(target.publication());
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
+    public void awaitVisible(VisibilityRequest r, StreamObserver<Transaction> o) {
+        try {
+            o.onNext(target.awaitVisible(r));
+            o.onCompleted();
+        } catch (Exception e) {
+            o.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(e.getMessage())
+                            .withCause(e)
+                            .asRuntimeException());
+        }
+    }
+
+    @Override
+    public void flushVisibleBarrier(
+            VisibleBarrierRequest r, StreamObserver<VisibleBarrier> o) {
+        try {
+            o.onNext(target.flushVisibleBarrier(r));
             o.onCompleted();
         } catch (Exception e) {
             o.onError(

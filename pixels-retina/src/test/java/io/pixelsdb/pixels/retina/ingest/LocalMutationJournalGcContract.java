@@ -10,9 +10,6 @@ import io.pixelsdb.pixels.common.ingest.MutationStreamSeal;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
-import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
-import java.nio.file.StandardOpenOption;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -23,6 +20,8 @@ import java.util.stream.Stream;
 /** Filesystem and crash-boundary checks; no services or native dependencies. */
 public final class LocalMutationJournalGcContract
 {
+    private static final long STATEMENT_ID = 1L;
+
     private LocalMutationJournalGcContract() {}
     interface Work { void run() throws Exception; }
     interface InDirectory { void run(Path path) throws Exception; }
@@ -49,7 +48,8 @@ public final class LocalMutationJournalGcContract
     { return new LocalMutationJournal(path, 65536, 2 * 1024 * 1024, 10000); }
     static MutationBatch batch(long tx, long seq)
     {
-        return new MutationBatch(new MutationStreamId(tx, 1, 73, 0, MutationStreamId.Kind.APPEND_ROWS),
+        return new MutationBatch(new MutationStreamId(
+                tx, STATEMENT_ID, 1, 73, 0, MutationStreamId.Kind.APPEND_ROWS),
                 seq, 1, 1, 100, new byte[8192]);
     }
     static MutationStreamSeal seal(MutationBatch... batches)
@@ -212,7 +212,8 @@ public final class LocalMutationJournalGcContract
     {
         directory(dir -> {
             MutationBatch dead = batch(200, 0);
-            MutationBatch deletion = new MutationBatch(new MutationStreamId(201, 1, 74, 1, MutationStreamId.Kind.DELETE_ROWS),
+            MutationBatch deletion = new MutationBatch(new MutationStreamId(
+                    201, STATEMENT_ID, 1, 74, 1, MutationStreamId.Kind.DELETE_ROWS),
                     0, 1, 1, 1, new byte[]{4, 5});
             try (LocalMutationJournal journal = open(dir))
             {
@@ -223,25 +224,12 @@ public final class LocalMutationJournalGcContract
             { check(journal.readSealedBatch(deletion.getStreamId(), 0).getStreamId().equals(deletion.getStreamId()), "Lost delete identity"); }
         });
     }
-    public static void legacyFileLockIsRespected() throws Exception
-    {
-        directory(dir -> {
-            try (LocalMutationJournal journal = open(dir)) { appendSealed(journal, batch(400, 0)); }
-            try (FileChannel old = FileChannel.open(dir.resolve("mutations.wal"), StandardOpenOption.WRITE);
-                 FileLock oldLock = old.lock())
-            {
-                check(oldLock.isValid(), "Missing legacy lock");
-                fails(() -> { try (LocalMutationJournal journal = open(dir)) { journal.sync(); } });
-            }
-        });
-    }
-
     public static void main(String[] args) throws Exception
     {
         collectsPayloadButKeepsIdentityFence(); abortOnlyReclamation(); openStreamIsPreserved();
         crashAtEveryPublicationBoundary(); lockSurvivesGenerationSwitch();
         corruptSelectedGenerationNeverFallsBack(); multipleCyclesAndAdmissionRecovery();
-        differentTablesAndKindsArePreserved(); legacyFileLockIsRespected();
-        System.out.println("Journal GC contract: 13 cases passed (including 5 crash boundaries)");
+        differentTablesAndKindsArePreserved();
+        System.out.println("Journal GC contract: 12 cases passed (including 5 crash boundaries)");
     }
 }

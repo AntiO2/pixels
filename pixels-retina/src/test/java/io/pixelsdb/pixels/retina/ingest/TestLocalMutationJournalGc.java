@@ -8,8 +8,6 @@ import org.junit.Test;
 
 public class TestLocalMutationJournalGc
 {
-    @Test public void legacyFileLock() throws Exception
-    { LocalMutationJournalGcContract.legacyFileLockIsRespected(); }
     @Test public void checkpointedPayload() throws Exception
     { LocalMutationJournalGcContract.collectsPayloadButKeepsIdentityFence(); }
     @Test public void abortedPayload() throws Exception

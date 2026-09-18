@@ -29,8 +29,21 @@ import java.util.Objects;
  */
 public final class MutationBatch
 {
-    public static final int PROTOCOL_VERSION = 1;
+    public static final int PROTOCOL_VERSION = 2;
     public static final int DIGEST_BYTES = 32;
+    private static final int DIGEST_HEADER_BYTES =
+            Integer.BYTES
+                    + Long.BYTES
+                    + Long.BYTES
+                    + Long.BYTES
+                    + Long.BYTES
+                    + Integer.BYTES
+                    + Integer.BYTES
+                    + Long.BYTES
+                    + Long.BYTES
+                    + Integer.BYTES
+                    + Integer.BYTES
+                    + Integer.BYTES;
 
     private final MutationStreamId streamId;
     private final long sequence;
@@ -57,9 +70,11 @@ public final class MutationBatch
         this.payload = payload.clone();
 
         // Fixed-width big-endian encoding; bind identity, metadata, and payload.
-        ByteBuffer header = ByteBuffer.allocate(64);
+        ByteBuffer header = ByteBuffer.allocate(DIGEST_HEADER_BYTES);
         header.putInt(PROTOCOL_VERSION)
-                .putLong(streamId.getTransactionId()).putLong(streamId.getWriterId())
+                .putLong(streamId.getTransactionId())
+                .putLong(streamId.getStatementId())
+                .putLong(streamId.getWriterId())
                 .putLong(streamId.getTableId()).putInt(streamId.getShardId())
                 .putInt(streamId.getKind().getCode()).putLong(sequence).putLong(schemaVersion)
                 .putInt(payloadFormat).putInt(rowCount).putInt(payload.length);
