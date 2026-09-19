@@ -174,12 +174,25 @@ public final class IngestFileWriter implements AutoCloseable
             active = create(span);
         }
         validateIdentity(span);
-        int expectedEnd = span.getBlockStartOffset() + span.getRowCount();
-        if (active.rows == expectedEnd)
+        int start = span.getBlockStartOffset();
+        int expectedEnd;
+        try
+        {
+            expectedEnd = Math.addExact(start, span.getRowCount());
+        }
+        catch (ArithmeticException e)
+        {
+            throw new RetinaException("Direct-file installation span overflows", e);
+        }
+        if (start < 0 || expectedEnd > active.capacity)
+        {
+            throw new RetinaException("Direct-file installation span is out of bounds");
+        }
+        if (expectedEnd <= active.rows)
         {
             return;
         }
-        if (active.rows != span.getBlockStartOffset())
+        if (active.rows != start)
         {
             throw new RetinaException("Direct-file installation is not contiguous");
         }

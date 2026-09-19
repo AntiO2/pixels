@@ -736,8 +736,27 @@ public class TestPixelsIngestStorage {
             installer.prepare(fileTransaction, Collections.singletonList(fileBatch));
             assertFalse(installer.install(
                     fileTransaction, Collections.singletonList(fileBatch), false, false));
+            List<byte[][]> nextFileRows = Collections.nCopies(
+                    20, new byte[][] {new byte[] {10}});
+            MutationBatch nextFileBatch = new MutationBatch(
+                    new MutationStreamId(
+                            103, STATEMENT_ID, 1, 73, 0,
+                            MutationStreamId.Kind.APPEND_ROWS),
+                    0, table.getSchemaVersion(), ColumnBatchCodec.FORMAT, nextFileRows.size(),
+                    ColumnBatchCodec.encode(nextFileRows, 1, 1024 * 1024));
+            Transaction nextFileTransaction = fileTransaction.toBuilder()
+                    .setTransactionId(103)
+                    .setCommitTimestamp(204)
+                    .setCommitToken("storage-test-file-103")
+                    .build();
+            installer.prepare(nextFileTransaction, Collections.singletonList(nextFileBatch));
+            assertFalse(installer.install(
+                    nextFileTransaction, Collections.singletonList(nextFileBatch), false, false));
+            assertFalse(installer.install(
+                    fileTransaction, Collections.singletonList(fileBatch), false, false),
+                    "Polling an earlier contribution must accept a later written file prefix");
             assertTrue(installer.install(
-                    fileTransaction, Collections.singletonList(fileBatch), false, true));
+                    nextFileTransaction, Collections.singletonList(nextFileBatch), false, true));
             assertEquals(bufferedBeforeFile, bufferedRows(buffer),
                     "FILE must not install rows into the shared MemTable");
             assertEquals(objectFilesBefore, countFiles(root.resolve("objects")),
@@ -753,7 +772,7 @@ public class TestPixelsIngestStorage {
                 directRows += countRows(root.resolve("ordered")
                         .resolve(file.getName()).toUri().toString());
             }
-            assertEquals(200, directRows);
+            assertEquals(220, directRows);
         } finally {
             if (installer != null) {
                 installer.close();
