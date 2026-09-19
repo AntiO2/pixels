@@ -226,7 +226,9 @@ message PrivateReadPage {
   bool end_of_input = 3;
   bytes manifest_digest = 4;
 }
-// Replay plans bind existing rowIds to existing write-buffer locations. They are not an index.
+// Replay plans bind existing rowIds to durable physical placements. BUFFERED spans describe
+// write-buffer blocks; FILE spans describe row ranges in a temporary Pixels file. They are not
+// an index.
 message BufferSpan {
   uint64 file_id = 1;
   string file_name = 2;

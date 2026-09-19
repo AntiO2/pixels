@@ -20,6 +20,7 @@ package io.pixelsdb.pixels.retina.ingest;
 
 import com.google.protobuf.ByteString;
 
+import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.index.IndexOption;
 import io.pixelsdb.pixels.common.index.service.*;
 import io.pixelsdb.pixels.common.ingest.MutationBatch;
@@ -67,13 +68,14 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     private final Map<Long, Long> reservedBytes = new HashMap<>();
     private final Map<Long, File> catalogFiles = new HashMap<>();
     private final Set<Long> preparedTransactions = new HashSet<>();
-    private final Map<PixelsWriteBuffer, FileAggregation> fileAggregations =
+    private final Map<IngestFileWriter, FileAggregation> fileAggregations =
             new IdentityHashMap<>();
     private final Set<String> fileContributions = new HashSet<>();
     private long planBytes;
     private final Map<Long, Long> intentBytes = new HashMap<>();
 
     private static final class FileAggregation {
+        private long fileId;
         private long rows;
         private long bytes;
         private long oldestContributionMillis;
@@ -359,6 +361,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                 resources.addVisibility(file.getId(), 0, span.getFileCapacity(), 0L, null, false);
             }
         }
+        resources.cleanupOrphanedIngestFiles(managedFiles);
         resources.initializeIngestBaseline(managedFiles);
     }
 
@@ -456,6 +459,9 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             plans.putAll(nextPlans);
             checkpoints.clear();
             checkpoints.putAll(nextCheckpoints);
+            synchronized (fileAggregations) {
+                fileContributions.removeAll(planSnapshot.keySet());
+            }
             planBytes = bytes.length;
         }
         return true;
@@ -556,7 +562,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             boolean recovering,
             boolean forceFileTail)
             throws Exception {
-        Map<PixelsWriteBuffer, Set<Long>> requiredFiles = new IdentityHashMap<>();
+        Map<IngestFileWriter, Set<Long>> requiredFiles = new IdentityHashMap<>();
         for (MutationBatch batch : batches) {
             TableSpec table = IngestWire.table(tx, batch.getStreamId().getTableId());
             List<byte[][]> rows = rows(tx, batch);
@@ -564,96 +570,41 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             if (!IngestWire.owner(route).equals(owner)) {
                 throw new IOException("Incorrect participant owner");
             }
-            PixelsWriteBuffer buffer = tx.getRepresentation() == WriteRepresentation.FILE
-                    ? resources.getIngestFileBuffer(
-                            table.getSchemaName(), table.getTableName(), route.getVirtualNodeId())
-                    : resources.getIngestBuffer(
-                            table.getSchemaName(), table.getTableName(), route.getVirtualNodeId());
-            String batchKey = IngestWire.batchKey(batch.getStreamId(), batch.getSequence());
-            // planSpan records the current append offset before the plan is forced to disk.
-            // Serialize that handoff per table/vnode buffer, while allowing independent
-            // buffers and the later file-materialization wait to proceed concurrently.
-            synchronized (buffer) {
-                buffer.beginInstallation();
-                try {
-                BatchInstall plan = plan(batchKey);
-                if (plan == null) {
-                    IndexProto.RowIdBatch allocation =
-                            indexes.allocateRowIdBatch(table.getTableId(), batch.getRowCount());
-                    if (allocation == null
-                            || allocation.getLength() < batch.getRowCount()
-                            || allocation.getRowIdStart() < 0) {
-                        throw new IOException("Existing row allocator returned an insufficient range");
-                    }
-                    Math.addExact(allocation.getRowIdStart(), batch.getRowCount() - 1L);
-                    plan =
-                            BatchInstall.newBuilder()
-                                    .setStream(IngestWire.encode(batch.getStreamId()))
-                                    .setSequence(batch.getSequence())
-                                    .setCommitTimestamp(tx.getCommitTimestamp())
-                                    .setRowIdStart(allocation.getRowIdStart())
-                                    .setRowCount(batch.getRowCount())
-                                    .setDigest(ByteString.copyFrom(batch.getDigest()))
-                                    .build();
-                    save(plan);
-                }
-                if (plan.getCommitTimestamp() != tx.getCommitTimestamp()
-                        || plan.getRowCount() != batch.getRowCount()
-                        || !plan.getDigest().equals(ByteString.copyFrom(batch.getDigest()))) {
-                    throw new IOException("Batch installation identity mismatch");
-                }
-                int offset = 0;
-                for (BufferSpan span : plan.getSpansList()) {
-                    installSpan(
-                            tx,
-                            table,
-                            route,
-                            buffer,
-                            span,
-                            rows.subList(offset, offset + span.getRowCount()),
-                            recovering);
-                    offset += span.getRowCount();
-                }
-                while (offset < rows.size()) {
-                    BufferSpan span =
-                            buffer.planSpan(
-                                    rows.size() - offset, Math.addExact(plan.getRowIdStart(), offset));
-                    plan = plan.toBuilder().addSpans(span).build();
-                    save(plan); // Assignments are durable before any corresponding shared row appears.
-                    installSpan(
-                            tx,
-                            table,
-                            route,
-                            buffer,
-                            span,
-                            rows.subList(offset, offset + span.getRowCount()),
-                            false);
-                    offset += span.getRowCount();
-                }
-                } finally {
-                    buffer.endInstallation();
-                }
-            }
             if (tx.getRepresentation() == WriteRepresentation.FILE) {
-                BatchInstall completed = plan(batchKey);
-                if (completed == null || completed.getSpansCount() == 0) {
-                    throw new IOException("FILE installation has no durable placement plan");
-                }
+                IngestFileWriter writer = resources.getIngestFileWriter(
+                        table.getSchemaName(), table.getTableName(), route.getVirtualNodeId());
+                BatchInstall completed = installFileBatch(
+                        tx, table, batch, rows, writer, recovering);
                 Set<Long> files = requiredFiles.computeIfAbsent(
-                        buffer, ignored -> new LinkedHashSet<>());
+                        writer, ignored -> new LinkedHashSet<>());
                 Set<Long> batchFiles = new LinkedHashSet<>();
                 for (BufferSpan span : completed.getSpansList()) {
                     files.add(span.getFileId());
                     batchFiles.add(span.getFileId());
                 }
                 if (!allRegular(batchFiles)) {
-                    contributeToFile(
-                            buffer, batchKey, batch.getRowCount(), batch.getPayload().length);
+                    long activeFileId = writer.getActiveFileId();
+                    long activeRows = completed.getSpansList().stream()
+                            .filter(span -> span.getFileId() == activeFileId)
+                            .mapToLong(BufferSpan::getRowCount)
+                            .sum();
+                    long activeBytes = activeRows == 0
+                            ? 0
+                            : Math.max(1L,
+                                    ((long) batch.getPayload().length * activeRows
+                                            + batch.getRowCount() - 1L)
+                                            / batch.getRowCount());
+                    contributeToFile(writer, key(completed), activeBytes);
                 }
+            }
+            else {
+                PixelsWriteBuffer buffer = resources.getIngestBuffer(
+                        table.getSchemaName(), table.getTableName(), route.getVirtualNodeId());
+                installBufferedBatch(tx, table, batch, rows, buffer, recovering);
             }
         }
         if (tx.getRepresentation() == WriteRepresentation.FILE) {
-            for (Map.Entry<PixelsWriteBuffer, Set<Long>> entry : requiredFiles.entrySet()) {
+            for (Map.Entry<IngestFileWriter, Set<Long>> entry : requiredFiles.entrySet()) {
                 if (forceFileTail) {
                     flushAggregation(entry.getKey(), true);
                 }
@@ -665,45 +616,152 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
         return true;
     }
 
+    private BatchInstall initialPlan(Transaction tx, MutationBatch batch) throws Exception {
+        String batchKey = IngestWire.batchKey(batch.getStreamId(), batch.getSequence());
+        BatchInstall plan = plan(batchKey);
+        if (plan == null) {
+            IndexProto.RowIdBatch allocation =
+                    indexes.allocateRowIdBatch(batch.getStreamId().getTableId(), batch.getRowCount());
+            if (allocation == null
+                    || allocation.getLength() < batch.getRowCount()
+                    || allocation.getRowIdStart() < 0) {
+                throw new IOException("Existing row allocator returned an insufficient range");
+            }
+            Math.addExact(allocation.getRowIdStart(), batch.getRowCount() - 1L);
+            plan = BatchInstall.newBuilder()
+                    .setStream(IngestWire.encode(batch.getStreamId()))
+                    .setSequence(batch.getSequence())
+                    .setCommitTimestamp(tx.getCommitTimestamp())
+                    .setRowIdStart(allocation.getRowIdStart())
+                    .setRowCount(batch.getRowCount())
+                    .setDigest(ByteString.copyFrom(batch.getDigest()))
+                    .build();
+            save(plan);
+        }
+        if (plan.getCommitTimestamp() != tx.getCommitTimestamp()
+                || plan.getRowCount() != batch.getRowCount()
+                || !plan.getDigest().equals(ByteString.copyFrom(batch.getDigest()))) {
+            throw new IOException("Batch installation identity mismatch");
+        }
+        return plan;
+    }
+
+    private BatchInstall installFileBatch(
+            Transaction tx,
+            TableSpec table,
+            MutationBatch batch,
+            List<byte[][]> rows,
+            IngestFileWriter writer,
+            boolean recovering) throws Exception {
+        synchronized (writer) {
+            BatchInstall plan = initialPlan(tx, batch);
+            int offset = 0;
+            for (BufferSpan span : plan.getSpansList()) {
+                installFileSpan(tx, table, writer, span,
+                        rows.subList(offset, offset + span.getRowCount()), recovering);
+                offset += span.getRowCount();
+            }
+            while (offset < rows.size()) {
+                BufferSpan span = writer.planSpan(
+                        rows.size() - offset, Math.addExact(plan.getRowIdStart(), offset));
+                plan = plan.toBuilder().addSpans(span).build();
+                save(plan);
+                installFileSpan(tx, table, writer, span,
+                        rows.subList(offset, offset + span.getRowCount()), false);
+                offset += span.getRowCount();
+            }
+            if (plan.getSpansCount() == 0) {
+                throw new IOException("FILE installation has no durable placement plan");
+            }
+            return plan;
+        }
+    }
+
+    private void installBufferedBatch(
+            Transaction tx,
+            TableSpec table,
+            MutationBatch batch,
+            List<byte[][]> rows,
+            PixelsWriteBuffer buffer,
+            boolean recovering) throws Exception {
+        synchronized (buffer) {
+            buffer.beginInstallation();
+            try {
+                BatchInstall plan = initialPlan(tx, batch);
+                int offset = 0;
+                for (BufferSpan span : plan.getSpansList()) {
+                    installBufferedSpan(tx, table, buffer, span,
+                            rows.subList(offset, offset + span.getRowCount()), recovering);
+                    offset += span.getRowCount();
+                }
+                while (offset < rows.size()) {
+                    BufferSpan span = buffer.planSpan(
+                            rows.size() - offset, Math.addExact(plan.getRowIdStart(), offset));
+                    plan = plan.toBuilder().addSpans(span).build();
+                    save(plan);
+                    installBufferedSpan(tx, table, buffer, span,
+                            rows.subList(offset, offset + span.getRowCount()), false);
+                    offset += span.getRowCount();
+                }
+            }
+            finally {
+                buffer.endInstallation();
+            }
+        }
+    }
+
     @Override
     public long installPollMillis() {
         return options.filePollMillis;
     }
 
     private void contributeToFile(
-            PixelsWriteBuffer buffer, String batchKey, long rows, long bytes)
+            IngestFileWriter writer, String batchKey, long bytes)
             throws Exception {
+        if (bytes <= 0) {
+            return;
+        }
         boolean thresholdReached;
         synchronized (fileAggregations) {
             if (!fileContributions.add(batchKey)) {
                 return;
             }
             FileAggregation aggregation = fileAggregations.computeIfAbsent(
-                    buffer, ignored -> new FileAggregation());
-            if (aggregation.rows == 0) {
+                    writer, ignored -> new FileAggregation());
+            long activeFileId = writer.getActiveFileId();
+            if (activeFileId == 0L) {
+                aggregation.fileId = 0L;
+                aggregation.rows = 0L;
+                aggregation.bytes = 0L;
+                aggregation.oldestContributionMillis = 0L;
+                return;
+            }
+            if (aggregation.fileId != activeFileId) {
+                aggregation.fileId = activeFileId;
+                aggregation.bytes = 0L;
                 aggregation.oldestContributionMillis = System.currentTimeMillis();
             }
-            aggregation.rows = Math.addExact(aggregation.rows, rows);
+            aggregation.rows = writer.getActiveRowCount();
             aggregation.bytes = Math.addExact(aggregation.bytes, bytes);
             thresholdReached = aggregation.rows >= options.fileTargetRows
                     || aggregation.bytes >= options.fileMaxBytes;
         }
         if (thresholdReached) {
-            flushAggregation(buffer, false);
+            flushAggregation(writer, false);
         }
     }
 
-    private boolean filesReady(PixelsWriteBuffer buffer, Set<Long> fileIds) throws Exception {
+    private boolean filesReady(IngestFileWriter writer, Set<Long> fileIds) throws Exception {
         boolean expired = false;
         synchronized (fileAggregations) {
-            FileAggregation aggregation = fileAggregations.get(buffer);
+            FileAggregation aggregation = fileAggregations.get(writer);
             expired = aggregation != null
                     && aggregation.rows > 0
                     && System.currentTimeMillis() - aggregation.oldestContributionMillis
                             >= options.fileMaxDelayMillis;
         }
         if (expired) {
-            flushAggregation(buffer, true);
+            flushAggregation(writer, true);
         }
         return allRegular(fileIds);
     }
@@ -718,11 +776,10 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
         return true;
     }
 
-    private void flushAggregation(PixelsWriteBuffer buffer, boolean delayExpired) {
-        long accountedRows;
-        long accountedBytes;
+    private void flushAggregation(IngestFileWriter writer, boolean delayExpired)
+            throws RetinaException {
         synchronized (fileAggregations) {
-            FileAggregation aggregation = fileAggregations.get(buffer);
+            FileAggregation aggregation = fileAggregations.get(writer);
             if (aggregation == null || aggregation.rows == 0 || aggregation.flushing
                     || (!delayExpired
                             && aggregation.rows < options.fileTargetRows
@@ -730,26 +787,23 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                 return;
             }
             aggregation.flushing = true;
-            accountedRows = aggregation.rows;
-            accountedBytes = aggregation.bytes;
         }
-        boolean retired = buffer.requestIngestTailFlush();
+        boolean retired = writer.publishTail();
         synchronized (fileAggregations) {
-            FileAggregation aggregation = fileAggregations.get(buffer);
+            FileAggregation aggregation = fileAggregations.get(writer);
             if (retired) {
-                aggregation.rows -= accountedRows;
-                aggregation.bytes -= accountedBytes;
-                aggregation.oldestContributionMillis = aggregation.rows == 0
-                        ? 0 : System.currentTimeMillis();
+                aggregation.fileId = 0L;
+                aggregation.rows = 0L;
+                aggregation.bytes = 0L;
+                aggregation.oldestContributionMillis = 0L;
             }
             aggregation.flushing = false;
         }
     }
 
-    private void installSpan(
+    private void installBufferedSpan(
             Transaction tx,
             TableSpec table,
-            Route route,
             PixelsWriteBuffer buffer,
             BufferSpan span,
             List<byte[][]> rows,
@@ -791,27 +845,74 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             // A crash may occur after MainIndex's atomic per-file flush but before
             // catalog publication. Resolve before putting: rebuilding that flushed
             // file's cache would violate its flush-marker contract.
-            List<Long> rowIds = new ArrayList<>(locations.size());
-            for (IndexProto.PrimaryIndexEntry entry : locations) {
-                rowIds.add(entry.getRowId());
+            putMissingMainIndexEntries(table.getTableId(), locations);
+        }
+        installBusinessIndexes(tx, table, span, rows);
+    }
+
+    private void installFileSpan(
+            Transaction tx,
+            TableSpec table,
+            IngestFileWriter writer,
+            BufferSpan span,
+            List<byte[][]> rows,
+            boolean recovering) throws Exception {
+        File file = recovering ? catalogFiles.get(span.getFileId()) : null;
+        if (file == null) {
+            file = metadata.getFileById(span.getFileId());
+        }
+        if (file == null) {
+            throw new IOException("Direct installation file was removed");
+        }
+        boolean published = file.getType() == File.Type.REGULAR;
+        if (!published) {
+            writer.append(span, rows, tx.getCommitTimestamp());
+            List<IndexProto.PrimaryIndexEntry> locations = new ArrayList<>();
+            for (int i = 0; i < rows.size(); i++) {
+                locations.add(IndexProto.PrimaryIndexEntry.newBuilder()
+                        .setRowId(span.getRowIdStart() + i)
+                        .setRowLocation(IndexProto.RowLocation.newBuilder()
+                                .setFileId(span.getFileId())
+                                .setRgId(0)
+                                .setRgRowOffset(span.getBlockStartOffset() + i)
+                                .build())
+                        .build());
             }
-            List<IndexProto.RowLocation> existing =
-                    indexes.lookupRowLocations(table.getTableId(), rowIds);
-            if (existing.size() != locations.size()) {
-                throw new IOException("MainIndex lookup lost positional alignment");
+            putMissingMainIndexEntries(table.getTableId(), locations);
+        }
+        installBusinessIndexes(tx, table, span, rows);
+        if (!published) {
+            writer.publishIfFull();
+        }
+    }
+
+    private void putMissingMainIndexEntries(
+            long tableId, List<IndexProto.PrimaryIndexEntry> locations) throws Exception {
+        List<Long> rowIds = new ArrayList<>(locations.size());
+        for (IndexProto.PrimaryIndexEntry entry : locations) {
+            rowIds.add(entry.getRowId());
+        }
+        List<IndexProto.RowLocation> existing = indexes.lookupRowLocations(tableId, rowIds);
+        if (existing.size() != locations.size()) {
+            throw new IOException("MainIndex lookup lost positional alignment");
+        }
+        List<IndexProto.PrimaryIndexEntry> missing = new ArrayList<>();
+        for (int i = 0; i < locations.size(); i++) {
+            if (existing.get(i) == null) {
+                missing.add(locations.get(i));
             }
-            List<IndexProto.PrimaryIndexEntry> missing = new ArrayList<>();
-            for (int i = 0; i < locations.size(); i++) {
-                if (existing.get(i) == null) {
-                    missing.add(locations.get(i));
-                } else if (!existing.get(i).equals(locations.get(i).getRowLocation())) {
-                    throw new IOException("Recorded rowId resolves to another storage location");
-                }
-            }
-            if (!missing.isEmpty()) {
-                indexes.putMainIndexEntriesOnly(table.getTableId(), missing);
+            else if (!existing.get(i).equals(locations.get(i).getRowLocation())) {
+                throw new IOException("Recorded rowId resolves to another storage location");
             }
         }
+        if (!missing.isEmpty()) {
+            indexes.putMainIndexEntriesOnly(tableId, missing);
+        }
+    }
+
+    private void installBusinessIndexes(
+            Transaction tx, TableSpec table, BufferSpan span, List<byte[][]> rows)
+            throws Exception {
         for (TableIndex index : table.getIndexesList()) {
             Map<Integer, List<IndexProto.PrimaryIndexEntry>> primary = new HashMap<>();
             Map<Integer, List<IndexProto.SecondaryIndexEntry>> secondary = new HashMap<>();

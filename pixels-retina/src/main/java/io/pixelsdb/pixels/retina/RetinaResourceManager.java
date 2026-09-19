@@ -20,6 +20,7 @@
 package io.pixelsdb.pixels.retina;
 
 import com.google.protobuf.ByteString;
+import io.pixelsdb.pixels.common.exception.MetadataException;
 import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.exception.TransException;
 import io.pixelsdb.pixels.common.index.service.IndexService;
@@ -88,16 +89,21 @@ public class RetinaResourceManager
      * {@link #pixelsWriteBufferMap}, so regular buffer PageSources cannot expose its rows before
      * the resulting Pixels file is atomically published.
      */
-    public synchronized PixelsWriteBuffer getIngestFileBuffer(
+    public synchronized IngestFileWriter getIngestFileWriter(
             String schema, String table, int vnode) throws RetinaException
     {
         String key = RetinaUtils.buildWriteBufferKey(schema, table);
-        Map<Integer, PixelsWriteBuffer> existing = ingestFileBufferMap.get(key);
+        Map<Integer, IngestFileWriter> existing = ingestFileWriterMap.get(key);
         if (existing == null || !existing.containsKey(vnode))
         {
-            addWriteBuffers(schema, table, ingestFileBufferMap, ingestFileTargetRows, false);
+            addIngestFileWriters(schema, table);
         }
-        return checkPixelsWriteBuffer(ingestFileBufferMap, schema, table, vnode);
+        IngestFileWriter writer = ingestFileWriterMap.get(key).get(vnode);
+        if (writer == null)
+        {
+            throw new RetinaException("Ingest file writer is missing for vnode " + vnode);
+        }
+        return writer;
     }
 
     /** Verify that every in-flight installation file is present in recovered visibility. */
@@ -110,9 +116,80 @@ public class RetinaResourceManager
         }
     }
 
+    /**
+     * Removes temporary ingest files that were registered before their installation plan became
+     * durable. This runs during recovery, before the daemon becomes ready, when no writer can
+     * still be using an unreferenced file.
+     */
+    public void cleanupOrphanedIngestFiles(Set<Long> managedFiles) throws RetinaException
+    {
+        try
+        {
+            List<File> temporaryFiles = metadataService.getFilesByType(
+                    EnumSet.of(File.Type.TEMPORARY_INGEST));
+            if (temporaryFiles.isEmpty())
+            {
+                return;
+            }
+            Map<Long, Path> paths = new HashMap<>();
+            for (Schema schema : metadataService.getSchemas())
+            {
+                for (Table table : metadataService.getTables(schema.getName()))
+                {
+                    for (Layout layout : metadataService.getLayouts(
+                            schema.getName(), table.getName()))
+                    {
+                        for (Path path : layout.getOrderedPaths())
+                        {
+                            paths.put(path.getId(), path);
+                        }
+                        for (Path path : layout.getCompactPaths())
+                        {
+                            paths.put(path.getId(), path);
+                        }
+                    }
+                }
+            }
+            for (File file : temporaryFiles)
+            {
+                if (managedFiles.contains(file.getId()))
+                {
+                    continue;
+                }
+                Path parent = paths.get(file.getPathId());
+                if (parent == null)
+                {
+                    throw new RetinaException("Path is missing for orphan ingest file "
+                            + file.getId());
+                }
+                String filePath = File.getFilePath(parent, file);
+                Storage fileStorage = StorageFactory.Instance().getStorage(filePath);
+                if (fileStorage.exists(filePath))
+                {
+                    fileStorage.delete(filePath, false);
+                }
+                removeVisibility(file.getId());
+                if (!metadataService.deleteFiles(Collections.singletonList(file.getId())))
+                {
+                    throw new RetinaException("Failed to delete orphan ingest file metadata "
+                            + file.getId());
+                }
+            }
+        }
+        catch (RetinaException e)
+        {
+            throw e;
+        }
+        catch (Exception e)
+        {
+            throw new RetinaException("Failed to clean orphan ingest files", e);
+        }
+    }
+
     private final Map<String, Map<Integer, PixelsWriteBuffer>> pixelsWriteBufferMap;
-    private final Map<String, Map<Integer, PixelsWriteBuffer>> ingestFileBufferMap;
+    private final Map<String, Map<Integer, IngestFileWriter>> ingestFileWriterMap;
     private final int ingestFileTargetRows;
+    private final int ingestFilePixelStride;
     private String retinaHostName;
 
     // GC related fields
@@ -238,11 +315,13 @@ public class RetinaResourceManager
         this.indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local);
         this.rgVisibilityMap = new ConcurrentHashMap<>();
         this.pixelsWriteBufferMap = new ConcurrentHashMap<>();
-        this.ingestFileBufferMap = new ConcurrentHashMap<>();
+        this.ingestFileWriterMap = new ConcurrentHashMap<>();
 
         ConfigFactory config = ConfigFactory.Instance();
-        this.ingestFileTargetRows =
-                new io.pixelsdb.pixels.common.ingest.rpc.IngestOptions().fileTargetRows;
+        io.pixelsdb.pixels.common.ingest.rpc.IngestOptions ingestOptions =
+                new io.pixelsdb.pixels.common.ingest.rpc.IngestOptions();
+        this.ingestFileTargetRows = ingestOptions.fileTargetRows;
+        this.ingestFilePixelStride = ingestOptions.filePixelStride;
 
         this.gcExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "retina-gc-thread");
@@ -456,9 +535,20 @@ public class RetinaResourceManager
         {
             buffers.addAll(perTable.values());
         }
-        for (Map<Integer, PixelsWriteBuffer> perTable : ingestFileBufferMap.values())
+        for (Map<Integer, IngestFileWriter> perTable : ingestFileWriterMap.values())
         {
-            buffers.addAll(perTable.values());
+            for (IngestFileWriter writer : perTable.values())
+            {
+                try
+                {
+                    writer.close();
+                }
+                catch (RetinaException e)
+                {
+                    if (failure == null) failure = e;
+                    else failure.addSuppressed(e);
+                }
+            }
         }
         for (PixelsWriteBuffer buffer : buffers)
         {
@@ -473,7 +563,7 @@ public class RetinaResourceManager
             }
         }
         pixelsWriteBufferMap.clear();
-        ingestFileBufferMap.clear();
+        ingestFileWriterMap.clear();
 
         for (RGVisibility visibility : rgVisibilityMap.values())
         {
@@ -887,6 +977,87 @@ public class RetinaResourceManager
         addWriteBuffers(schemaName, tableName, pixelsWriteBufferMap, 0, true);
     }
 
+    private static final class WriteLayout
+    {
+        private final long tableId;
+        private final TypeDescription schema;
+        private final int[] orderMapping;
+        private final Path orderedPath;
+        private final Path compactPath;
+
+        private WriteLayout(long tableId, TypeDescription schema, int[] orderMapping,
+                            Path orderedPath, Path compactPath)
+        {
+            this.tableId = tableId;
+            this.schema = schema;
+            this.orderMapping = orderMapping;
+            this.orderedPath = orderedPath;
+            this.compactPath = compactPath;
+        }
+    }
+
+    private WriteLayout loadWriteLayout(String schemaName, String tableName) throws Exception
+    {
+        Layout latestLayout = this.metadataService.getLatestLayout(schemaName, tableName);
+        List<Column> columns = this.metadataService.getColumns(schemaName, tableName, false);
+        List<String> layoutColumnOrder = latestLayout.getOrdered().getColumnOrder();
+        List<String> metadataColumnNames = new ArrayList<>(columns.size());
+        for (Column column : columns)
+        {
+            metadataColumnNames.add(column.getName());
+        }
+        int[] orderMapping = new int[layoutColumnOrder.size()];
+        List<String> columnNames = new ArrayList<>(columns.size());
+        List<String> columnTypes = new ArrayList<>(columns.size());
+        for (int i = 0; i < layoutColumnOrder.size(); ++i)
+        {
+            int metadataColumnIndex = metadataColumnNames.indexOf(layoutColumnOrder.get(i));
+            if (metadataColumnIndex < 0)
+            {
+                throw new MetadataException("Layout column is missing from table metadata: "
+                        + layoutColumnOrder.get(i));
+            }
+            orderMapping[i] = metadataColumnIndex;
+            Column column = columns.get(metadataColumnIndex);
+            columnNames.add(column.getName());
+            columnTypes.add(column.getType());
+        }
+        return new WriteLayout(
+                latestLayout.getTableId(),
+                TypeDescription.createSchemaFromStrings(columnNames, columnTypes),
+                orderMapping,
+                latestLayout.getOrderedPaths().get(0),
+                latestLayout.getCompactPaths().get(0));
+    }
+
+    private void addIngestFileWriters(String schemaName, String tableName) throws RetinaException
+    {
+        try
+        {
+            WriteLayout layout = loadWriteLayout(schemaName, tableName);
+            String key = RetinaUtils.buildWriteBufferKey(schemaName, tableName);
+            Map<Integer, IngestFileWriter> nodeWriters = ingestFileWriterMap.computeIfAbsent(
+                    key, ignored -> new ConcurrentHashMap<>());
+            for (int vnode = 0; vnode < totalVirtualNodeNum; vnode++)
+            {
+                if (nodeWriters.containsKey(vnode))
+                {
+                    continue;
+                }
+                nodeWriters.put(vnode, new IngestFileWriter(
+                        layout.tableId, layout.schema, layout.orderMapping, layout.orderedPath,
+                        retinaHostName, vnode, ingestFileTargetRows, ingestFilePixelStride,
+                        metadataService, indexService, this));
+            }
+        }
+        catch (Exception e)
+        {
+            throw new RetinaException(String.format(
+                    "Failed to add ingest file writers for schema %s, table %s",
+                    schemaName, tableName), e);
+        }
+    }
+
     private void addWriteBuffers(
             String schemaName,
             String tableName,
@@ -896,37 +1067,7 @@ public class RetinaResourceManager
     {
         try
         {
-            /*
-             * Get ordered and compact dir path.
-             * Already been validated when adding visibility.
-             */
-            Layout latestLayout = this.metadataService.getLatestLayout(schemaName, tableName);
-            List<io.pixelsdb.pixels.common.metadata.domain.Path> orderedPaths = latestLayout.getOrderedPaths();
-            List<io.pixelsdb.pixels.common.metadata.domain.Path> compactPaths = latestLayout.getCompactPaths();
-
-            // Build the file schema in layout order while retaining a mapping from
-            // layout positions to the metadata order used by Retina RPC values.
-            List<Column> columns = this.metadataService.getColumns(schemaName, tableName, false);
-            List<String> layoutColumnOrder = latestLayout.getOrdered().getColumnOrder();
-            List<String> metadataColumnNames = new ArrayList<>(columns.size());
-            for (Column column : columns)
-            {
-                metadataColumnNames.add(column.getName());
-            }
-            int[] orderMapping = new int[layoutColumnOrder.size()];
-            for (int i = 0; i < layoutColumnOrder.size(); ++i)
-            {
-                orderMapping[i] = metadataColumnNames.indexOf(layoutColumnOrder.get(i));
-            }
-            List<String> columnNames = new ArrayList<>(columns.size());
-            List<String> columnTypes = new ArrayList<>(columns.size());
-            for (int metadataColumnIndex : orderMapping)
-            {
-                Column column = columns.get(metadataColumnIndex);
-                columnNames.add(column.getName());
-                columnTypes.add(column.getType());
-            }
-            TypeDescription schema = TypeDescription.createSchemaFromStrings(columnNames, columnTypes);
+            WriteLayout layout = loadWriteLayout(schemaName, tableName);
 
             String writeBufferKey = RetinaUtils.buildWriteBufferKey(schemaName, tableName);
             Map<Integer, PixelsWriteBuffer> nodeBuffers = buffers.computeIfAbsent(
@@ -936,8 +1077,8 @@ public class RetinaResourceManager
             {
                 if (nodeBuffers.containsKey(i)) { continue; }
                 PixelsWriteBuffer pixelsWriteBuffer = new PixelsWriteBuffer(
-                        latestLayout.getTableId(), schema, orderMapping,
-                        orderedPaths.get(0), compactPaths.get(0), retinaHostName, i,
+                        layout.tableId, layout.schema, layout.orderMapping,
+                        layout.orderedPath, layout.compactPath, retinaHostName, i,
                         minimumFileRows, automaticTailFlush);
                 nodeBuffers.put(i, pixelsWriteBuffer);
             }
@@ -1280,14 +1421,14 @@ public class RetinaResourceManager
                         }
                     }
                 }
-                for (Map<Integer, PixelsWriteBuffer> perTable : this.ingestFileBufferMap.values())
+                for (Map<Integer, IngestFileWriter> perTable : this.ingestFileWriterMap.values())
                 {
-                    for (PixelsWriteBuffer buffer : perTable.values())
+                    for (IngestFileWriter writer : perTable.values())
                     {
-                        long ts = buffer.getEarliestPendingMinTs();
+                        long ts = writer.getEarliestPendingMinTs();
                         if (ts != Long.MAX_VALUE)
                         {
-                            segments.add(new PendingSegmentEntry(buffer.getVirtualNodeId(), ts));
+                            segments.add(new PendingSegmentEntry(writer.getVirtualNodeId(), ts));
                         }
                     }
                 }

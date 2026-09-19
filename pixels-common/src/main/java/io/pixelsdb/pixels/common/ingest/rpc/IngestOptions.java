@@ -38,6 +38,7 @@ public final class IngestOptions {
     private static final int DEFAULT_MAX_TRANSACTIONS = 10_000;
     private static final int DEFAULT_INSTALLATION_THREADS = 16;
     private static final int DEFAULT_FILE_TARGET_ROWS = 1_000_000;
+    private static final int DEFAULT_FILE_PIXEL_STRIDE = 10_000;
     private static final long DEFAULT_FILE_MAX_BYTES = 512L * MEBIBYTE;
     private static final long DEFAULT_FILE_MAX_DELAY_MILLIS = 30_000L;
     private static final long DEFAULT_FILE_POLL_MILLIS = 25L;
@@ -63,6 +64,8 @@ public final class IngestOptions {
             "retina.ingest.install.threads", DEFAULT_INSTALLATION_THREADS);
     public final int fileTargetRows = number(
             "retina.ingest.file.target.rows", DEFAULT_FILE_TARGET_ROWS);
+    public final int filePixelStride = number(
+            "retina.ingest.file.pixel.stride", DEFAULT_FILE_PIXEL_STRIDE);
     public final long fileMaxBytes = longNumber(
             "retina.ingest.file.max.bytes", DEFAULT_FILE_MAX_BYTES);
     public final long fileMaxDelayMillis = longNumber(

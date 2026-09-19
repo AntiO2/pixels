@@ -329,6 +329,9 @@ public class TestPixelsIngestStorage {
         // the independent idle-flush scheduler outside that assertion window;
         // slow CI hosts can otherwise flush the final four rows into a third file.
         changes.put("retina.buffer.flush.interval", "60");
+        changes.put("retina.ingest.file.target.rows", "128");
+        changes.put("retina.ingest.file.pixel.stride", "64");
+        changes.put("retina.ingest.file.max.delay.ms", "60000");
         changes.put(
                 "retina.buffer.object.storage.folder", root.resolve("objects").toUri().toString());
         changes.put("retina.storage.gc.journal.dir", root.resolve("gc").toUri().toString());
@@ -389,8 +392,8 @@ public class TestPixelsIngestStorage {
             buffer = resources.getIngestBuffer("s", "t", 0);
             assertNotSame(
                     buffer,
-                    resources.getIngestFileBuffer("s", "t", 0),
-                    "FILE installation must not reuse the query-visible BUFFERED instance");
+                    resources.getIngestFileWriter("s", "t", 0),
+                    "FILE installation must bypass the query-visible MemTable path");
             AtomicLong allocation = new AtomicLong(1000),
                     allocationCalls = new AtomicLong(),
                     putCalls = new AtomicLong();
@@ -705,6 +708,48 @@ public class TestPixelsIngestStorage {
             installer.initializeRecovery(Collections.singletonList(publishedNext));
             assertFalse(installer.recoveredByCheckpoint(published),
                     "Coordinator absence is the durable acknowledgement that prunes this checkpoint");
+
+            long bufferedBeforeFile = bufferedRows(buffer);
+            long objectFilesBefore = countFiles(root.resolve("objects"));
+            Set<Long> regularBeforeFile = catalog.files.values().stream()
+                    .filter(f -> f.getType() == MetadataProto.File.Type.REGULAR)
+                    .map(MetadataProto.File::getId)
+                    .collect(java.util.stream.Collectors.toSet());
+            List<byte[][]> fileRows = Collections.nCopies(
+                    200, new byte[][] {new byte[] {9}});
+            MutationBatch fileBatch = new MutationBatch(
+                    new MutationStreamId(
+                            102, STATEMENT_ID, 1, 73, 0,
+                            MutationStreamId.Kind.APPEND_ROWS),
+                    0, table.getSchemaVersion(), ColumnBatchCodec.FORMAT, fileRows.size(),
+                    ColumnBatchCodec.encode(fileRows, 1, 1024 * 1024));
+            Transaction fileTransaction = tx.toBuilder()
+                    .setTransactionId(102)
+                    .setCommitTimestamp(203)
+                    .setCommitToken("storage-test-file-102")
+                    .setRepresentation(WriteRepresentation.FILE)
+                    .build();
+            installer.prepare(fileTransaction, Collections.singletonList(fileBatch));
+            assertFalse(installer.install(
+                    fileTransaction, Collections.singletonList(fileBatch), false, false));
+            assertTrue(installer.install(
+                    fileTransaction, Collections.singletonList(fileBatch), false, true));
+            assertEquals(bufferedBeforeFile, bufferedRows(buffer),
+                    "FILE must not install rows into the shared MemTable");
+            assertEquals(objectFilesBefore, countFiles(root.resolve("objects")),
+                    "FILE must not create Retina object-staging blocks");
+            List<MetadataProto.File> directFiles = catalog.files.values().stream()
+                    .filter(f -> f.getType() == MetadataProto.File.Type.REGULAR)
+                    .filter(f -> !regularBeforeFile.contains(f.getId()))
+                    .collect(java.util.stream.Collectors.toList());
+            assertEquals(2, directFiles.size(),
+                    "The row target and forced tail should produce two direct files");
+            int directRows = 0;
+            for (MetadataProto.File file : directFiles) {
+                directRows += countRows(root.resolve("ordered")
+                        .resolve(file.getName()).toUri().toString());
+            }
+            assertEquals(200, directRows);
         } finally {
             if (installer != null) {
                 installer.close();
@@ -744,6 +789,15 @@ public class TestPixelsIngestStorage {
             }
         }
         return rows;
+    }
+
+    private static long countFiles(Path directory) throws Exception {
+        if (!Files.exists(directory)) {
+            return 0L;
+        }
+        try (java.util.stream.Stream<Path> paths = Files.walk(directory)) {
+            return paths.filter(Files::isRegularFile).count();
+        }
     }
 
     static long readBuffered(RetinaResourceManager resources, Path root, long timestamp)
