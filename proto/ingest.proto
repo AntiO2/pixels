@@ -204,6 +204,18 @@ message CoordinatorSnapshot {
   repeated TerminalTransaction terminal_transactions = 6;
   uint64 retired_transaction_id_high_watermark = 7;
 }
+message CoordinatorMutation {
+  uint32 version = 1;
+  uint32 snapshot_version = 2;
+  uint64 published_timestamp = 3;
+  uint64 last_commit_timestamp = 4;
+  repeated Route routes = 5;
+  uint64 retired_transaction_id_high_watermark = 6;
+  repeated Transaction upsert_transactions = 7;
+  repeated uint64 remove_transaction_ids = 8;
+  repeated TerminalTransaction upsert_terminal_transactions = 9;
+  repeated uint64 remove_terminal_transaction_ids = 10;
+}
 message ReadPin {
   uint64 transaction_id = 1;
   uint64 read_timestamp = 2;

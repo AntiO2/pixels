@@ -557,7 +557,9 @@ public final class SqlIngestFixture implements AutoCloseable {
         AtomicReference<IngestClient> clients = new AtomicReference<>();
         coordinator =
                 new DurableIngestCoordinator(
-                        new AtomicStateFile(root.resolve("decisions"), ingestOptions.maxStateBytes),
+                        new CoordinatorStateStore(root.resolve("decisions"),
+                                ingestOptions.maxStateBytes,
+                                ingestOptions.coordinatorCompactionBytes),
                         new DurableIngestCoordinator.Tables() {
                             public TableSpec load(String s, String t) throws Exception {
                                 return IngestTables.load(s, t);

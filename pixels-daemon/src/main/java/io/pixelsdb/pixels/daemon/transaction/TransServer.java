@@ -32,13 +32,13 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import io.grpc.ServerBuilder;
-import io.pixelsdb.pixels.common.ingest.durable.AtomicStateFile;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestAuth;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestClient;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestOptions;
 import io.pixelsdb.pixels.common.ingest.wire.IngestWire;
 import io.pixelsdb.pixels.common.server.Server;
 import io.pixelsdb.pixels.core.ingest.IngestTables;
+import io.pixelsdb.pixels.daemon.transaction.ingest.CoordinatorStateStore;
 import io.pixelsdb.pixels.daemon.transaction.ingest.DurableIngestCoordinator;
 import io.pixelsdb.pixels.daemon.transaction.ingest.IngestCoordinatorRpc;
 import io.pixelsdb.pixels.ingest.IngestProto.ParticipantRequest;
@@ -92,7 +92,8 @@ public class TransServer implements Server
             }
             AtomicLong firstId = new AtomicLong(TransServiceImpl.allocateIngestTimestamp());
             coordinator = new DurableIngestCoordinator(
-                    new AtomicStateFile(Paths.get(options.coordinatorStateDirectory), options.maxStateBytes),
+                    new CoordinatorStateStore(Paths.get(options.coordinatorStateDirectory),
+                            options.maxStateBytes, options.coordinatorCompactionBytes),
                     new DurableIngestCoordinator.Tables()
                     {
                         @Override

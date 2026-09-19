@@ -74,8 +74,38 @@ public final class DurableIngestCoordinator implements Closeable {
         void discard(String owner, long transactionId) throws Exception;
     }
 
+    public interface StateStore extends Closeable {
+        CoordinatorSnapshot read() throws IOException;
+
+        void store(CoordinatorSnapshot snapshot) throws IOException;
+    }
+
+    private static final class AtomicSnapshotStore implements StateStore {
+        private final AtomicStateFile delegate;
+
+        private AtomicSnapshotStore(AtomicStateFile delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public CoordinatorSnapshot read() throws IOException {
+            byte[] bytes = delegate.read();
+            return bytes.length == 0 ? null : CoordinatorSnapshot.parseFrom(bytes);
+        }
+
+        @Override
+        public void store(CoordinatorSnapshot value) throws IOException {
+            delegate.store(value.toByteArray());
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+    }
+
     private static final Logger LOG = LogManager.getLogger(DurableIngestCoordinator.class);
-    private final AtomicStateFile store;
+    private final StateStore store;
     private final Tables tables;
     private final Participants participants;
     private final LongSupplier ids;
@@ -143,6 +173,25 @@ public final class DurableIngestCoordinator implements Closeable {
             int maxTerminalTransactions,
             int installationThreads)
             throws IOException {
+        this(new AtomicSnapshotStore(store), tables, participants, ids, clock,
+                baselineTimestamp, leaseMillis, maxTransactions, maxStreams,
+                terminalRetentionMillis, maxTerminalTransactions, installationThreads);
+    }
+
+    public DurableIngestCoordinator(
+            StateStore store,
+            Tables tables,
+            Participants participants,
+            LongSupplier ids,
+            Clock clock,
+            long baselineTimestamp,
+            long leaseMillis,
+            int maxTransactions,
+            int maxStreams,
+            long terminalRetentionMillis,
+            int maxTerminalTransactions,
+            int installationThreads)
+            throws IOException {
         this.store = store;
         this.tables = tables;
         this.participants = participants;
@@ -158,8 +207,8 @@ public final class DurableIngestCoordinator implements Closeable {
         }
         this.terminalRetentionMillis = terminalRetentionMillis;
         this.maxTerminalTransactions = maxTerminalTransactions;
-        byte[] bytes = store.read();
-        if (bytes.length == 0) {
+        CoordinatorSnapshot recovered = store.read();
+        if (recovered == null) {
             snapshot =
                     CoordinatorSnapshot.newBuilder()
                             .setVersion(COORDINATOR_SNAPSHOT_VERSION)
@@ -168,7 +217,7 @@ public final class DurableIngestCoordinator implements Closeable {
                             .build();
             save(snapshot);
         } else {
-            snapshot = CoordinatorSnapshot.parseFrom(bytes);
+            snapshot = recovered;
             validateRecoveredSnapshot(snapshot);
         }
         recovery =
@@ -218,7 +267,7 @@ public final class DurableIngestCoordinator implements Closeable {
     }
 
     private void save(CoordinatorSnapshot value) throws IOException {
-        store.store(value.toByteArray());
+        store.store(value);
         snapshot = value;
     }
 
