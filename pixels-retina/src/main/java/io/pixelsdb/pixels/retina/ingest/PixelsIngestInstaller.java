@@ -24,7 +24,6 @@ import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.index.IndexOption;
 import io.pixelsdb.pixels.common.index.service.*;
 import io.pixelsdb.pixels.common.ingest.MutationBatch;
-import io.pixelsdb.pixels.common.ingest.durable.AtomicStateFile;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestOptions;
 import io.pixelsdb.pixels.common.ingest.wire.*;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
@@ -53,9 +52,8 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     private static final long VISIBILITY_PADDING_WORDS = 2L;
     private static final long KEY_INTENT_BASE_BYTES = 256L;
     private static final long KEY_INTENT_BYTE_MULTIPLIER = 2L;
-    private static final int INSTALLATION_SNAPSHOT_VERSION = 3;
 
-    private final AtomicStateFile state;
+    private final InstallationStateStore state;
     private final IngestOptions options;
     private final RetinaResourceManager resources;
     private final IndexService indexes;
@@ -83,7 +81,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     }
 
     public PixelsIngestInstaller(
-            AtomicStateFile state,
+            InstallationStateStore state,
             IngestOptions options,
             String owner,
             RetinaResourceManager resources,
@@ -96,13 +94,9 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
         this.resources = resources;
         this.indexes = indexes;
         this.metadata = metadata;
-        byte[] bytes = state.read();
-        if (bytes.length > 0) {
-            InstallationSnapshot snapshot = InstallationSnapshot.parseFrom(bytes);
-            if (snapshot.getVersion() != INSTALLATION_SNAPSHOT_VERSION) {
-                throw new IOException("Unknown installation plan version");
-            }
-            for (BatchInstall plan : snapshot.getBatchesList()) {
+        Map<String, BatchInstall> recoveredPlans = state.plans();
+        if (!recoveredPlans.isEmpty()) {
+            for (BatchInstall plan : recoveredPlans.values()) {
                 String key = key(plan);
                 if (plans.put(key, plan) != null) {
                     throw new IOException("Duplicate installation plan");
@@ -119,7 +113,10 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                     throw new IOException("Plan exceeds its batch");
                 }
             }
-            for (TransactionCheckpoint checkpoint : snapshot.getCheckpointsList()) {
+        }
+        Map<Long, TransactionCheckpoint> recoveredCheckpoints = state.checkpoints();
+        if (!recoveredCheckpoints.isEmpty()) {
+            for (TransactionCheckpoint checkpoint : recoveredCheckpoints.values()) {
                 if (checkpoint.getTransactionId() <= 0
                         || checkpoint.getCommitTimestamp() <= 0
                         || checkpoints.put(checkpoint.getTransactionId(), checkpoint) != null) {
@@ -127,26 +124,18 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
                 }
                 validateCheckpoint(checkpoint);
             }
-            planBytes = bytes.length;
         }
+        planBytes = state.size();
     }
 
-    private static String key(BatchInstall plan) {
+    static String key(BatchInstall plan) {
         return IngestWire.batchKey(IngestWire.decode(plan.getStream()), plan.getSequence());
     }
 
     /** Files whose exact row locations can be reconstructed from retained batch plans. */
-    public static Set<Long> recoveryFileIds(AtomicStateFile state) throws IOException {
-        byte[] bytes = state.read();
-        if (bytes.length == 0) {
-            return Collections.emptySet();
-        }
-        InstallationSnapshot snapshot = InstallationSnapshot.parseFrom(bytes);
-        if (snapshot.getVersion() != INSTALLATION_SNAPSHOT_VERSION) {
-            throw new IOException("Unknown installation plan version");
-        }
+    public static Set<Long> recoveryFileIds(InstallationStateStore state) throws IOException {
         Set<Long> fileIds = new HashSet<>();
-        for (BatchInstall plan : snapshot.getBatchesList()) {
+        for (BatchInstall plan : state.plans().values()) {
             for (BufferSpan span : plan.getSpansList()) {
                 fileIds.add(span.getFileId());
             }
@@ -155,28 +144,13 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
     }
 
     private synchronized void save(BatchInstall value) throws IOException {
-        Map<String, BatchInstall> next = new LinkedHashMap<>(plans);
-        next.put(key(value), value);
-        byte[] bytes = snapshot(next, checkpoints);
-        state.store(bytes);
-        plans.clear();
-        plans.putAll(next);
-        planBytes = bytes.length;
+        state.put(value);
+        plans.put(key(value), value);
+        planBytes = state.size();
     }
 
     private synchronized BatchInstall plan(String batchKey) {
         return plans.get(batchKey);
-    }
-
-    private static byte[] snapshot(
-            Map<String, BatchInstall> plans,
-            Map<Long, TransactionCheckpoint> checkpoints) {
-        return InstallationSnapshot.newBuilder()
-                .setVersion(INSTALLATION_SNAPSHOT_VERSION)
-                .addAllBatches(plans.values())
-                .addAllCheckpoints(checkpoints.values())
-                .build()
-                .toByteArray();
     }
 
     private List<byte[][]> rows(Transaction tx, MutationBatch batch) throws IOException {
@@ -330,11 +304,10 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
         if (!retiredCheckpoints.isEmpty()) {
             Map<Long, TransactionCheckpoint> retained = new LinkedHashMap<>(checkpoints);
             retiredCheckpoints.forEach(retained::remove);
-            byte[] compacted = snapshot(plans, retained);
-            state.store(compacted);
+            state.storeCheckpoints(retained.values());
             checkpoints.clear();
             checkpoints.putAll(retained);
-            planBytes = compacted.length;
+            planBytes = state.size();
         }
         Set<Long> managedFiles = new HashSet<>();
         for (BatchInstall plan : plans.values()) {
@@ -453,8 +426,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             Map<Long, TransactionCheckpoint> nextCheckpoints =
                     new LinkedHashMap<>(checkpoints);
             nextCheckpoints.put(tx.getTransactionId(), checkpoint.build());
-            byte[] bytes = snapshot(nextPlans, nextCheckpoints);
-            state.store(bytes);
+            state.checkpoint(tx.getTransactionId(), nextCheckpoints.values());
             plans.clear();
             plans.putAll(nextPlans);
             checkpoints.clear();
@@ -462,7 +434,7 @@ public final class PixelsIngestInstaller implements RetinaIngestParticipant.Inst
             synchronized (fileAggregations) {
                 fileContributions.removeAll(planSnapshot.keySet());
             }
-            planBytes = bytes.length;
+            planBytes = state.size();
         }
         return true;
     }

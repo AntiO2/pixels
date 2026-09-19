@@ -25,7 +25,6 @@ import io.grpc.stub.StreamObserver;
 import io.pixelsdb.pixels.common.index.MainIndexFactory;
 import io.pixelsdb.pixels.common.index.service.*;
 import io.pixelsdb.pixels.common.ingest.*;
-import io.pixelsdb.pixels.common.ingest.durable.AtomicStateFile;
 import io.pixelsdb.pixels.common.ingest.rpc.*;
 import io.pixelsdb.pixels.common.ingest.wire.*;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
@@ -55,6 +54,8 @@ import java.util.concurrent.atomic.*;
  */
 public class TestPixelsIngestStorage {
     private static final long STATEMENT_ID = 1L;
+    private static final int INSTALLATION_STATE_BYTES = 16 * 1024 * 1024;
+    private static final int INSTALLATION_COMPACTION_BYTES = 8 * 1024 * 1024;
 
     private static <T> void reply(StreamObserver<T> out, T value) {
         out.onNext(value);
@@ -436,8 +437,9 @@ public class TestPixelsIngestStorage {
                                     });
             installer =
                     new PixelsIngestInstaller(
-                            new AtomicStateFile(
-                                    planDirectory, 16 * 1024 * 1024),
+                            new InstallationStateStore(
+                                    planDirectory, INSTALLATION_STATE_BYTES,
+                                    INSTALLATION_COMPACTION_BYTES),
                             new IngestOptions(),
                             "127.0.0.1:18890",
                             resources,
@@ -699,7 +701,9 @@ public class TestPixelsIngestStorage {
 
             installer.close();
             installer = new PixelsIngestInstaller(
-                    new AtomicStateFile(planDirectory, 16 * 1024 * 1024),
+                    new InstallationStateStore(
+                            planDirectory, INSTALLATION_STATE_BYTES,
+                            INSTALLATION_COMPACTION_BYTES),
                     new IngestOptions(), "127.0.0.1:18890", resources, index,
                     MetadataService.Instance());
             Transaction publishedNext = next.toBuilder().setState(TransactionState.PUBLISHED)

@@ -701,7 +701,9 @@ public final class SqlIngestFixture implements AutoCloseable {
                                 });
         PixelsIngestInstaller installer =
                 new PixelsIngestInstaller(
-                        new AtomicStateFile(root.resolve("plans"), ingestOptions.maxStateBytes),
+                        new InstallationStateStore(
+                                root.resolve("plans"), ingestOptions.maxStateBytes,
+                                ingestOptions.planCompactionBytes),
                         ingestOptions,
                         owner,
                         resources,

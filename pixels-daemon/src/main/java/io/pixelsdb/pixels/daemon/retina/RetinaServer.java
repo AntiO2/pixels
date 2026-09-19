@@ -22,7 +22,6 @@ package io.pixelsdb.pixels.daemon.retina;
 import io.grpc.ServerBuilder;
 import io.grpc.ServerInterceptors;
 import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
-import io.pixelsdb.pixels.common.ingest.durable.AtomicStateFile;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestAuth;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestClient;
 import io.pixelsdb.pixels.common.ingest.rpc.IngestOptions;
@@ -37,6 +36,7 @@ import io.pixelsdb.pixels.ingest.IngestProto.Transaction;
 import io.pixelsdb.pixels.ingest.IngestProto.TransactionList;
 import io.pixelsdb.pixels.retina.RetinaResourceManager;
 import io.pixelsdb.pixels.retina.ingest.IngestParticipantRpc;
+import io.pixelsdb.pixels.retina.ingest.InstallationStateStore;
 import io.pixelsdb.pixels.retina.ingest.LocalMutationJournal;
 import io.pixelsdb.pixels.retina.ingest.PixelsIngestInstaller;
 import io.pixelsdb.pixels.retina.ingest.RetinaIngestParticipant;
@@ -126,7 +126,7 @@ public class RetinaServer implements Server
     @Override
     public void run()
     {
-        AtomicStateFile installationState = null;
+        InstallationStateStore installationState = null;
         try
         {
             HeartbeatWorker.setCurrentStatus(NodeStatus.INIT);
@@ -135,8 +135,9 @@ public class RetinaServer implements Server
             Set<Long> bootstrapRecoveryFileIds = Collections.emptySet();
             if (options.enabled)
             {
-                installationState = new AtomicStateFile(
-                        Paths.get(options.participantPlanDirectory), options.maxStateBytes);
+                installationState = new InstallationStateStore(
+                        Paths.get(options.participantPlanDirectory), options.maxStateBytes,
+                        options.planCompactionBytes);
                 bootstrapRecoveryFileIds = PixelsIngestInstaller.recoveryFileIds(
                         installationState);
             }

@@ -42,6 +42,7 @@ public final class IngestOptions {
     private static final long DEFAULT_FILE_MAX_BYTES = 512L * MEBIBYTE;
     private static final long DEFAULT_FILE_MAX_DELAY_MILLIS = 30_000L;
     private static final long DEFAULT_FILE_POLL_MILLIS = 25L;
+    private static final int DEFAULT_PLAN_COMPACTION_BYTES = 16 * MEBIBYTE;
     private static final int DEFAULT_MAX_STATE_BYTES = 64 * MEBIBYTE;
     private static final int DEFAULT_MAX_PREPARED_ROWS = 1_000_000;
     private static final long DEFAULT_READ_LEASE_MILLIS = 120_000L;
@@ -72,6 +73,8 @@ public final class IngestOptions {
             "retina.ingest.file.max.delay.ms", DEFAULT_FILE_MAX_DELAY_MILLIS);
     public final long filePollMillis = longNumber(
             "retina.ingest.file.poll.ms", DEFAULT_FILE_POLL_MILLIS);
+    public final int planCompactionBytes = number(
+            "retina.ingest.plan.compaction.bytes", DEFAULT_PLAN_COMPACTION_BYTES);
     public final int maxStateBytes = number("retina.ingest.max.state.bytes", DEFAULT_MAX_STATE_BYTES);
     public final int maxPreparedRows = number(
             "retina.ingest.max.prepared.rows", DEFAULT_MAX_PREPARED_ROWS);
