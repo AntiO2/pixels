@@ -563,7 +563,8 @@ void appendDirectRleUint32(
 }
 
 std::vector<std::uint8_t> makeFixedScalarFixture(
-        pixels::proto::Type_Kind kind, bool littleEndian)
+        pixels::proto::Type_Kind kind, bool littleEndian,
+        bool narrowShort = false)
 {
     const std::vector<std::uint8_t> canonical = readFixture();
     pixels::proto::RowGroupFooter rowGroupFooter;
@@ -588,6 +589,13 @@ std::vector<std::uint8_t> makeFixedScalarFixture(
             for (const std::int32_t value :
                  std::vector<std::int32_t>{-32768, -1, 0, 32767})
             {
+                if (narrowShort)
+                {
+                    const std::uint16_t bits = static_cast<std::uint16_t>(value);
+                    columnData.push_back(static_cast<std::uint8_t>(bits >> (littleEndian ? 0 : 8)));
+                    columnData.push_back(static_cast<std::uint8_t>(bits >> (littleEndian ? 8 : 0)));
+                    continue;
+                }
                 appendUint32(
                         columnData,
                         static_cast<std::uint32_t>(value),
@@ -733,6 +741,79 @@ std::vector<std::uint8_t> makeFixedScalarFixture(
         file.push_back(static_cast<std::uint8_t>(
                 tailOffset >> (static_cast<std::uint32_t>(byte) * 8U)));
     }
+    return file;
+}
+
+std::vector<std::uint8_t> makeShortLayoutFixture(
+        bool narrow, bool littleEndian, bool padded, bool allNull = false,
+        bool singlePixel = false)
+{
+    const auto canonical = readFixture();
+    pixels::proto::RowGroupFooter footer;
+    pixels::proto::FileTail tail;
+    require(footer.ParseFromArray(canonical.data() + 352, 154), "SHORT footer parse");
+    require(tail.ParseFromArray(canonical.data() + 506, 276), "SHORT tail parse");
+    std::vector<std::uint8_t> data;
+    const std::int32_t values[] = {-32768, 0, -1, 0, 0, 32767};
+    auto *chunk = footer.mutable_rowgroupindexentry()->mutable_columnchunkindexentries(0);
+    chunk->clear_pixelpositions();
+    chunk->clear_pixelstatistics();
+    for (std::size_t row = 0; row < 6; ++row)
+    {
+        if (row == 0 || (!singlePixel && row == 3))
+        {
+            chunk->add_pixelpositions(data.size());
+            auto *stat = chunk->add_pixelstatistics()->mutable_statistic();
+            stat->set_numberofvalues(singlePixel ? 6 : 3);
+            stat->set_hasnull(true);
+        }
+        if (padded || (!allNull && row != 1 && row != 4))
+        {
+            const auto bits = static_cast<std::uint32_t>(allNull ? 0 : values[row]);
+            const std::uint32_t width = narrow ? 2 : 4;
+            for (std::uint32_t byte = 0; byte < width; ++byte)
+            {
+                data.push_back(static_cast<std::uint8_t>(bits >> ((littleEndian ? byte : width - byte - 1U) * 8U)));
+            }
+        }
+    }
+    while (data.size() % 32 != 0) data.push_back(0);
+    chunk->set_chunkoffset(0);
+    chunk->set_isnulloffset(data.size());
+    chunk->set_isnullalignment(32);
+    chunk->set_littleendian(littleEndian);
+    chunk->set_nullspadding(padded);
+    const std::uint8_t bitmap = allNull ? (singlePixel ? 0x3F : 0x07)
+            : singlePixel ? 0x12 : 0x02;
+    auto appendBitmap = [&]() {
+        std::uint8_t bits = bitmap;
+        if (!littleEndian)
+        {
+            bits = 0;
+            for (unsigned bit = 0; bit < 8; ++bit) bits |= ((bitmap >> bit) & 1U) << (7U - bit);
+        }
+        data.push_back(bits);
+    };
+    appendBitmap();
+    if (!singlePixel) appendBitmap();
+    chunk->set_chunklength(data.size());
+    footer.mutable_rowgroupencoding()->mutable_columnchunkencodings(0)->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
+    tail.mutable_footer()->mutable_types(0)->set_kind(pixels::proto::Type_Kind_SHORT);
+    auto *rg = tail.mutable_footer()->mutable_rowgroupinfos(0);
+    rg->set_numberofrows(6);
+    tail.mutable_postscript()->set_numberofrows(6);
+    tail.mutable_postscript()->set_pixelstride(singlePixel ? 6 : 3);
+    std::string footerBytes;
+    require(footer.SerializeToString(&footerBytes), "SHORT footer serialize");
+    rg->set_footerlength(footerBytes.size());
+    std::string tailBytes;
+    require(tail.SerializeToString(&tailBytes), "SHORT tail serialize");
+    std::vector<std::uint8_t> file(canonical.begin(), canonical.begin() + 352);
+    std::copy(data.begin(), data.end(), file.begin());
+    file.insert(file.end(), footerBytes.begin(), footerBytes.end());
+    const std::uint64_t offset = file.size();
+    file.insert(file.end(), tailBytes.begin(), tailBytes.end());
+    appendUint64(file, offset, false);
     return file;
 }
 
@@ -1006,7 +1087,8 @@ std::vector<std::uint8_t> makeMultiPixelVarcharFixture(
 
 std::vector<std::uint8_t> makeBinaryFixture(
         pixels::proto::Type_Kind kind =
-                pixels::proto::Type_Kind_VARBINARY)
+                pixels::proto::Type_Kind_VARBINARY,
+        bool currentLayout = false, bool littleEndian = true)
 {
     const std::vector<std::uint8_t> canonical = readFixture();
     pixels::proto::RowGroupFooter rowGroupFooter;
@@ -1029,13 +1111,25 @@ std::vector<std::uint8_t> makeBinaryFixture(
             1, 6,
             1, 7,
             0x02, 0x00};
+    if (currentLayout)
+    {
+        // August 2026 BinaryColumnWriter: concatenated non-null payloads,
+        // bitmap, endian-aware starts (including final content length), trailer.
+        columnData = {0x00, 0xFF, 1, 2, 3, 4, 5, 6, 7,
+                      static_cast<std::uint8_t>(littleEndian ? 0x02 : 0x40)};
+        for (const std::uint32_t start : {0U, 2U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U})
+        {
+            appendUint32(columnData, start, littleEndian);
+        }
+        appendUint32(columnData, 10, littleEndian);
+    }
     pixels::proto::ColumnChunkIndex *chunk =
             rowGroupFooter.mutable_rowgroupindexentry()
                     ->mutable_columnchunkindexentries(0);
     chunk->set_chunkoffset(0);
     chunk->set_chunklength(
             static_cast<std::uint32_t>(columnData.size()));
-    chunk->set_isnulloffset(18);
+    chunk->set_isnulloffset(currentLayout ? 9 : 18);
     chunk->clear_pixelpositions();
     chunk->add_pixelpositions(0);
     chunk->clear_pixelstatistics();
@@ -1043,8 +1137,16 @@ std::vector<std::uint8_t> makeBinaryFixture(
             chunk->add_pixelstatistics()->mutable_statistic();
     statistic->set_numberofvalues(10);
     statistic->set_hasnull(true);
-    chunk->set_littleendian(true);
-    chunk->set_nullspadding(true);
+    if (currentLayout)
+    {
+        statistic->set_numberofvalues(5);
+        chunk->add_pixelpositions(4);
+        statistic = chunk->add_pixelstatistics()->mutable_statistic();
+        statistic->set_numberofvalues(5);
+        statistic->set_hasnull(false);
+    }
+    chunk->set_littleendian(littleEndian);
+    chunk->set_nullspadding(!currentLayout);
     rowGroupFooter.mutable_rowgroupencoding()
             ->mutable_columnchunkencodings(0)
             ->set_kind(pixels::proto::ColumnEncoding_Kind_NONE);
@@ -1058,7 +1160,7 @@ std::vector<std::uint8_t> makeBinaryFixture(
             fileTail.mutable_footer()->mutable_rowgroupinfos(0);
     rowGroup->set_footeroffset(352);
     rowGroup->set_numberofrows(10);
-    fileTail.mutable_postscript()->set_pixelstride(10);
+    fileTail.mutable_postscript()->set_pixelstride(currentLayout ? 5 : 10);
     fileTail.mutable_postscript()->set_numberofrows(10);
 
     std::string serializedFooter;
@@ -1908,7 +2010,9 @@ std::string decodePage(
                 "generic fixture page did not converge");
     }
     require(status == PIXELS_INSPECTOR_RESULT_READY,
-            "generic fixture ranges did not produce a page");
+            "generic fixture ranges did not produce a page: "
+            + (status >= PIXELS_INSPECTOR_INVALID_ARGUMENT
+               ? readError(session) : std::to_string(status)));
     return readResult(session);
 }
 
@@ -2111,6 +2215,54 @@ void testFixedScalarTypePages()
                     + std::string(test.values) + "}";
             require(decodePage(file, 0, 0, 4) == expected,
                     "fixed scalar page differs from the golden");
+        }
+    }
+}
+
+void testCurrentWriterLayouts()
+{
+    for (const bool littleEndian : {false, true})
+    {
+        for (const bool narrow : {false, true})
+        {
+            for (const bool padded : {false, true})
+            {
+                const auto shortFile = makeShortLayoutFixture(narrow, littleEndian, padded);
+                require(decodePage(shortFile, 0, 3, 3)
+                        == "{\"rowGroup\":0,\"column\":0,\"offset\":3,\"count\":3,"
+                           "\"values\":[\"0\",null,\"32767\"]}",
+                        "aligned SHORT final pixel must use earlier-pixel width evidence");
+            }
+        }
+        require(decodePage(makeShortLayoutFixture(true, littleEndian, false, true), 0, 0, 6)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":6,"
+                   "\"values\":[null,null,null,null,null,null]}",
+                "all-null SHORT must not require a storage width");
+        const auto ambiguous = makeShortLayoutFixture(true, littleEndian, false, false, true);
+        Session session(ambiguous.size());
+        driveMetadataFlexible(session, ambiguous);
+        auto status = pixels_inspector_begin_page(session.handle(), 0, 0, 0, 6);
+        while (status == PIXELS_INSPECTOR_RANGE_READY) status = supply(session, nextRange(session), ambiguous);
+        require(status == PIXELS_INSPECTOR_UNSUPPORTED_TYPE
+                && readError(session).find("ambiguous") != std::string::npos,
+                "unversioned aligned SHORT must not guess a storage width");
+        require(decodePage(makeFixedScalarFixture(
+                        pixels::proto::Type_Kind_SHORT, littleEndian, true), 0, 1, 2)
+                == "{\"rowGroup\":0,\"column\":0,\"offset\":1,\"count\":2,"
+                   "\"values\":[\"-1\",\"0\"]}",
+                "current INT16 SHORT partial page differs");
+        for (const auto kind : {pixels::proto::Type_Kind_BINARY,
+                                pixels::proto::Type_Kind_VARBINARY})
+        {
+            const auto file = makeBinaryFixture(kind, true, littleEndian);
+            require(decodePage(file, 0, 0, 4)
+                    == "{\"rowGroup\":0,\"column\":0,\"offset\":0,\"count\":4,"
+                       "\"values\":[\"AP8=\",null,\"\",\"AQ==\"]}",
+                    "current binary null/empty/non-UTF8 page differs");
+            require(decodePage(file, 0, 3, 6)
+                    == "{\"rowGroup\":0,\"column\":0,\"offset\":3,\"count\":6,"
+                       "\"values\":[\"AQ==\",\"Ag==\",\"Aw==\",\"BA==\",\"BQ==\",\"Bg==\"]}",
+                    "current binary cross-pixel page differs");
         }
     }
 }
@@ -4728,6 +4880,39 @@ void writeConformanceCorpus(const std::filesystem::path &directory)
     manifest += "],\"compatibility\":[";
     first = true;
 
+    for (const bool littleEndian : {false, true})
+    {
+        const std::string endian = littleEndian ? "LE" : "BE";
+        const std::string shortName = "SHORT-INT16-" + endian;
+        const auto shortFile = makeFixedScalarFixture(
+                pixels::proto::Type_Kind_SHORT, littleEndian, true);
+        writeBytes(directory / (shortName + ".pxl"), shortFile);
+        addCase(shortName, shortName + ".pxl", 0, 1, 2, decodePage(shortFile, 0, 1, 2));
+        for (const bool narrow : {false, true})
+        {
+            for (const bool padded : {false, true})
+            {
+                const std::string name = "SHORT-ALIGNED-" + endian
+                        + (narrow ? "-INT16" : "-INT32") + (padded ? "-PADDED" : "-COMPACT");
+                const auto file = makeShortLayoutFixture(narrow, littleEndian, padded);
+                writeBytes(directory / (name + ".pxl"), file);
+                addCase(name, name + ".pxl", 0, 3, 3, decodePage(file, 0, 3, 3));
+            }
+        }
+        const std::string nullName = "SHORT-ALL-NULL-" + endian;
+        const auto nullFile = makeShortLayoutFixture(true, littleEndian, false, true);
+        writeBytes(directory / (nullName + ".pxl"), nullFile);
+        addCase(nullName, nullName + ".pxl", 0, 0, 6, decodePage(nullFile, 0, 0, 6));
+        for (const auto kind : {pixels::proto::Type_Kind_BINARY, pixels::proto::Type_Kind_VARBINARY})
+        {
+            const std::string name = std::string(kind == pixels::proto::Type_Kind_BINARY ? "BINARY" : "VARBINARY") + "-STARTS-" + endian;
+            const auto file = makeBinaryFixture(kind, true, littleEndian);
+            writeBytes(directory / (name + ".pxl"), file);
+            addCase(name, name + ".pxl", 0, 0, 4, decodePage(file, 0, 0, 4));
+            addCase(name + "-CROSS-PIXEL", name + ".pxl", 0, 3, 6, decodePage(file, 0, 3, 6));
+        }
+    }
+
     writeBytes(directory / "RLE-BYTE.pxl", makeByteRleFixture());
     addCase(
             "RLE-BYTE", "RLE-BYTE.pxl", 0, 0, 5,
@@ -5012,6 +5197,7 @@ int main(int argc, char **argv)
         testCapabilities();
         testCanonicalFixture();
         testFixedScalarTypePages();
+        testCurrentWriterLayouts();
         testRemainingVariableTypePages();
         testBoundedPageRange();
         testRowGroupLayoutAndRepeatedPages();

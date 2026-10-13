@@ -43,6 +43,12 @@ public:
             std::size_t valueCount, std::int8_t *destination,
             std::size_t destinationSize, FormatError &error);
 
+    [[nodiscard]] static bool decodeInt16(
+            const ByteSpan &bytes, bool littleEndian,
+            std::uint64_t valueOffset, std::size_t valueCount,
+            std::int16_t *destination, std::size_t destinationSize,
+            FormatError &error);
+
     [[nodiscard]] static bool decodeInt32(
             const ByteSpan &bytes, bool littleEndian,
             std::uint64_t valueOffset, std::size_t valueCount,

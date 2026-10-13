@@ -118,6 +118,7 @@ private:
         std::uint32_t rowCount = 0;
         bool legacyLongResult = false;
         std::uint32_t bitOffset = 0;
+        std::uint32_t shortWidth = 0;
         std::uint32_t pixel = 0;
         std::uint32_t pixelRowOffset = 0;
         std::uint32_t pixelRowCount = 0;
@@ -215,6 +216,7 @@ private:
             std::uint32_t rowGroup, std::uint64_t localRow) const;
     void resetOperation();
     [[nodiscard]] bool validatePageRequest();
+    [[nodiscard]] bool inferShortWidth(const format::ByteSpan &prefixBitmap);
     [[nodiscard]] bool preparePageLayout();
     [[nodiscard]] bool requestCurrentPixel();
     [[nodiscard]] bool requestPixelValues();

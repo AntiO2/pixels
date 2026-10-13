@@ -1739,6 +1739,7 @@ bool InspectionSession::beginPageRequest(
     pageRequest_.rowCount = rowCount;
     pageRequest_.legacyLongResult = legacyLongResult;
     pageRequest_.bitOffset = 0;
+    pageRequest_.shortWidth = 0;
     pageRequest_.pixel = 0;
     pageRequest_.pixelRowOffset = 0;
     pageRequest_.pixelRowCount = 0;
@@ -1993,6 +1994,23 @@ bool InspectionSession::preparePageLayout()
     }
     if (!isPlainVariablePage())
     {
+        const proto::Type &type = fileTail_.footer().types(
+                static_cast<int>(pageRequest_.column));
+        if (type.kind() == proto::Type_Kind_SHORT && !usesRunLengthEncoding())
+        {
+            if (pageRequest_.nullBitmapByteOffset != 0 && !usesNullPadding())
+            {
+                setPendingRange(format::FileRange{
+                        pageChunk_.chunkoffset() + pageChunk_.isnulloffset(),
+                        pageRequest_.nullBitmapByteOffset}, State::AWAITING_PREFIX_NULL_BITMAP);
+                return true;
+            }
+            if (!inferShortWidth(format::ByteSpan()))
+            {
+                state_ = State::FAILED;
+                return false;
+            }
+        }
         return requestCurrentPixel();
     }
     if (pageChunk_.chunklength() < 4)
@@ -2220,12 +2238,77 @@ bool InspectionSession::consumeVariableTrailer(
 bool InspectionSession::consumePrefixNullBitmap(
         const format::ByteSpan &bytes)
 {
+    const proto::Type &type = fileTail_.footer().types(
+            static_cast<int>(pageRequest_.column));
+    if (type.kind() == proto::Type_Kind_SHORT)
+    {
+        if (!inferShortWidth(bytes))
+        {
+            state_ = State::FAILED;
+            return false;
+        }
+        return requestCurrentPixel();
+    }
     if (!computeVariablePhysicalBase(bytes))
     {
         state_ = State::FAILED;
         return false;
     }
     return requestCurrentPixel();
+}
+
+bool InspectionSession::inferShortWidth(const format::ByteSpan &prefixBitmap)
+{
+    const std::uint32_t stride = fileTail_.postscript().pixelstride();
+    const bool littleEndian = pageChunk_.has_littleendian() && pageChunk_.littleendian();
+    std::size_t bitmapOffset = 0;
+    for (std::uint32_t pixel = 0; pixel < pageRequest_.pixel; ++pixel)
+    {
+        std::uint32_t count = stride;
+        if (pixelHasNull(pageChunk_, pixel))
+        {
+            const std::size_t length = (stride + 7U) / 8U;
+            if (!usesNullPadding())
+            {
+                format::ByteSpan bitmap;
+                if (!prefixBitmap.subspan(bitmapOffset, length, bitmap))
+                {
+                    return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
+                                        "SHORT prefix bitmap is incomplete");
+                }
+                count = 0;
+                for (std::uint32_t row = 0; row < stride; ++row)
+                {
+                    const std::uint32_t shift = littleEndian ? row % 8U : 7U - row % 8U;
+                    if (((bitmap.data()[row / 8U] >> shift) & 1U) == 0)
+                    {
+                        ++count;
+                    }
+                }
+            }
+            bitmapOffset += length;
+        }
+        const std::uint64_t length = pageChunk_.pixelpositions(pixel + 1U)
+                - pageChunk_.pixelpositions(pixel);
+        if (count == 0)
+        {
+            if (length != 0)
+            {
+                return format::fail(error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                                    "all-null SHORT pixel contains scalar data");
+            }
+            continue;
+        }
+        const std::uint32_t width = length == count * 2ULL ? 2
+                : length == count * 4ULL ? 4 : 0;
+        if (width == 0 || (pageRequest_.shortWidth != 0 && pageRequest_.shortWidth != width))
+        {
+            return format::fail(error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                                "SHORT pixels have inconsistent scalar widths");
+        }
+        pageRequest_.shortWidth = width;
+    }
+    return true;
 }
 
 bool InspectionSession::requestCurrentPixel()
@@ -2408,6 +2491,49 @@ bool InspectionSession::requestPixelValues()
     }
     std::uint64_t pageByteOffset = 0;
     std::uint64_t pageByteLength = 0;
+    if (type.kind() == proto::Type_Kind_SHORT)
+    {
+        // The V1 schema has no writer-layout version: historical SHORT was
+        // stored as INT32; current writers use INT16. Match the entire pixel,
+        // not the requested slice, and never guess when final alignment hides
+        // the distinction.
+        const bool lastPixel = pageRequest_.pixel + 1U
+                == static_cast<std::uint32_t>(pageChunk_.pixelpositions_size());
+        const std::uint64_t alignment = lastPixel && pageChunk_.has_isnullalignment()
+                ? pageChunk_.isnullalignment() : 0;
+        const auto matches = [&](std::uint64_t width)
+        {
+            std::uint64_t end = pixelDataOffset
+                    + static_cast<std::uint64_t>(pagePlan_.pixelPhysicalCount) * width;
+            if (alignment != 0 && end % alignment != 0)
+            {
+                end += alignment - end % alignment;
+            }
+            return end - pixelDataOffset == pixelDataLength;
+        };
+        const bool narrow = matches(2);
+        const bool legacy = matches(4);
+        if (!narrow && !legacy)
+        {
+            state_ = State::FAILED;
+            return format::fail(error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                                "SHORT storage width does not match its pixel rows");
+        }
+        if (narrow && legacy && pageRequest_.shortWidth == 0)
+        {
+            state_ = State::FAILED;
+            return format::fail(error_, format::ErrorCode::UNSUPPORTED_TYPE,
+                                "SHORT storage width is invalid or ambiguous after alignment");
+        }
+        valueWidth = narrow && legacy ? pageRequest_.shortWidth : narrow ? 2 : 4;
+        if (pageRequest_.shortWidth != 0 && valueWidth != pageRequest_.shortWidth)
+        {
+            state_ = State::FAILED;
+            return format::fail(error_, format::ErrorCode::MALFORMED_PROTOBUF,
+                                "SHORT pixel width differs from earlier pixels");
+        }
+        pageRequest_.shortWidth = static_cast<std::uint32_t>(valueWidth);
+    }
     if (type.kind() == proto::Type_Kind_BOOLEAN)
     {
         pageRequest_.bitOffset = pagePlan_.physicalOffset % 8U;
@@ -2614,7 +2740,8 @@ bool InspectionSession::finishVariableValues(
         const std::uint64_t relative =
                 range.offset - pageRequest_.variableContentBase;
         if ((type.kind() == proto::Type_Kind_VARCHAR
-             || type.kind() == proto::Type_Kind_CHAR)
+             || type.kind() == proto::Type_Kind_CHAR
+             || isLengthPrefixedBinary(type))
             && range.length > type.maximumlength())
         {
             state_ = State::FAILED;
@@ -2638,6 +2765,11 @@ bool InspectionSession::finishVariableValues(
             return format::fail(
                     error_, format::ErrorCode::OUT_OF_BOUNDS,
                     "plain variable value exceeds requested content");
+        }
+        if (isLengthPrefixedBinary(type))
+        {
+            physicalValues[index] = "\"" + encodeBase64(value) + "\"";
+            continue;
         }
         if (!format::VariableLengthDecoder::isValidUtf8(value))
         {
@@ -3207,6 +3339,25 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
             break;
         }
         case proto::Type_Kind_SHORT:
+        {
+            if (pageRequest_.shortWidth == 2)
+            {
+                std::vector<std::int16_t> values(pagePlan_.physicalCount);
+                decoded = format::PlainScalarDecoder::decodeInt16(
+                        bytes, littleEndian, 0, values.size(),
+                        values.data(), values.size(), error_);
+                if (decoded)
+                {
+                    for (std::size_t index = 0; index < values.size(); ++index)
+                    {
+                        physicalValues[index] = quoteInteger(values[index]);
+                    }
+                }
+                break;
+            }
+            // Legacy V1 SHORT uses the INT32 path below.
+            [[fallthrough]];
+        }
         case proto::Type_Kind_INT:
         case proto::Type_Kind_DATE:
         case proto::Type_Kind_TIME:
@@ -3534,9 +3685,29 @@ bool InspectionSession::isPlainVariablePage() const
     const proto::ColumnEncoding &encoding =
             encodings.columnchunkencodings(
                     static_cast<int>(pageRequest_.column));
-    return isPlainVariableString(
-                   fileTail_.footer().types(
-                           static_cast<int>(pageRequest_.column)))
+    const proto::Type &type = fileTail_.footer().types(
+            static_cast<int>(pageRequest_.column));
+    bool variable = isPlainVariableString(type);
+    if (isLengthPrefixedBinary(type) && pageChunk_.has_isnulloffset())
+    {
+        std::uint64_t bitmapBytes = 0;
+        const std::uint64_t rows = fileTail_.footer().rowgroupinfos(
+                static_cast<int>(pageRequest_.rowGroup)).numberofrows();
+        const std::uint64_t stride = fileTail_.postscript().pixelstride();
+        for (int pixel = 0; pixel < pageChunk_.pixelstatistics_size(); ++pixel)
+        {
+            if (pixelHasNull(pageChunk_, static_cast<std::uint32_t>(pixel)))
+            {
+                const std::uint64_t count = std::min(stride, rows - pixel * stride);
+                bitmapBytes += (count + 7U) / 8U;
+            }
+        }
+        // Legacy binary has only length-prefixed content + bitmap. Current
+        // binary appends a non-null starts table and a four-byte trailer.
+        variable = pageChunk_.isnulloffset() + bitmapBytes
+                < pageChunk_.chunklength();
+    }
+    return variable
            && encoding.has_kind()
            && encoding.kind() == proto::ColumnEncoding_Kind_NONE;
 }

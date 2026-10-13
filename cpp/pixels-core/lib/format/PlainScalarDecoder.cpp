@@ -200,6 +200,22 @@ bool PlainScalarDecoder::decodeByte(
             error);
 }
 
+bool PlainScalarDecoder::decodeInt16(
+        const ByteSpan &bytes, bool littleEndian,
+        std::uint64_t valueOffset, std::size_t valueCount,
+        std::int16_t *destination, std::size_t destinationSize,
+        FormatError &error)
+{
+    return decodeFixed(
+            bytes, littleEndian, valueOffset, valueCount, destination,
+            destinationSize, 2, "INT16",
+            [](std::uint64_t bits, std::int16_t &value)
+            {
+                const std::uint16_t word = static_cast<std::uint16_t>(bits);
+                std::memcpy(&value, &word, sizeof(value));
+            }, error);
+}
+
 bool PlainScalarDecoder::decodeInt32(
         const ByteSpan &bytes, bool littleEndian,
         std::uint64_t valueOffset, std::size_t valueCount,
