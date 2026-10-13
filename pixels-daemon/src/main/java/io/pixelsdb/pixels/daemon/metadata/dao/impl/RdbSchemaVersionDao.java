@@ -75,17 +75,17 @@ public class RdbSchemaVersionDao extends SchemaVersionDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO SCHEMA_VERSIONS(" +
-                "`SV_COLUMNS`," +
-                "`SV_TRANS_TS`," +
-                "`TBLS_TBL_ID`) VALUES (?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "SV_COLUMNS," +
+                "SV_TRANS_TS," +
+                "TBLS_TBL_ID) VALUES (?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setString(1, JSON.toJSONString(new Columns(schemaVersion.getColumnsList())));
             pst.setLong(2, schemaVersion.getTransTs());
             pst.setLong(3, schemaVersion.getTableId());
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);

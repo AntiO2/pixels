@@ -32,7 +32,7 @@ import static java.util.Objects.requireNonNull;
 
 /**
  * This class represents a nullable int column vector.
- * This class uses a 32-bit long value to hold the values.
+ * This class uses a 32-bit integer value to hold the values.
  * In high Java versions such as Java 23, 32-bit integer has comparable operation performance as 64-bit integer.
  * Therefore, using 32-bit column vector for int32 columns saves memory without performance degradation.
  * <p>
@@ -64,7 +64,7 @@ public class IntColumnVector extends ColumnVector
     {
         super(len);
         vector = new int[len];
-        memoryUsage += Integer.BYTES * len;
+        memoryUsage += (long) Integer.BYTES * len;
     }
 
     @Override
@@ -213,7 +213,7 @@ public class IntColumnVector extends ColumnVector
     @Override
     public void addSelected(int[] selected, int offset, int length, ColumnVector src)
     {
-        // isRepeating should be false and src should be an instance of LongColumnVector.
+        // isRepeating should be false and src should be an instance of IntColumnVector.
         // However, we do not check these for performance considerations.
         IntColumnVector source = (IntColumnVector) src;
 

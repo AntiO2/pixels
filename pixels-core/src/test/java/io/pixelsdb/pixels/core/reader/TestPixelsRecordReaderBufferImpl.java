@@ -78,7 +78,6 @@ public class TestPixelsRecordReaderBufferImpl
         option.skipCorruptRecords(true);
         option.tolerantSchemaEvolution(true);
         option.enableEncodedColumnVector(true);
-        option.readIntColumnAsIntVector(true);
         option.includeCols(includeCols);
         option.transId(transId);
         option.transTimestamp(timeStamp);
@@ -117,5 +116,14 @@ public class TestPixelsRecordReaderBufferImpl
             ++readBatchNum;
         }
         Assertions.assertEquals(exceptedBatchNum, readBatchNum);
+    }
+
+    @Test
+    public void testNormalizeRetinaBufferStorageFolder()
+    {
+        String expected = "minio://pixels/retina-buffer/";
+        Assertions.assertEquals(expected, PixelsRecordReaderBufferImpl.normalizeRetinaBufferStorageFolder(
+                "minio://pixels/retina-buffer"));
+        Assertions.assertEquals(expected, PixelsRecordReaderBufferImpl.normalizeRetinaBufferStorageFolder(expected));
     }
 }

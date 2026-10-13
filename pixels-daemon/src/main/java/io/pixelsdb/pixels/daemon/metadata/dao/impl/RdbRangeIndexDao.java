@@ -142,17 +142,17 @@ public class RdbRangeIndexDao extends RangeIndexDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO RANGE_INDEXES(" +
-                "`RI_KEY_COLUMNS`," +
-                "`TBLS_TBL_ID`," +
-                "`SCHEMA_VERSIONS_SV_ID`) VALUES (?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "RI_KEY_COLUMNS," +
+                "TBLS_TBL_ID," +
+                "SCHEMA_VERSIONS_SV_ID) VALUES (?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setString(1, rangeIndex.getKeyColumns());
             pst.setLong(2, rangeIndex.getTableId());
             pst.setLong(3, rangeIndex.getSchemaVersionId());
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);
@@ -180,10 +180,10 @@ public class RdbRangeIndexDao extends RangeIndexDao
         Connection conn = db.getConnection();
         String sql = "UPDATE RANGE_INDEXES\n" +
                 "SET\n" +
-                "`RI_KEY_COLUMNS` = ?," +
-                "`TBLS_TBL_ID` = ?," +
-                "`SCHEMA_VERSIONS_SV_ID` = ?\n" +
-                "WHERE `RI_ID` = ?";
+                "RI_KEY_COLUMNS = ?," +
+                "TBLS_TBL_ID = ?," +
+                "SCHEMA_VERSIONS_SV_ID = ?\n" +
+                "WHERE RI_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, rangeIndex.getKeyColumns());

@@ -58,7 +58,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     private final boolean retinaEnabled;
     private final TypeDescription typeDescription;
     private final int colNum;
-    private final int typeMode = TypeDescription.Mode.CREATE_INT_VECTOR_FOR_INT;
+    private final int vectorLayout;
     private static ExecutorService prefetchExecutor; // Thread pool for I/O and deserialization
     private final BlockingQueue<VectorizedRowBatch> prefetchQueue; // Queue for completed batches
     private final AtomicInteger pendingTasks = new AtomicInteger(0); // Counter for submitted but unfinished tasks
@@ -111,11 +111,15 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     ) throws IOException
     {
         ConfigFactory configFactory = ConfigFactory.Instance();
-        this.retinaBufferStorageFolder = configFactory.getProperty("retina.buffer.object.storage.folder");
+        this.retinaBufferStorageFolder = normalizeRetinaBufferStorageFolder(
+                configFactory.getProperty("retina.buffer.object.storage.folder"));
         this.retinaHost = retinaHost;
         this.retinaEnabled = Boolean.parseBoolean(configFactory.getProperty("retina.enable"));
 
         this.option = option;
+        this.vectorLayout = (option.isReadIntColumnAsLongVector() ? TypeDescription.VectorLayout.INT_AS_LONG : 0) |
+                (option.isReadShortColumnAsLongVector() ? TypeDescription.VectorLayout.SHORT_AS_LONG : 0) |
+                (option.isReadTimeColumnAsLongTimeVector() ? TypeDescription.VectorLayout.TIME_AS_LONG_TIME : 0);
         this.activeMemtableData = activeMemtableData;
         this.fileIds = fileIds;
         this.storage = storage;
@@ -168,7 +172,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
                 {
                     memoryUsage.addAndGet(activeMemtableData.length);
                     ByteBuffer buffer = ByteBuffer.wrap(activeMemtableData);
-                    VectorizedRowBatch batch = VectorizedRowBatch.deserialize(buffer);
+                    VectorizedRowBatch batch = VectorizedRowBatch.deserialize(buffer, vectorLayout);
                     memoryUsage.addAndGet(batch.getMemoryUsage());
                     prefetchQueue.put(batch);
                 } catch (Exception e)
@@ -216,7 +220,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
                         buffer = getMemtableDataFromStorage(path);
 
                         // CPU Intensive Operation
-                        VectorizedRowBatch batch = VectorizedRowBatch.deserialize(buffer);
+                        VectorizedRowBatch batch = VectorizedRowBatch.deserialize(buffer, vectorLayout);
                         memoryUsage.addAndGet(batch.getMemoryUsage());
                         // Put result into the queue (blocks if queue is full)
                         prefetchQueue.put(batch);
@@ -327,7 +331,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     private VectorizedRowBatch createEmptyRowBatch(int size)
     {
         TypeDescription resultSchema = TypeDescription.createSchema(new ArrayList<>());
-        VectorizedRowBatch resultRowBatch = resultSchema.createRowBatch(0, this.typeMode);
+        VectorizedRowBatch resultRowBatch = resultSchema.createRowBatch(0, vectorLayout);
         resultRowBatch.projectionSize = 0;
         resultRowBatch.endOfFile = this.endOfFile;
         resultRowBatch.size = size;
@@ -454,6 +458,15 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
         {
             memoryUsage.addAndGet(-b.getMemoryUsage());
         }
+    }
+
+    static String normalizeRetinaBufferStorageFolder(String folder)
+    {
+        if (folder == null || folder.isEmpty())
+        {
+            throw new IllegalArgumentException("retina.buffer.object.storage.folder must not be empty");
+        }
+        return folder.endsWith("/") ? folder : folder + "/";
     }
 
     private String getRetinaBufferStoragePathFromId(long entryId, int virtualId)

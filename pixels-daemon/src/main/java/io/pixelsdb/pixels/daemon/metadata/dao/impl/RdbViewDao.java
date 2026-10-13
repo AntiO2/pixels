@@ -184,10 +184,10 @@ public class RdbViewDao extends ViewDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO VIEWS(" +
-                "`VIEW_NAME`," +
-                "`VIEW_TYPE`," +
-                "`VIEW_DATA`," +
-                "`DBS_DB_ID`) VALUES (?,?,?,?)";
+                "VIEW_NAME," +
+                "VIEW_TYPE," +
+                "VIEW_DATA," +
+                "DBS_DB_ID) VALUES (?,?,?,?)";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, view.getName());
@@ -208,10 +208,10 @@ public class RdbViewDao extends ViewDao
         Connection conn = db.getConnection();
         String sql = "UPDATE VIEWS\n" +
                 "SET\n" +
-                "`VIEW_NAME` = ?," +
-                "`VIEW_TYPE` = ?," +
-                "`VIEW_DATA` = ?\n" +
-                "WHERE `VIEW_ID` = ?";
+                "VIEW_NAME = ?," +
+                "VIEW_TYPE = ?," +
+                "VIEW_DATA = ?\n" +
+                "WHERE VIEW_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, view.getName());

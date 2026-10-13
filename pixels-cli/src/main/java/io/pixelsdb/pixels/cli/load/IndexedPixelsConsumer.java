@@ -39,6 +39,7 @@
  import io.pixelsdb.pixels.common.utils.RetinaUtils;
  import io.pixelsdb.pixels.core.PixelsWriter;
  import io.pixelsdb.pixels.core.TypeDescription;
+ import io.pixelsdb.pixels.core.utils.PrimaryKeyBytes;
  import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
  import io.pixelsdb.pixels.daemon.NodeProto;
  import io.pixelsdb.pixels.index.IndexProto;
@@ -47,9 +48,7 @@
  import java.io.DataInputStream;
  import java.io.IOException;
  import java.io.InputStreamReader;
- import java.nio.ByteBuffer;
  import java.util.ArrayList;
- import java.util.LinkedList;
  import java.util.List;
  import java.util.Map;
  import java.util.concurrent.BlockingQueue;
@@ -81,7 +80,6 @@
      protected void processSourceFile(String originalFilePath) throws IOException, MetadataException
      {
          Storage originStorage = StorageFactory.Instance().getStorage(originalFilePath);
-         Pattern SPLIT_PATTERN = Pattern.compile(Pattern.quote(regex));
          try (
                  DataInputStream dataInputStream = originStorage.open(originalFilePath);
                  BufferedReader reader = new BufferedReader(new InputStreamReader(dataInputStream)))
@@ -89,19 +87,25 @@
              System.out.println("loading indexed data from: " + originalFilePath);
              long timestamp = parameters.getTimestamp();
              String line;
+             long lineNumber = 0;
 
              while ((line = reader.readLine()) != null)
              {
-                 if (line.isEmpty())
-                 {
-                     System.err.println("thread: " + currentThread().getName() + " got empty line.");
-                     continue;
-                 }
+                 lineNumber++;
 
-                 String[] colsInLine = SPLIT_PATTERN.split(line);
+                 // limit=-1 keeps trailing empty fields; String.split(regex) drops them by default.
+                 String[] colsInLine = Pattern.compile(Pattern.quote(regex)).split(line, -1);
 
                  // 1. Calculate Primary Key and Bucket ID
-                 ByteString pkByteString = calculatePrimaryKeyBytes(colsInLine);
+                 ByteString pkByteString;
+                 try
+                 {
+                     pkByteString = calculatePrimaryKeyBytes(colsInLine);
+                 } catch (RuntimeException e)
+                 {
+                     throw new IOException("Failed to load '" + originalFilePath +
+                             "' at line " + lineNumber, e);
+                 }
                  int retinaBucketId = RetinaUtils.getBucketIdFromByteBuffer(pkByteString);
                  VnodeIdentifier vnodeIdentifier = RetinaUtils.getInstance().getVnodeIdentifierFromBucketId(retinaBucketId);
                  int indexBucketId = IndexUtils.getBucketIdFromByteBuffer(pkByteString);
@@ -117,7 +121,14 @@
                  });
 
                  // 3. Write Data Row
-                 writeRowToBatch(retinaNodeWriter.rowBatch, colsInLine, timestamp);
+                 try
+                 {
+                     writeRowToBatch(retinaNodeWriter.rowBatch, colsInLine, timestamp);
+                 } catch (RuntimeException e)
+                 {
+                     throw new IOException("Failed to load '" + originalFilePath +
+                             "' at line " + lineNumber, e);
+                 }
                  retinaNodeWriter.rowCounter++;
 
                  try
@@ -140,11 +151,13 @@
                      }
                  } catch (IndexException e)
                  {
-                     e.printStackTrace();
+                     throw new IOException("Failed to update index while loading '" +
+                             originalFilePath + "' at line " + lineNumber, e);
                  }
              }
          }
-         originStorage.close();
+         // Do not close originStorage: StorageFactory caches one Storage instance per scheme, and the same
+         // instance is used by flushRemainingData() to write the data files when they share the scheme.
      }
 
      @Override
@@ -159,7 +172,8 @@
                      closePixelsFile(bucketWriter);
                  } catch (IndexException e)
                  {
-                     e.printStackTrace();
+                     throw new IOException("Failed to flush indexed file " +
+                             bucketWriter.currFile.getName(), e);
                  }
              }
          }
@@ -198,29 +212,34 @@
 
      private ByteString calculatePrimaryKeyBytes(String[] colsInLine)
      {
-         TypeDescription pkTypeDescription = parameters.getPkTypeDescription();
-         List<byte[]> pkBytes = new LinkedList<>();
-         int indexKeySize = 0;
+         List<TypeDescription> pkTypes = pkTypeDescription.getChildren();
+         List<String> pkNames = pkTypeDescription.getFieldNames();
+         if (pkTypes == null || pkMapping.length != pkTypes.size())
+         {
+             throw new IllegalArgumentException("Primary key mapping does not match primary key schema.");
+         }
 
+         String[] pkValues = new String[pkMapping.length];
          for (int i = 0; i < pkMapping.length; i++)
          {
              int pkColumnId = pkMapping[i];
-             // Safety check for array bounds
-             if (pkColumnId >= colsInLine.length)
+             String pkName = pkNames != null && i < pkNames.size() ? pkNames.get(i) : "column_" + i;
+             if (pkColumnId < 0 || pkColumnId >= colsInLine.length)
              {
-                 throw new IllegalArgumentException("Primary key mapping index out of bounds for line.");
+                 throw new IllegalArgumentException("Primary key column '" + pkName +
+                         "' at ordinal " + i + " maps to missing input index " + pkColumnId);
              }
-             byte[] bytes = pkTypeDescription.getChildren().get(i).convertSqlStringToByte(colsInLine[pkColumnId]);
-             pkBytes.add(bytes);
-             indexKeySize += bytes.length;
-         }
 
-         ByteBuffer indexKeyBuffer = ByteBuffer.allocate(indexKeySize);
-         for (byte[] pkByte : pkBytes)
-         {
-             indexKeyBuffer.put(pkByte);
+             String rawValue = colsInLine[pkColumnId];
+             // Align with LOAD dialect: \N -> NULL (forbidden for PK).
+             if (rawValue != null && rawValue.equalsIgnoreCase("\\N"))
+             {
+                 throw new IllegalArgumentException("Primary key column '" + pkName +
+                         "' at ordinal " + i + " cannot be NULL.");
+             }
+             pkValues[i] = rawValue;
          }
-         return ByteString.copyFrom((ByteBuffer) indexKeyBuffer.rewind());
+         return ByteString.copyFrom(PrimaryKeyBytes.fromSqlStrings(pkTypes, pkValues));
      }
 
      private void updateIndexEntry(PerVirtualNodeWriter bucketWriter, ByteString pkByteString, int indexBucketId) throws IndexException
@@ -263,8 +282,6 @@
                  queue.clear();
              }
          }
-         bucketWriter.indexService.flushIndexEntriesOfFile(index.getTableId(), index.getId(),
-                 bucketWriter.currFile.getId(), true, bucketWriter.defaultIndexOption);
      }
 
      private void closePixelsFile(PerVirtualNodeWriter bucketWriter) throws IOException, IndexException
@@ -274,6 +291,10 @@
          {
              flushRowBatch(bucketWriter);
          }
+
+         // The main index of a file can only be flushed once, hence it is flushed here instead of in flushRowBatch()
+         bucketWriter.indexService.flushIndexEntriesOfFile(index.getTableId(), index.getId(),
+                 bucketWriter.currFile.getId(), true, bucketWriter.defaultIndexOption);
 
          closeWriterAndAddFile(bucketWriter.pixelsWriter, bucketWriter.currFile, bucketWriter.currTargetPath, bucketWriter.targetNode);
      }
@@ -308,7 +329,7 @@
              this.prevRgId = this.rgId;
              this.rgRowOffset = 0;
              this.rowCounter = 0;
-             this.rowBatch = schema.createRowBatchWithHiddenColumn(pixelStride, TypeDescription.Mode.NONE);
+             this.rowBatch = schema.createRowBatchWithHiddenColumn(pixelStride);
              this.vNodeId = vNodeId;
              this.indexService = indexServices.computeIfAbsent(node.getAddress(), nodeInfo ->
                      RPCIndexService.CreateInstance(nodeInfo, indexServerPort));

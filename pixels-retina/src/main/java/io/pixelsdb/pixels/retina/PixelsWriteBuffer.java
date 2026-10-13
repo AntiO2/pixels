@@ -69,6 +69,9 @@ public class PixelsWriteBuffer
     // column information is recorded to create rowBatch
     private final TypeDescription schema;
 
+    // column order mapping from layout to metadata column order
+    private final int[] orderMapping;
+
     // configuration information of PixelsWriter
     private final int memTableSize;
     private final long blockSize;
@@ -130,11 +133,13 @@ public class PixelsWriteBuffer
     private final int virtualNodeId;
     private final IndexOption indexOption;
 
-    public PixelsWriteBuffer(long tableId, TypeDescription schema, Path targetOrderedDirPath,
-                             Path targetCompactDirPath, String retinaHostName, int virtualNode) throws RetinaException
+    public PixelsWriteBuffer(long tableId, TypeDescription schema, int[] orderMapping,
+                             Path targetOrderedDirPath, Path targetCompactDirPath,
+                             String retinaHostName, int virtualNode) throws RetinaException
     {
         this.tableId = tableId;
         this.schema = schema;
+        this.orderMapping = orderMapping;
         this.virtualNodeId = virtualNode;
         this.indexOption = IndexOption.builder()
                 .vNodeId(virtualNodeId)
@@ -182,8 +187,8 @@ public class PixelsWriteBuffer
         this.ingestFilePublisher = new IngestFilePublisher(this.currentFileWriterManager.getFirstBlockId());
 
         this.activeMemTable = new MemTable(this.idCounter, schema, memTableSize,
-                TypeDescription.Mode.CREATE_INT_VECTOR_FOR_INT, this.currentFileWriterManager.getFileId(),
-                0, this.memTableSize);
+                TypeDescription.VectorLayout.NONE, this.orderMapping,
+                this.currentFileWriterManager.getFileId(), 0, this.memTableSize);
         this.idCounter++;
         this.currentMemTableCount = 1;
 
@@ -299,8 +304,8 @@ public class PixelsWriteBuffer
         SuperVersion oldVersion = this.currentVersion;
         this.immutableMemTables.add(this.activeMemTable);
         this.activeMemTable = new MemTable(this.idCounter, this.schema,
-                this.memTableSize, TypeDescription.Mode.CREATE_INT_VECTOR_FOR_INT,
-                this.currentFileWriterManager.getFileId(),
+                this.memTableSize, TypeDescription.VectorLayout.NONE,
+                this.orderMapping, this.currentFileWriterManager.getFileId(),
                 this.currentMemTableCount * this.memTableSize,
                 this.memTableSize);
         this.currentMemTableCount += 1;

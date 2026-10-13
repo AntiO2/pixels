@@ -174,11 +174,11 @@ public class RdbPathDao extends PathDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO PATHS(" +
-                "`PATH_URI`," +
-                "`PATH_TYPE`," +
-                "`LAYOUTS_LAYOUT_ID`," +
-                "`RANGES_RANGE_ID`) VALUES (?,?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "PATH_URI," +
+                "PATH_TYPE," +
+                "LAYOUTS_LAYOUT_ID," +
+                "RANGES_RANGE_ID) VALUES (?,?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setString(1, path.getUri());
             pst.setInt(2, path.getTypeValue());
@@ -193,7 +193,7 @@ public class RdbPathDao extends PathDao
             }
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);
@@ -221,9 +221,9 @@ public class RdbPathDao extends PathDao
         Connection conn = db.getConnection();
         String sql = "UPDATE PATHS\n" +
                 "SET\n" +
-                "`PATH_URI` = ?," +
-                "`PATH_IS_COMPACT` = ?\n" +
-                "WHERE `PATH_ID` = ?";
+                "PATH_URI = ?," +
+                "PATH_IS_COMPACT = ?\n" +
+                "WHERE PATH_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, path.getUri());

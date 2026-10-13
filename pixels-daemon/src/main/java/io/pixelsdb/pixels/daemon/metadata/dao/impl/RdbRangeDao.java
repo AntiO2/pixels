@@ -121,11 +121,11 @@ public class RdbRangeDao extends RangeDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO RANGES(" +
-                "`RANGE_MIN`," +
-                "`RANGE_MAX`," +
-                "`RANGE_PARENT_ID`," +
-                "`RANGE_INDEXES_RI_ID`) VALUES (?,?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "RANGE_MIN," +
+                "RANGE_MAX," +
+                "RANGE_PARENT_ID," +
+                "RANGE_INDEXES_RI_ID) VALUES (?,?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setBytes(1, range.getMin().toByteArray());
             pst.setBytes(2, range.getMax().toByteArray());
@@ -140,7 +140,7 @@ public class RdbRangeDao extends RangeDao
             pst.setLong(4, range.getRangeIndexId());
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);
@@ -168,11 +168,11 @@ public class RdbRangeDao extends RangeDao
         Connection conn = db.getConnection();
         String sql = "UPDATE RANGES\n" +
                 "SET\n" +
-                "`RANGE_MIN` = ?," +
-                "`RANGE_MXN` = ?," +
-                "`RANGE_PARENT_ID` = ?," +
-                "`RANGE_INDEXES_RI_ID` = ?\n" +
-                "WHERE `RANGE_ID` = ?";
+                "RANGE_MIN = ?," +
+                "RANGE_MXN = ?," +
+                "RANGE_PARENT_ID = ?," +
+                "RANGE_INDEXES_RI_ID = ?\n" +
+                "WHERE RANGE_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setBytes(1, range.getMin().toByteArray());

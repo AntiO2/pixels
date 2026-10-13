@@ -64,14 +64,22 @@ public abstract class ColumnReader implements Closeable
             case BYTE:
                 return new ByteColumnReader(type);
             case SHORT:
-            case INT:
-                if (option.isReadIntColumnAsIntVector())
+                if (option.isReadShortColumnAsLongVector())
                 {
-                    return new IntColumnReader(type);
+                    return new LongColumnReader(type);
                 }
                 else
                 {
+                    return new ShortColumnReader(type);
+                }
+            case INT:
+                if (option.isReadIntColumnAsLongVector())
+                {
                     return new LongColumnReader(type);
+                }
+                else
+                {
+                    return new IntColumnReader(type);
                 }
             case LONG:
                 return new LongColumnReader(type);
@@ -93,7 +101,14 @@ public abstract class ColumnReader implements Closeable
             case DATE:
                 return new DateColumnReader(type);
             case TIME:
-                return new TimeColumnReader(type);
+                if (option.isReadTimeColumnAsLongTimeVector())
+                {
+                    return new LongTimeColumnReader(type);
+                }
+                else
+                {
+                    return new TimeColumnReader(type);
+                }
             case TIMESTAMP:
                 return new TimestampColumnReader(type);
             case BINARY:

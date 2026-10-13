@@ -101,7 +101,7 @@ public class RdbSinglePointIndexDao extends SinglePointIndexDao
     public MetadataProto.SinglePointIndex getPrimaryByTableId(long tableId)
     {
         Connection conn = db.getConnection();
-        String sql = "SELECT * FROM SINGLE_POINT_INDICES WHERE TBLS_TBL_ID=? AND SPI_PRIMARY=TRUE";
+        String sql = "SELECT * FROM SINGLE_POINT_INDICES WHERE TBLS_TBL_ID=? AND SPI_PRIMARY=1";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setLong(1, tableId);
@@ -151,13 +151,13 @@ public class RdbSinglePointIndexDao extends SinglePointIndexDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO SINGLE_POINT_INDICES(" +
-                "`SPI_KEY_COLUMNS`," +
-                "`SPI_PRIMARY`," +
-                "`SPI_UNIQUE`," +
-                "`SPI_INDEX_SCHEME`," +
-                "`TBLS_TBL_ID`," +
-                "`SCHEMA_VERSIONS_SV_ID`) VALUES (?,?,?,?,?,?)";
-        try (PreparedStatement pst = conn.prepareStatement(sql))
+                "SPI_KEY_COLUMNS," +
+                "SPI_PRIMARY," +
+                "SPI_UNIQUE," +
+                "SPI_INDEX_SCHEME," +
+                "TBLS_TBL_ID," +
+                "SCHEMA_VERSIONS_SV_ID) VALUES (?,?,?,?,?,?)";
+        try (PreparedStatement pst = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS))
         {
             pst.setString(1, singlePointIndex.getKeyColumns());
             pst.setBoolean(2, singlePointIndex.getPrimary());
@@ -167,7 +167,7 @@ public class RdbSinglePointIndexDao extends SinglePointIndexDao
             pst.setLong(6, singlePointIndex.getSchemaVersionId());
             if (pst.executeUpdate() == 1)
             {
-                ResultSet rs = pst.executeQuery("SELECT LAST_INSERT_ID()");
+                ResultSet rs = pst.getGeneratedKeys();
                 if (rs.next())
                 {
                     return rs.getLong(1);
@@ -193,13 +193,13 @@ public class RdbSinglePointIndexDao extends SinglePointIndexDao
         Connection conn = db.getConnection();
         String sql = "UPDATE SINGLE_POINT_INDICES\n" +
                 "SET\n" +
-                "`SPI_KEY_COLUMNS` = ?," +
-                "`SPI_PRIMARY` = ?," +
-                "`SPI_UNIQUE` = ?," +
-                "`SPI_INDEX_SCHEME` = ?," +
-                "`TBLS_TBL_ID` = ?," +
-                "`SCHEMA_VERSIONS_SV_ID` = ?\n" +
-                "WHERE `SPI_ID` = ?";
+                "SPI_KEY_COLUMNS = ?," +
+                "SPI_PRIMARY = ?," +
+                "SPI_UNIQUE = ?," +
+                "SPI_INDEX_SCHEME = ?," +
+                "TBLS_TBL_ID = ?," +
+                "SCHEMA_VERSIONS_SV_ID = ?\n" +
+                "WHERE SPI_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, singlePointIndex.getKeyColumns());

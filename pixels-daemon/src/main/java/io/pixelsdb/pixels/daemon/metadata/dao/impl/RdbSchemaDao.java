@@ -136,8 +136,8 @@ public class RdbSchemaDao extends SchemaDao
     {
         Connection conn = db.getConnection();
         String sql = "INSERT INTO DBS(" +
-                "`DB_NAME`," +
-                "`DB_DESC`) VALUES (?,?)";
+                "DB_NAME," +
+                "DB_DESC) VALUES (?,?)";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, schema.getName());
@@ -156,9 +156,9 @@ public class RdbSchemaDao extends SchemaDao
         Connection conn = db.getConnection();
         String sql = "UPDATE DBS\n" +
                 "SET\n" +
-                "`DB_NAME` = ?," +
-                "`DB_DESC` = ?\n" +
-                "WHERE `DB_ID` = ?";
+                "DB_NAME = ?," +
+                "DB_DESC = ?\n" +
+                "WHERE DB_ID = ?";
         try (PreparedStatement pst = conn.prepareStatement(sql))
         {
             pst.setString(1, schema.getName());

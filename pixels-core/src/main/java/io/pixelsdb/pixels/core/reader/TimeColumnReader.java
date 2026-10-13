@@ -37,6 +37,10 @@ import java.util.Arrays;
 /**
  * Pixels time column reader.
  * All time values are translated to the specified time zone after read from file.
+ * <p>
+ * Reads into {@link TimeColumnVector} (millis of day). For Trino-native picoseconds
+ * output vector layout, use {@link LongTimeColumnReader} instead (selected by
+ * {@link PixelsReaderOption#readTimeColumnAsLongTimeVector(boolean)}).
  *
  * @author hank
  * @create 2021-04-28
@@ -115,21 +119,21 @@ public class TimeColumnReader extends ColumnReader
 
         // read without copying the de-compacted content and isNull
         int numLeft = size, numToRead, bytesToDeCompact;
-        boolean endOfPixels;
+        boolean endOfPixel;
         for (int i = vectorIndex; numLeft > 0;)
         {
             if (elementIndex / pixelStride < (elementIndex + numLeft) / pixelStride)
             {
                 // read to the end of the current pixel
                 numToRead = pixelStride - elementIndex % pixelStride;
-                endOfPixels = true;
+                endOfPixel = true;
             }
             else
             {
                 numToRead = numLeft;
-                endOfPixels = false;
+                endOfPixel = false;
             }
-            bytesToDeCompact = (numToRead + isNullSkipBits + (endOfPixels ? 7 : 0)) / 8;
+            bytesToDeCompact = (numToRead + isNullSkipBits + (endOfPixel ? 7 : 0)) / 8;
             // read isNull
             int pixelId = elementIndex / pixelStride;
             hasNull = chunkIndex.getPixelStatistics(pixelId).getStatistic().getHasNull();
@@ -138,7 +142,7 @@ public class TimeColumnReader extends ColumnReader
                 BitUtils.bitWiseDeCompact(columnVector.isNull, i, numToRead,
                         inputBuffer, isNullOffset, isNullSkipBits, littleEndian);
                 isNullOffset += bytesToDeCompact;
-                isNullSkipBits = endOfPixels ? 0 : (numToRead + isNullSkipBits) % 8;
+                isNullSkipBits = endOfPixel ? 0 : (numToRead + isNullSkipBits) % 8;
                 columnVector.noNulls = false;
             }
             else
@@ -326,10 +330,10 @@ public class TimeColumnReader extends ColumnReader
                     {
                         if (!(hasNull && isNull[j - vectorIndex]))
                         {
+                            // If time column is not encoded, it is written as integers instead of longs.
                             int value = inputBuffer.getInt();
                             if (selected.get(j - vectorIndex))
                             {
-                                // If time column is not encoded, it is written as integers instead of longs.
                                 columnVector.set(vectorWriteIndex++, value);
                             }
                         }
