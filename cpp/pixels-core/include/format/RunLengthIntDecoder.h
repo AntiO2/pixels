@@ -26,11 +26,13 @@ namespace format
 class RunLengthIntDecoder
 {
 public:
+    // Prefix decoding is only for callers that separately validate the
+    // exact final-pixel alignment padding using consumedBytes.
     [[nodiscard]] static bool decode(
             const ByteSpan &bytes, bool signedValues,
             std::size_t expectedCount, std::int64_t *destination,
             std::size_t destinationSize, std::size_t &consumedBytes,
-            FormatError &error);
+            FormatError &error, bool requireEnd = true);
 };
 
 } // namespace format

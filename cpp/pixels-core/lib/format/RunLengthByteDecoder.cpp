@@ -22,7 +22,7 @@ namespace format
 bool RunLengthByteDecoder::decode(
         const ByteSpan &bytes, std::size_t expectedCount,
         std::int8_t *destination, std::size_t destinationSize,
-        std::size_t &consumedBytes, FormatError &error)
+        std::size_t &consumedBytes, FormatError &error, bool requireEnd)
 {
     error.clear();
     consumedBytes = 0;
@@ -108,7 +108,7 @@ bool RunLengthByteDecoder::decode(
         }
     }
     consumedBytes = input;
-    if (input != bytes.size())
+    if (requireEnd && input != bytes.size())
     {
         return fail(error, ErrorCode::MALFORMED_PROTOBUF,
                     "RLE byte stream has trailing bytes");

@@ -117,6 +117,8 @@ pixels_inspector_status currentStatus(const InspectionSession &session)
         case InspectionSession::State::AWAITING_VARIABLE_TRAILER:
         case InspectionSession::State::AWAITING_VARIABLE_STARTS:
         case InspectionSession::State::AWAITING_VARIABLE_CONTENT:
+        case InspectionSession::State::AWAITING_BINARY_FIRST_START:
+        case InspectionSession::State::AWAITING_BINARY_LAST_START:
         case InspectionSession::State::AWAITING_DICTIONARY_TRAILER:
         case InspectionSession::State::AWAITING_DICTIONARY_STARTS:
         case InspectionSession::State::AWAITING_DICTIONARY_CONTENT:

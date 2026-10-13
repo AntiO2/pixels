@@ -1745,6 +1745,7 @@ bool InspectionSession::beginPageRequest(
     pageRequest_.pixelRowCount = 0;
     pageRequest_.resultOffset = 0;
     pageRequest_.nullBitmapByteOffset = 0;
+    pageRequest_.nullBitmapBytes = 0;
     pageRequest_.pixelPhysicalBase = 0;
     pageRequest_.variableContentBase = 0;
     variableLayout_ = format::PlainVariableLayout{};
@@ -1823,6 +1824,10 @@ bool InspectionSession::supplyRange(
             return consumeVariableStarts(bytes);
         case State::AWAITING_VARIABLE_CONTENT:
             return consumeVariableContent(bytes);
+        case State::AWAITING_BINARY_FIRST_START:
+            return consumeBinaryBoundary(bytes, true);
+        case State::AWAITING_BINARY_LAST_START:
+            return consumeBinaryBoundary(bytes, false);
         case State::AWAITING_DICTIONARY_TRAILER:
             return consumeDictionaryTrailer(bytes);
         case State::AWAITING_DICTIONARY_STARTS:
@@ -1859,6 +1864,8 @@ bool InspectionSession::cancel()
         case State::AWAITING_VARIABLE_TRAILER:
         case State::AWAITING_VARIABLE_STARTS:
         case State::AWAITING_VARIABLE_CONTENT:
+        case State::AWAITING_BINARY_FIRST_START:
+        case State::AWAITING_BINARY_LAST_START:
         case State::AWAITING_DICTIONARY_TRAILER:
         case State::AWAITING_DICTIONARY_STARTS:
         case State::AWAITING_DICTIONARY_CONTENT:
@@ -2208,6 +2215,25 @@ bool InspectionSession::consumeVariableTrailer(
                 error_, format::ErrorCode::MALFORMED_PROTOBUF,
                 "plain variable null and starts offsets are inconsistent");
     }
+    const proto::Type &type = fileTail_.footer().types(
+            static_cast<int>(pageRequest_.column));
+    if (isLengthPrefixedBinary(type))
+    {
+        if (pageChunk_.isnulloffset() + pageRequest_.nullBitmapBytes
+                != variableLayout_.startsOffset || usesNullPadding())
+        {
+            return transitionFailure(format::ErrorCode::MALFORMED_PROTOBUF,
+                                     "binary starts must follow the complete compacted null bitmap");
+        }
+        if (pageRequest_.nullBitmapBytes == 0)
+        {
+            return validateBinaryNullBitmaps(format::ByteSpan());
+        }
+        setPendingRange(format::FileRange{
+                pageChunk_.chunkoffset() + pageChunk_.isnulloffset(),
+                pageRequest_.nullBitmapBytes}, State::AWAITING_PREFIX_NULL_BITMAP);
+        return true;
+    }
 
     const std::uint64_t pixelStart =
             static_cast<std::uint64_t>(pageRequest_.pixel)
@@ -2249,12 +2275,147 @@ bool InspectionSession::consumePrefixNullBitmap(
         }
         return requestCurrentPixel();
     }
+    if (isLengthPrefixedBinary(type))
+    {
+        return validateBinaryNullBitmaps(bytes);
+    }
     if (!computeVariablePhysicalBase(bytes))
     {
         state_ = State::FAILED;
         return false;
     }
     return requestCurrentPixel();
+}
+
+bool InspectionSession::validateBinaryNullBitmaps(const format::ByteSpan &bytes)
+{
+    const std::uint64_t stride = fileTail_.postscript().pixelstride();
+    const std::uint64_t rows = fileTail_.footer().rowgroupinfos(
+            static_cast<int>(pageRequest_.rowGroup)).numberofrows();
+    const bool littleEndian = pageChunk_.has_littleendian() && pageChunk_.littleendian();
+    std::size_t bitmapOffset = 0;
+    std::uint64_t total = 0;
+    pageRequest_.pixelPhysicalBase = 0;
+    for (int pixel = 0; pixel < pageChunk_.pixelpositions_size(); ++pixel)
+    {
+        const std::uint32_t count = static_cast<std::uint32_t>(
+                std::min(stride, rows - static_cast<std::uint64_t>(pixel) * stride));
+        std::uint32_t physical = count;
+        if (pixelHasNull(pageChunk_, static_cast<std::uint32_t>(pixel)))
+        {
+            const std::size_t length = (count + 7U) / 8U;
+            format::ByteSpan bitmap;
+            if (!bytes.subspan(bitmapOffset, length, bitmap))
+            {
+                return transitionFailure(format::ErrorCode::OUT_OF_BOUNDS,
+                                         "binary null bitmap is incomplete");
+            }
+            std::unique_ptr<bool[]> validity(new bool[count]);
+            format::PlainPixelPlan plan;
+            if (!format::PlainPixelPlanner::plan(count, 0, count, true, false,
+                        littleEndian, bitmap, validity.get(), count, plan, error_))
+            {
+                state_ = State::FAILED;
+                return false;
+            }
+            physical = plan.pixelPhysicalCount;
+            bitmapOffset += length;
+        }
+        total += physical;
+        if (static_cast<std::uint32_t>(pixel) < pageRequest_.pixel)
+        {
+            pageRequest_.pixelPhysicalBase += physical;
+        }
+    }
+    if (bitmapOffset != bytes.size() || total != variableLayout_.physicalValueCount)
+    {
+        return transitionFailure(format::ErrorCode::MALFORMED_PROTOBUF,
+                                 "binary starts count does not match its non-null rows");
+    }
+    return requestBinaryFirstStart();
+}
+
+bool InspectionSession::requestBinaryFirstStart()
+{
+    setPendingRange(format::FileRange{
+            pageChunk_.chunkoffset() + variableLayout_.startsOffset, 4},
+            State::AWAITING_BINARY_FIRST_START);
+    return true;
+}
+
+bool InspectionSession::consumeBinaryBoundary(const format::ByteSpan &bytes, bool first)
+{
+    std::int32_t value = 0;
+    if (!format::PlainScalarDecoder::decodeInt32(bytes,
+                pageChunk_.has_littleendian() && pageChunk_.littleendian(),
+                0, 1, &value, 1, error_))
+    {
+        state_ = State::FAILED;
+        return false;
+    }
+    if (value < 0 || (first && value != 0))
+    {
+        return transitionFailure(format::ErrorCode::MALFORMED_PROTOBUF,
+                                 "binary starts boundary is invalid");
+    }
+    if (first && variableLayout_.physicalValueCount != 0)
+    {
+        setPendingRange(format::FileRange{
+                pageChunk_.chunkoffset() + variableLayout_.startsOffset
+                        + variableLayout_.startsLength - 4U, 4},
+                State::AWAITING_BINARY_LAST_START);
+        return true;
+    }
+    const std::uint64_t contentLength = static_cast<std::uint32_t>(value);
+    std::uint64_t alignedEnd = contentLength;
+    const std::uint64_t alignment = pageChunk_.has_isnullalignment()
+            ? pageChunk_.isnullalignment() : 0;
+    if (alignment != 0 && alignedEnd % alignment != 0)
+    {
+        alignedEnd += alignment - alignedEnd % alignment;
+    }
+    if (alignedEnd != pageChunk_.isnulloffset()
+        || contentLength < pageChunk_.pixelpositions(pageChunk_.pixelpositions_size() - 1))
+    {
+        return transitionFailure(format::ErrorCode::MALFORMED_PROTOBUF,
+                                 "binary terminal start does not match its content boundary");
+    }
+    variableLayout_.contentLength = contentLength;
+    return requestCurrentPixel();
+}
+
+bool InspectionSession::validatePixelPadding(const format::ByteSpan &bytes, std::size_t consumed)
+{
+    std::uint64_t offset = 0;
+    std::uint64_t length = 0;
+    if (consumed > bytes.size() || !currentPixelDataRange(offset, length))
+    {
+        return transitionFailure(format::ErrorCode::OUT_OF_BOUNDS,
+                                 "encoded pixel consumed range is invalid");
+    }
+    std::uint64_t end = offset + consumed;
+    const bool last = pageRequest_.pixel + 1U
+            == static_cast<std::uint32_t>(pageChunk_.pixelpositions_size());
+    const std::uint64_t alignment = last && pageChunk_.has_isnullalignment()
+            ? pageChunk_.isnullalignment() : 0;
+    if (alignment != 0 && end % alignment != 0)
+    {
+        end += alignment - end % alignment;
+    }
+    if (end != offset + length)
+    {
+        return transitionFailure(format::ErrorCode::MALFORMED_PROTOBUF,
+                                 "encoded pixel trailing bytes are not exact final alignment padding");
+    }
+    for (std::size_t index = consumed; index < bytes.size(); ++index)
+    {
+        if (bytes.data()[index] != 0)
+        {
+            return transitionFailure(format::ErrorCode::MALFORMED_PROTOBUF,
+                                     "encoded pixel alignment padding is not zero");
+        }
+    }
+    return true;
 }
 
 bool InspectionSession::inferShortWidth(const format::ByteSpan &prefixBitmap)
@@ -2652,7 +2813,10 @@ bool InspectionSession::consumeVariableStarts(
             pageChunk_.has_littleendian() && pageChunk_.littleendian();
     if (!format::VariableLengthDecoder::decodeStartsWindow(
                 bytes, littleEndian, pagePlan_.physicalCount,
-                pageChunk_.isnulloffset(), variableRanges_, error_))
+                isLengthPrefixedBinary(fileTail_.footer().types(
+                        static_cast<int>(pageRequest_.column)))
+                    ? variableLayout_.contentLength : pageChunk_.isnulloffset(),
+                variableRanges_, error_))
     {
         state_ = State::FAILED;
         return false;
@@ -2987,6 +3151,7 @@ bool InspectionSession::validatePageRequest()
         return format::fail(error_, format::ErrorCode::OUT_OF_BOUNDS,
                             "pixel null bitmaps exceed the column chunk");
     }
+    pageRequest_.nullBitmapBytes = nullBitmapBytes;
 
     const std::uint64_t firstPixel =
             pageRequest_.rowOffset / pixelStride;
@@ -3184,9 +3349,11 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
     if (isLengthPrefixedBinary(type))
     {
         std::vector<format::VariableValueRange> pixelRanges;
+        std::size_t consumed = 0;
         if (!format::VariableLengthDecoder::decodeLengthPrefixed(
                     bytes, pagePlan_.pixelPhysicalCount,
-                    type.maximumlength(), pixelRanges, error_))
+                    type.maximumlength(), pixelRanges, error_, &consumed)
+            || !validatePixelPadding(bytes, consumed))
         {
             state_ = State::FAILED;
             return false;
@@ -3243,7 +3410,8 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
             if (!format::RunLengthByteDecoder::decode(
                         bytes, pixelValues.size(),
                         pixelValues.data(), pixelValues.size(),
-                        consumedBytes, error_))
+                        consumedBytes, error_, false)
+                || !validatePixelPadding(bytes, consumedBytes))
             {
                 state_ = State::FAILED;
                 return false;
@@ -3274,7 +3442,8 @@ bool InspectionSession::consumeColumnChunk(const format::ByteSpan &bytes)
         if (!format::RunLengthIntDecoder::decode(
                     bytes, true, pixelValues.size(),
                     pixelValues.data(), pixelValues.size(),
-                    consumedBytes, error_))
+                    consumedBytes, error_, false)
+            || !validatePixelPadding(bytes, consumedBytes))
         {
             state_ = State::FAILED;
             return false;
@@ -3698,7 +3867,8 @@ bool InspectionSession::isPlainVariablePage() const
         {
             if (pixelHasNull(pageChunk_, static_cast<std::uint32_t>(pixel)))
             {
-                const std::uint64_t count = std::min(stride, rows - pixel * stride);
+                const std::uint64_t count = std::min(
+                        stride, rows - static_cast<std::uint64_t>(pixel) * stride);
                 bitmapBytes += (count + 7U) / 8U;
             }
         }

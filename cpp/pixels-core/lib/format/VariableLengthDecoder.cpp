@@ -199,10 +199,11 @@ bool VariableLengthDecoder::decodeLengthPrefixed(
         const ByteSpan &bytes, std::size_t valueCount,
         std::uint32_t maximumLength,
         std::vector<VariableValueRange> &ranges,
-        FormatError &error)
+        FormatError &error, std::size_t *consumedBytes)
 {
     error.clear();
     ranges.clear();
+    if (consumedBytes != nullptr) *consumedBytes = 0;
     if (!bytes.isValid())
     {
         return fail(error, ErrorCode::INVALID_ARGUMENT,
@@ -232,7 +233,8 @@ bool VariableLengthDecoder::decodeLengthPrefixed(
                 static_cast<std::uint64_t>(offset), length});
         offset += length;
     }
-    if (offset != bytes.size())
+    if (consumedBytes != nullptr) *consumedBytes = offset;
+    if (consumedBytes == nullptr && offset != bytes.size())
     {
         return fail(error, ErrorCode::MALFORMED_PROTOBUF,
                     "binary pixel has trailing bytes");

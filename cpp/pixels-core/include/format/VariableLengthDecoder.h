@@ -66,11 +66,13 @@ public:
             std::uint64_t encodedDataLength,
             DictionaryVariableLayout &layout, FormatError &error);
 
+    // Supplying consumedBytes enables prefix decoding; callers must validate
+    // any remaining bytes as exact final-pixel alignment padding.
     [[nodiscard]] static bool decodeLengthPrefixed(
             const ByteSpan &bytes, std::size_t valueCount,
             std::uint32_t maximumLength,
             std::vector<VariableValueRange> &ranges,
-            FormatError &error);
+            FormatError &error, std::size_t *consumedBytes = nullptr);
 
     [[nodiscard]] static bool isValidUtf8(
             const ByteSpan &bytes) noexcept;

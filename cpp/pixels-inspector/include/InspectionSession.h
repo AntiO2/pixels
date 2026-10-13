@@ -55,7 +55,9 @@ public:
         AWAITING_DICTIONARY_STARTS = 15,
         AWAITING_DICTIONARY_CONTENT = 16,
         AWAITING_NESTED_CHILD = 17,
-        AWAITING_OPERATION_CHILD = 18
+        AWAITING_OPERATION_CHILD = 18,
+        AWAITING_BINARY_FIRST_START = 19,
+        AWAITING_BINARY_LAST_START = 20
     };
 
     explicit InspectionSession(std::uint64_t fileSize);
@@ -126,6 +128,7 @@ private:
         std::uint64_t nullBitmapByteOffset = 0;
         std::uint64_t pixelPhysicalBase = 0;
         std::uint64_t variableContentBase = 0;
+        std::uint64_t nullBitmapBytes = 0;
     };
 
     enum class Operation : std::uint32_t
@@ -217,6 +220,11 @@ private:
     void resetOperation();
     [[nodiscard]] bool validatePageRequest();
     [[nodiscard]] bool inferShortWidth(const format::ByteSpan &prefixBitmap);
+    [[nodiscard]] bool validatePixelPadding(
+            const format::ByteSpan &bytes, std::size_t consumed);
+    [[nodiscard]] bool validateBinaryNullBitmaps(const format::ByteSpan &bytes);
+    [[nodiscard]] bool requestBinaryFirstStart();
+    [[nodiscard]] bool consumeBinaryBoundary(const format::ByteSpan &bytes, bool first);
     [[nodiscard]] bool preparePageLayout();
     [[nodiscard]] bool requestCurrentPixel();
     [[nodiscard]] bool requestPixelValues();

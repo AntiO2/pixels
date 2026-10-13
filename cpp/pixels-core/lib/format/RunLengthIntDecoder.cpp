@@ -588,7 +588,7 @@ bool RunLengthIntDecoder::decode(
         const ByteSpan &bytes, bool signedValues,
         std::size_t expectedCount, std::int64_t *destination,
         std::size_t destinationSize, std::size_t &consumedBytes,
-        FormatError &error)
+        FormatError &error, bool requireEnd)
 {
     error.clear();
     consumedBytes = 0;
@@ -650,7 +650,7 @@ bool RunLengthIntDecoder::decode(
         }
     }
     consumedBytes = cursor.position();
-    if (consumedBytes != bytes.size())
+    if (requireEnd && consumedBytes != bytes.size())
     {
         return fail(error, ErrorCode::MALFORMED_PROTOBUF,
                     "RLE integer stream has trailing bytes");
